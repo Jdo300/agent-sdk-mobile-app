@@ -209,7 +209,16 @@ export async function listConversations(
   const records = await sdkClient(conn).conversations.list({
     agentId,
     limit,
-    // The management API pages newest-first with an `after` cursor.
+    // Order by last activity. This matters beyond sorting: the API's default
+    // list projection omits `summary` and `last_message_at` (every row renders
+    // as "New conversation" / "no messages yet") and orders by creation time,
+    // which floats empty auto-created conversations to the top. Requesting
+    // last_message_at ordering returns hydrated records — real titles,
+    // real timestamps, most-recently-active first — which is also the order
+    // a chat app wants anyway.
+    orderBy: "lastMessageAt",
+    order: "desc",
+    // The management API pages with an `after` cursor in sort order.
     ...(opts.before ? { after: opts.before } : {}),
   });
   return records.map(toConversation);
