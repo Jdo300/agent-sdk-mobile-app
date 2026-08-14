@@ -1,0 +1,23 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@/assets/*": [
+        "./assets/*"
+      ]
+    }
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    ".expo/types/**/*.ts",
+    "expo-env.d.ts"
+  ],
+  // Tests run under `bun test` (bun:test globals) and scripts/ under plain
+  // bun; keep both out of the app's RN typecheck.
+  "exclude": ["node_modules", "**/*.test.ts", "scripts"]
+}

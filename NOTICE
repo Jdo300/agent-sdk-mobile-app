@@ -1,0 +1,17 @@
+Bloop — a reference mobile client for the Letta Agent SDK
+Copyright 2026 Letta
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Every asset in this repository is covered by that same license. The app icon,
+splash mark and agent avatars are generated from the design tokens in
+src/theme/tokens.ts (see scripts/make-icons.py) — no third-party artwork or
+trademarks are distributed here.
+
+"Letta", "Letta Cloud" and "Letta Code" are used only to identify the service
+this client connects to. That is nominative use and conveys no rights in those
+marks; Apache-2.0 section 6 grants no trademark license either. Name and brand
+a fork of this project as your own.
+
+This product depends on software from third parties, including
+@letta-ai/letta-agent-sdk, Expo, and React Native, each under its own license.
