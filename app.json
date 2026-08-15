@@ -5,7 +5,7 @@
     "version": "0.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "letta-mobile",
+    "scheme": ["bloop", "letta-mobile"],
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "platforms": [
