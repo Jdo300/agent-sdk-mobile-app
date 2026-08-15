@@ -15,11 +15,24 @@ aborting, queued follow-ups — lives in one readable file you can lift into you
 Built with Expo (React Native), TypeScript, and
 [`@letta-ai/letta-agent-sdk`](https://github.com/letta-ai/letta-agent-sdk).
 
-## Try it
+## Try it on your phone
+
+Install [Expo Go](https://expo.dev/go) on your iPhone or Android device, then run:
 
 ```bash
-bun install          # or npm install
-bun run ios          # or: bun run android
+git clone https://github.com/letta-ai/agent-sdk-mobile-app.git
+cd agent-sdk-mobile-app
+bun install
+bunx expo start --tunnel
+```
+
+Scan the QR code shown in the terminal with your phone.
+
+To build the native app locally instead:
+
+```bash
+bun run ios      # requires macOS and Xcode
+bun run android  # requires Android Studio
 ```
 
 Then connect it to one of two things.
