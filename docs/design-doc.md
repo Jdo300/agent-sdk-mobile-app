@@ -141,7 +141,7 @@ Wireframes show hierarchy, not final pixels. All screens: light + dark, 320/375/
 │                                       │
 │   ┌─────────────────────────────┐     │
 │   │ ☁  Letta Cloud           ›  │     │   surface card, 12r
-│   │    Sign in with an API key  │     │
+│   │    Sign in or use an API key│     │
 │   └─────────────────────────────┘     │
 │   ┌─────────────────────────────┐     │
 │   │ ⌂  Your own server       ›  │     │
@@ -154,8 +154,9 @@ Wireframes show hierarchy, not final pixels. All screens: light + dark, 320/375/
 └──────────────────────────────────────┘
 ```
 
-Profile editor (push): name, then per type — Cloud: API key (secure field), advanced
-API URL; Remote: WebSocket URL, capability token (secure field). Below the fields, plain
+Profile editor (push): Cloud offers browser OAuth with PKCE first and an API key as the
+secondary choice. The Cloud API host is fixed and is not shown in the form. Remote:
+name, WebSocket URL, capability token (secure field). Below the remote fields, plain
 `sub` copy: *"A remote server can run tools on that machine. Use wss:// or a private
 network like Tailscale; plain ws:// is for development."* Primary action **Test
 connection** runs a real handshake and reports specifically (unreachable / unauthorized /

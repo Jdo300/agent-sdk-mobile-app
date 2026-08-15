@@ -48,6 +48,7 @@ import { haptic } from "../lib/haptics";
 import { ChatSession } from "../lib/letta/ChatSession";
 import {
   getConversationModel,
+  isAuthError,
   listModels,
   updateConversationModel,
   type ModelOption,
@@ -265,18 +266,28 @@ export default function ChatScreen() {
     let cancelled = false;
     let opened: ChatSession | null = null;
     void (async () => {
-      const secret = (await getSecret(activeProfile.id)) ?? "";
-      const session = ChatSession.open({ profile: activeProfile, secret }, params.conversationId);
-      if (cancelled) {
-        session.close();
-        return;
+      try {
+        const secret = (await getSecret(activeProfile.id)) ?? "";
+        const session = ChatSession.open({ profile: activeProfile, secret }, params.conversationId);
+        if (cancelled) {
+          session.close();
+          return;
+        }
+        opened = session;
+        sessionRef.current = session;
+        // Scrolling belongs to the list's onContentSizeChange, not here: a
+        // snapshot-time scroll races layout, since the hydration batch measures
+        // after the scroll fires.
+        session.subscribe(setSnapshot);
+      } catch (error) {
+        if (!cancelled) {
+          setSnapshot({
+            ...emptyChat,
+            hydrating: false,
+            connection: isAuthError(error) ? "auth_failed" : "offline",
+          });
+        }
       }
-      opened = session;
-      sessionRef.current = session;
-      // Scrolling belongs to the list's onContentSizeChange, not here: a
-      // snapshot-time scroll races layout, since the hydration batch measures
-      // after the scroll fires.
-      session.subscribe(setSnapshot);
     })();
     return () => {
       cancelled = true;
@@ -523,7 +534,9 @@ export default function ChatScreen() {
               ) : null
             }
             ListEmptyComponent={
-              <EmptyState message={`No messages yet. Say hello to ${agentName}.`} />
+              <View style={styles.invertedEmpty}>
+                <EmptyState message={`No messages yet. Say hello to ${agentName}.`} />
+              </View>
             }
             // Dragging the transcript pulls the keyboard down with the gesture.
             keyboardDismissMode="interactive"
@@ -782,6 +795,8 @@ const styles = StyleSheet.create({
   // Inverted list: style paddingTop renders at the VISUAL bottom (above the
   // composer), paddingBottom at the visual top.
   transcript: { paddingHorizontal: space.gutter, paddingTop: space.xl, paddingBottom: space.md, gap: space.md },
+  // FlatList does not counter-rotate ListEmptyComponent when `inverted` is set.
+  invertedEmpty: { transform: [{ scaleY: -1 }] },
   latestWrap: { position: "absolute", left: 0, right: 0, bottom: space.md, alignItems: "center" },
   olderSpinner: { paddingVertical: space.md, alignItems: "center" },
   attachRow: { flexDirection: "row", gap: space.sm, paddingBottom: space.sm },

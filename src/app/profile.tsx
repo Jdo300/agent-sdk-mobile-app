@@ -1,28 +1,37 @@
 /**
- * Profile editor — create (?type=cloud|remote) or edit (?id=...) a connection
- * profile. "Test connection" runs a real handshake and reports a specific
- * verdict; Save activates the profile and enters the app.
- * See docs/design-doc.md §4.1.
+ * Profile editor — Letta Cloud offers browser OAuth or an API key. Remote
+ * app-servers keep their WebSocket URL + capability token flow.
  */
 import { router, useLocalSearchParams } from "expo-router";
 import { useEffect, useState } from "react";
-import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, TextInput, View } from "react-native";
+import {
+  KeyboardAvoidingView,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  TextInput,
+  View,
+} from "react-native";
 
+import { Bloop } from "../components/ui/Bloop";
 import { Header, Screen } from "../components/ui/Screen";
 import { Text } from "../components/ui/Text";
 import { Touchable } from "../components/ui/Touchable";
+import { OAuthCancelledError, signInWithLetta } from "../lib/auth/oauth";
 import { testConnection, type TestResult } from "../lib/letta/testConnection";
 import {
   CLOUD_DEFAULT_URL,
   hasSecret,
   newProfileId,
+  saveOAuthProfile,
   saveProfile,
+  type CloudAuthMethod,
   type Profile,
   type ProfileType,
 } from "../lib/profiles/profiles";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
-import { radius, space } from "../theme/tokens";
+import { brandMark, radius, space } from "../theme/tokens";
 
 function Field({
   label,
@@ -56,9 +65,63 @@ function Field({
         autoCapitalize="none"
         autoCorrect={false}
         autoFocus={autoFocus}
-        style={[styles.input, { color: colors.ink, borderColor: colors.surfaceEdge, backgroundColor: colors.surface }]}
+        style={[
+          styles.input,
+          {
+            color: colors.ink,
+            borderColor: colors.surfaceEdge,
+            backgroundColor: colors.surface,
+          },
+        ]}
       />
     </View>
+  );
+}
+
+function AuthChoice({
+  selected,
+  title,
+  detail,
+  onPress,
+}: {
+  selected: boolean;
+  title: string;
+  detail: string;
+  onPress: () => void;
+}) {
+  const { colors } = useTheme();
+  return (
+    <Touchable
+      accessibilityRole="radio"
+      accessibilityState={{ selected }}
+      accessibilityLabel={`${title}. ${detail}`}
+      onPress={onPress}
+      style={[
+        styles.authChoice,
+        {
+          backgroundColor: colors.surface,
+          borderColor: selected ? colors.accent : colors.surfaceEdge,
+        },
+      ]}
+    >
+      <View style={styles.authChoiceText}>
+        <Text role="bodyEm">{title}</Text>
+        <Text role="sub" ink={2}>
+          {detail}
+        </Text>
+      </View>
+      <View
+        style={[
+          styles.radio,
+          {
+            borderColor: selected ? colors.accent : colors.ink3,
+            backgroundColor: selected ? colors.accent : "transparent",
+          },
+        ]}
+      >
+        {selected ? <View style={[styles.radioCenter, { backgroundColor: colors.surface }]} /> : null}
+      </View>
+    </Touchable>
   );
 }
 
@@ -67,35 +130,99 @@ export default function ProfileEditorScreen() {
   const { colors } = useTheme();
   const { profiles, refresh, setActive } = useProfiles();
 
-  const existing = params.id ? profiles.find((p) => p.id === params.id) : undefined;
+  const existing = params.id ? profiles.find((profile) => profile.id === params.id) : undefined;
   const type: ProfileType = existing?.type ?? (params.type === "remote" ? "remote" : "cloud");
+  const existingAuthMethod: CloudAuthMethod = existing?.authMethod ?? "api_key";
 
+  const [authMethod, setAuthMethod] = useState<CloudAuthMethod>(
+    existing ? existingAuthMethod : type === "remote" ? "api_key" : "oauth",
+  );
   const [name, setName] = useState(existing?.name ?? "");
-  const [url, setUrl] = useState(existing?.url ?? (type === "cloud" ? CLOUD_DEFAULT_URL : ""));
+  const [url, setUrl] = useState(existing?.url ?? "");
   const [secret, setSecret] = useState("");
   const [storedSecret, setStoredSecret] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [oauthWorking, setOAuthWorking] = useState(false);
   const [result, setResult] = useState<TestResult | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (existing) void hasSecret(existing.id).then(setStoredSecret);
   }, [existing]);
 
-  const canTest = url.trim().length > 0 && (secret.length > 0 || storedSecret) && !testing;
-  const canSave = result?.ok === true || existing !== undefined;
+  const storedSecretMatches =
+    storedSecret && (type === "remote" || existingAuthMethod === authMethod);
+  const effectiveUrl = type === "cloud" ? CLOUD_DEFAULT_URL : url.trim();
+  const canTest =
+    (type === "remote" || authMethod === "api_key") &&
+    effectiveUrl.length > 0 &&
+    (secret.length > 0 || storedSecretMatches) &&
+    !testing;
+  const canSave = result?.ok === true || (existing !== undefined && storedSecretMatches);
+
+  const chooseAuthMethod = (next: CloudAuthMethod) => {
+    setAuthMethod(next);
+    setSecret("");
+    setResult(null);
+    setMessage(null);
+  };
 
   const runTest = async () => {
     setTesting(true);
     setResult(null);
+    setMessage(null);
     let effectiveSecret = secret;
-    if (!effectiveSecret && existing) {
+    if (!effectiveSecret && existing && storedSecretMatches) {
       const { getSecret } = await import("../lib/profiles/profiles");
       effectiveSecret = (await getSecret(existing.id)) ?? "";
     }
-    const verdict = await testConnection(type, url.trim(), effectiveSecret);
+    const verdict = await testConnection(type, effectiveUrl, effectiveSecret);
     setResult(verdict);
     setTesting(false);
+  };
+
+  const finishSave = async (profile: Profile) => {
+    await setActive(profile.id);
+    await refresh();
+    router.replace("/agents");
+  };
+
+  const runOAuth = async () => {
+    setOAuthWorking(true);
+    setResult(null);
+    setMessage("Opening Letta in your browser…");
+    try {
+      const credential = await signInWithLetta();
+      setMessage("Checking your Letta account…");
+      const verdict = await testConnection("cloud", CLOUD_DEFAULT_URL, credential.accessToken);
+      if (!verdict.ok) {
+        setResult(verdict);
+        setMessage(null);
+        return;
+      }
+      const profile: Profile = {
+        id: existing?.id ?? newProfileId(),
+        type: "cloud",
+        authMethod: "oauth",
+        name: name.trim() || existing?.name || "Letta Cloud",
+        url: CLOUD_DEFAULT_URL,
+        lastTest: "ok",
+        createdAt: existing?.createdAt ?? Date.now(),
+      };
+      await saveOAuthProfile(profile, credential);
+      await finishSave(profile);
+    } catch (error) {
+      setMessage(
+        error instanceof OAuthCancelledError
+          ? "Sign-in was cancelled."
+          : error instanceof Error
+            ? error.message
+            : "Letta Cloud could not complete sign-in.",
+      );
+    } finally {
+      setOAuthWorking(false);
+    }
   };
 
   const save = async () => {
@@ -104,90 +231,196 @@ export default function ProfileEditorScreen() {
       id: existing?.id ?? newProfileId(),
       type,
       name: name.trim() || (type === "cloud" ? "Letta Cloud" : "My server"),
-      url: url.trim(),
-      lastTest: result ? (result.ok ? "ok" : result.reason === "unauthorized" ? "unauthorized" : "unreachable") : existing?.lastTest,
+      url: effectiveUrl,
+      ...(type === "cloud" ? { authMethod: "api_key" as const } : {}),
+      lastTest: result
+        ? result.ok
+          ? "ok"
+          : result.reason === "unauthorized"
+            ? "unauthorized"
+            : "unreachable"
+        : existing?.lastTest,
       createdAt: existing?.createdAt ?? Date.now(),
     };
     await saveProfile(profile, secret || null);
-    await setActive(profile.id);
-    await refresh();
+    await finishSave(profile);
     setSaving(false);
-    router.replace("/agents");
   };
 
   return (
     <Screen>
       <Header title={type === "cloud" ? "Letta Cloud" : "Your own server"} back />
-      <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-        style={styles.flex}
-      >
+      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.flex}>
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-          <Field label="Name" value={name} onChange={setName} placeholder={type === "cloud" ? "Personal Cloud" : "Homeserver"} autoFocus={!existing} />
-          <Field
-            label={type === "cloud" ? "API URL" : "WebSocket URL"}
-            value={url}
-            onChange={setUrl}
-            placeholder={type === "cloud" ? CLOUD_DEFAULT_URL : "wss://your-server:4500"}
-          />
-          <Field
-            label={type === "cloud" ? "API key" : "Capability token"}
-            value={secret}
-            onChange={(v) => {
-              setSecret(v);
-              setResult(null);
-            }}
-            placeholder={type === "cloud" ? "sk-…" : "token"}
-            secret
-            hasStoredSecret={storedSecret}
-          />
+          {type === "cloud" ? (
+            <>
+              <View style={styles.cloudIntro}>
+                <Bloop id="cloud-auth" size={52} color={brandMark.bloop} />
+                <View style={styles.cloudIntroText}>
+                  <Text role="title">Connect to Letta Cloud</Text>
+                  <Text role="body" ink={2}>
+                    Choose how you want to sign in.
+                  </Text>
+                </View>
+              </View>
 
-          {type === "remote" ? (
-            <Text role="sub" ink={2} style={styles.notice}>
-              A remote server can run tools on that machine. Prefer wss:// or a private
-              network like Tailscale; plain ws:// is for development.
-            </Text>
+              <View accessibilityRole="radiogroup" style={styles.authChoices}>
+                <AuthChoice
+                  selected={authMethod === "oauth"}
+                  title="Continue with Letta"
+                  detail="Sign in securely in your browser"
+                  onPress={() => chooseAuthMethod("oauth")}
+                />
+                <AuthChoice
+                  selected={authMethod === "api_key"}
+                  title="Use an API key"
+                  detail="Paste a key from your Letta account"
+                  onPress={() => chooseAuthMethod("api_key")}
+                />
+              </View>
+
+              {authMethod === "oauth" ? (
+                <View style={styles.oauthPanel}>
+                  <Field
+                    label="Connection name"
+                    value={name}
+                    onChange={setName}
+                    placeholder="Letta Cloud"
+                  />
+                  <Touchable
+                    accessibilityRole="button"
+                    accessibilityLabel={existing?.authMethod === "oauth" ? "Sign in again" : "Continue with Letta"}
+                    disabled={oauthWorking}
+                    onPress={runOAuth}
+                    style={[
+                      styles.primary,
+                      { backgroundColor: colors.accent, opacity: oauthWorking ? 0.6 : 1 },
+                    ]}
+                  >
+                    <Text role="bodyEm" style={styles.primaryLabel}>
+                      {oauthWorking
+                        ? "Waiting for browser…"
+                        : existing?.authMethod === "oauth"
+                          ? "Sign in again"
+                          : "Continue with Letta"}
+                    </Text>
+                  </Touchable>
+                  <Text role="sub" ink={2} style={styles.centeredText}>
+                    Your browser handles sign-in. This app receives a revocable access token, not your password.
+                  </Text>
+                </View>
+              ) : (
+                <View style={styles.apiKeyPanel}>
+                  <Field
+                    label="Connection name"
+                    value={name}
+                    onChange={setName}
+                    placeholder="Personal Cloud"
+                    autoFocus={!existing}
+                  />
+                  <Field
+                    label="API key"
+                    value={secret}
+                    onChange={(value) => {
+                      setSecret(value);
+                      setResult(null);
+                    }}
+                    placeholder="sk-…"
+                    secret
+                    hasStoredSecret={storedSecretMatches}
+                  />
+                  <Text role="sub" ink={2}>
+                    Your key stays in the device keychain and is sent only to Letta Cloud.
+                  </Text>
+                </View>
+              )}
+            </>
           ) : (
-            <Text role="sub" ink={2} style={styles.notice}>
-              Your key is stored in the device keychain and only sent to the API URL above.
-            </Text>
+            <>
+              <Field
+                label="Name"
+                value={name}
+                onChange={setName}
+                placeholder="Homeserver"
+                autoFocus={!existing}
+              />
+              <Field
+                label="WebSocket URL"
+                value={url}
+                onChange={setUrl}
+                placeholder="wss://your-server:4500"
+              />
+              <Field
+                label="Capability token"
+                value={secret}
+                onChange={(value) => {
+                  setSecret(value);
+                  setResult(null);
+                }}
+                placeholder="token"
+                secret
+                hasStoredSecret={storedSecretMatches}
+              />
+              <Text role="sub" ink={2}>
+                A remote server can run tools on that machine. Prefer wss:// or a private network like
+                Tailscale; plain ws:// is for development.
+              </Text>
+            </>
           )}
 
+          {message ? (
+            <Text role="sub" ink={2} accessibilityLiveRegion="polite" style={styles.centeredText}>
+              {message}
+            </Text>
+          ) : null}
           {result ? (
             <Text role="sub" tone={result.ok ? "run" : "danger"} accessibilityLiveRegion="polite">
               {result.detail}
             </Text>
           ) : null}
 
-          <View style={styles.actions}>
-            <Touchable
-              accessibilityRole="button"
-              accessibilityLabel="Test connection"
-              disabled={!canTest}
-              onPress={runTest}
-              style={[styles.test, { borderColor: colors.surfaceEdge, opacity: canTest ? 1 : 0.5 }]}
-            >
-              <Text role="bodyEm" tone="accent" style={styles.actionLabel}>
-                {testing ? "Testing…" : "Test connection"}
-              </Text>
-            </Touchable>
-            <Touchable
-              accessibilityRole="button"
-              accessibilityLabel="Save"
-              disabled={!canSave || saving}
-              onPress={save}
-              style={[styles.save, { backgroundColor: colors.accent, opacity: canSave && !saving ? 1 : 0.5 }]}
-            >
-              <Text role="bodyEm" style={[styles.actionLabel, styles.saveLabel]}>
-                {saving ? "Saving…" : "Save"}
-              </Text>
-            </Touchable>
-          </View>
-          {!result?.ok && !existing ? (
-            <Text role="sub" ink={3} style={styles.hint}>
-              Run a successful test to enable Save.
-            </Text>
-          ) : null}
+          {(type === "remote" || authMethod === "api_key") && (
+            <>
+              <View style={styles.actions}>
+                <Touchable
+                  accessibilityRole="button"
+                  accessibilityLabel="Test connection"
+                  disabled={!canTest}
+                  onPress={runTest}
+                  style={[
+                    styles.test,
+                    { borderColor: colors.surfaceEdge, opacity: canTest ? 1 : 0.5 },
+                  ]}
+                >
+                  <Text role="bodyEm" tone="accent" style={styles.actionLabel}>
+                    {testing ? "Testing…" : "Test connection"}
+                  </Text>
+                </Touchable>
+                <Touchable
+                  accessibilityRole="button"
+                  accessibilityLabel="Save"
+                  disabled={!canSave || saving}
+                  onPress={save}
+                  style={[
+                    styles.save,
+                    {
+                      backgroundColor: colors.accent,
+                      opacity: canSave && !saving ? 1 : 0.5,
+                    },
+                  ]}
+                >
+                  <Text role="bodyEm" style={[styles.actionLabel, styles.primaryLabel]}>
+                    {saving ? "Saving…" : "Save"}
+                  </Text>
+                </Touchable>
+              </View>
+              {!result?.ok && !existing ? (
+                <Text role="sub" ink={3} style={styles.centeredText}>
+                  Run a successful test to enable Save.
+                </Text>
+              ) : null}
+            </>
+          )}
         </ScrollView>
       </KeyboardAvoidingView>
     </Screen>
@@ -196,7 +429,37 @@ export default function ProfileEditorScreen() {
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
-  content: { paddingHorizontal: space.gutter, paddingTop: space.sm, gap: space.lg, paddingBottom: space.xxl },
+  content: {
+    paddingHorizontal: space.gutter,
+    paddingTop: space.sm,
+    gap: space.lg,
+    paddingBottom: space.xxl,
+  },
+  cloudIntro: { flexDirection: "row", alignItems: "center", gap: space.lg, paddingVertical: space.sm },
+  cloudIntroText: { flex: 1, gap: space.xs },
+  authChoices: { gap: space.sm },
+  authChoice: {
+    minHeight: 76,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radius.row,
+    paddingHorizontal: space.lg,
+    paddingVertical: space.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.md,
+  },
+  authChoiceText: { flex: 1, gap: 2 },
+  radio: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  radioCenter: { width: 7, height: 7, borderRadius: 4 },
+  oauthPanel: { gap: space.md, paddingTop: space.sm },
+  apiKeyPanel: { gap: space.lg, paddingTop: space.sm },
   field: { gap: 6 },
   input: {
     borderWidth: StyleSheet.hairlineWidth,
@@ -205,11 +468,16 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     fontSize: 16,
   },
-  notice: { paddingTop: space.xs },
+  primary: { borderRadius: radius.row, alignItems: "center" },
+  primaryLabel: { color: "#FFFFFF", paddingVertical: 14 },
+  centeredText: { textAlign: "center" },
   actions: { flexDirection: "row", gap: space.md, paddingTop: space.sm },
-  test: { flex: 1, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, alignItems: "center" },
+  test: {
+    flex: 1,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radius.row,
+    alignItems: "center",
+  },
   save: { flex: 1, borderRadius: radius.row, alignItems: "center" },
   actionLabel: { paddingVertical: 13 },
-  saveLabel: { color: "#FFFFFF" },
-  hint: { textAlign: "center" },
 });

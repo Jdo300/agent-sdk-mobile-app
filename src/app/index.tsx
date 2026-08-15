@@ -83,7 +83,7 @@ export default function ConnectScreen() {
           <ModeCard
             glyph="☁︎"
             title="Letta Cloud"
-            detail="Sign in with an API key"
+            detail="Sign in or use an API key"
             onPress={() => router.push({ pathname: "/profile", params: { type: "cloud" } })}
           />
           <ModeCard
@@ -123,7 +123,9 @@ export default function ConnectScreen() {
                   <View style={styles.profileText}>
                     <Text role="bodyEm">{profile.name}</Text>
                     <Text role="sub" ink={3}>
-                      {profile.type === "cloud" ? "Letta Cloud" : "Remote server"}
+                      {profile.type === "cloud"
+                        ? `Letta Cloud · ${profile.authMethod === "oauth" ? "signed in" : "API key"}`
+                        : "Remote server"}
                       {activeProfile?.id === profile.id ? " · active" : ""}
                     </Text>
                   </View>

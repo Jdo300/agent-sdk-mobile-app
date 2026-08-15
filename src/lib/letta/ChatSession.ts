@@ -713,10 +713,21 @@ export class ChatSession {
 
   private async consume(): Promise<void> {
     try {
-      if (!this.session) return;
-      for await (const message of this.session.stream()) {
-        if (this.closed) break;
-        this.ingest(message as SDKMessage);
+      const session = this.session;
+      if (!session) return;
+      // The SDK stream covers one turn and returns after its result. Open the
+      // next stream immediately so later sends use the same live session.
+      while (!this.closed && this.session === session) {
+        let received = false;
+        for await (const message of session.stream()) {
+          if (this.closed) break;
+          received = true;
+          this.ingest(message as SDKMessage);
+        }
+        // A stream with no message means the SDK session itself closed. Route
+        // that closure through the normal recovery path instead of retaining a
+        // session object that no consumer reads.
+        if (!received) throw new Error("Session stream closed.");
       }
     } catch (e) {
       if (this.closed) return;
@@ -974,8 +985,4 @@ export class ChatSession {
 function isTransportError(message: string): boolean {
   return /network|socket|connect|timed?\s?out|closed|unavailable|offline|interrupt|stream ended/i.test(message);
 }
-
-
-
-
 

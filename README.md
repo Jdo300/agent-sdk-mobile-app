@@ -24,9 +24,17 @@ bun run ios          # or: bun run android
 
 Then connect it to one of two things.
 
-**Letta Cloud** — choose *Letta Cloud* on the first screen and paste an API key from
-[app.letta.com](https://app.letta.com). Keys go to the device keychain
-(`expo-secure-store`) and are sent only to the API host you configure.
+**Letta Cloud** — choose *Letta Cloud* on the first screen, then continue in your browser
+with OAuth or paste an API key from [platform.letta.com](https://platform.letta.com).
+The reference build includes the general-purpose Letta Mobile public OAuth client and
+uses `letta-mobile://oauth/callback`. Apps that need a separate OAuth identity can set
+`EXPO_PUBLIC_LETTA_OAUTH_CLIENT_ID` and configure their own scheme. Access tokens,
+refresh tokens, and API keys stay in the device keychain (`expo-secure-store`). Cloud
+requests always use `https://api.letta.com`.
+
+The distributed OAuth client is `ci-let-94bf2d5e34984a684fb6b18880b6bc7d`. It is a
+public identifier, not a client secret. The registered redirect is
+`letta-mobile://oauth/callback`, and the app always uses Authorization Code with PKCE.
 
 **Your own machine** — run an app-server wherever your code lives:
 

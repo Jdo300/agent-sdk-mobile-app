@@ -17,7 +17,8 @@ import type {
   ReasoningEffort,
 } from "@letta-ai/letta-agent-sdk/client";
 
-import type { Profile } from "../profiles/profiles";
+import { CLOUD_DEFAULT_URL, type Profile } from "../profiles/profiles";
+import { OAuthTokenError } from "../auth/oauthTokens";
 
 // Re-exported so UI code imports from the app's data module, but the
 // definition is the SDK's — no drift (previously narrowed to low|medium|high,
@@ -47,7 +48,7 @@ function cloudHeaders({ secret }: Connection): Record<string, string> {
 }
 
 async function cloudFetch(conn: Connection, path: string, init?: RequestInit): Promise<unknown> {
-  const url = new URL(path, conn.profile.url).toString();
+  const url = new URL(path, CLOUD_DEFAULT_URL).toString();
   const response = await fetch(url, { ...init, headers: { ...cloudHeaders(conn), ...init?.headers } });
   if (response.status === 401 || response.status === 403) {
     throw new AuthError(`Letta API ${response.status} for ${path}`);
@@ -69,9 +70,9 @@ export class AuthError extends Error {}
  * the UI can route to the profile editor instead of offering a doomed Retry.
  */
 export function isAuthError(e: unknown): boolean {
-  if (e instanceof AuthError) return true;
+  if (e instanceof AuthError || e instanceof OAuthTokenError) return true;
   const message = e instanceof Error ? e.message : "";
-  return /\b401\b|\b403\b|unauthori[sz]ed|forbidden|invalid (api key|token|credential)|credentials/i.test(message);
+  return /\b401\b|\b403\b|unauthori[sz]ed|forbidden|invalid (api key|token|credential)|invalid_grant|credentials/i.test(message);
 }
 
 /** The portable SDK client for the active connection. Used for createAgent and sessions. */
@@ -80,7 +81,7 @@ export function sdkClient(conn: Connection): LettaAgentClient {
     return new LettaAgentClient({
       backend: "cloud",
       apiKey: conn.secret,
-      apiBaseUrl: conn.profile.url,
+      apiBaseUrl: CLOUD_DEFAULT_URL,
       // Browser/RN WebSockets can't set upgrade headers.
       webSocketAuth: "query",
     });
