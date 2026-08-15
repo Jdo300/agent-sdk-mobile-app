@@ -9,7 +9,15 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
 
+import {
+  parseOAuthCredential,
+  refreshOAuthCredential,
+  revokeOAuthCredential,
+  type OAuthCredential,
+} from "../auth/oauthTokens";
+
 export type ProfileType = "cloud" | "remote";
+export type CloudAuthMethod = "oauth" | "api_key";
 
 export interface Profile {
   id: string;
@@ -17,6 +25,8 @@ export interface Profile {
   name: string;
   /** Cloud: API base URL (default https://api.letta.com). Remote: WebSocket URL. */
   url: string;
+  /** Existing Cloud profiles omit this field and remain API-key profiles. */
+  authMethod?: CloudAuthMethod;
   /** Result of the last "Test connection" run. */
   lastTest?: "ok" | "unauthorized" | "unreachable";
   createdAt: number;
@@ -25,6 +35,7 @@ export interface Profile {
 const INDEX_KEY = "letta.profiles.v1";
 const ACTIVE_KEY = "letta.profiles.active.v1";
 const secretKey = (id: string) => `letta.secret.${id}`;
+const credentialRefreshes = new Map<string, Promise<string>>();
 
 export const CLOUD_DEFAULT_URL = "https://api.letta.com";
 
@@ -54,7 +65,26 @@ export async function saveProfile(profile: Profile, secret: string | null): Prom
   }
 }
 
+export async function saveOAuthProfile(
+  profile: Profile,
+  credential: OAuthCredential,
+): Promise<void> {
+  await saveProfile(
+    { ...profile, type: "cloud", url: CLOUD_DEFAULT_URL, authMethod: "oauth" },
+    JSON.stringify(credential),
+  );
+}
+
 export async function deleteProfile(id: string): Promise<void> {
+  const stored = await SecureStore.getItemAsync(secretKey(id));
+  const oauth = stored ? parseOAuthCredential(stored) : null;
+  if (oauth) {
+    try {
+      await revokeOAuthCredential(oauth);
+    } catch {
+      // Local deletion must still work when the account is offline.
+    }
+  }
   const profiles = (await listProfiles()).filter((p) => p.id !== id);
   await writeProfiles(profiles);
   await SecureStore.deleteItemAsync(secretKey(id));
@@ -65,11 +95,25 @@ export async function deleteProfile(id: string): Promise<void> {
 
 /** Secrets never leave this module except through this call at connect time. */
 export async function getSecret(id: string): Promise<string | null> {
-  return SecureStore.getItemAsync(secretKey(id));
+  const stored = await SecureStore.getItemAsync(secretKey(id));
+  if (!stored) return null;
+  const oauth = parseOAuthCredential(stored);
+  if (!oauth) return stored;
+  if (oauth.expiresAt > Date.now() + 5 * 60 * 1000) return oauth.accessToken;
+  const currentRefresh = credentialRefreshes.get(id);
+  if (currentRefresh) return currentRefresh;
+  const refresh = refreshOAuthCredential(oauth)
+    .then(async (refreshed) => {
+      await SecureStore.setItemAsync(secretKey(id), JSON.stringify(refreshed));
+      return refreshed.accessToken;
+    })
+    .finally(() => credentialRefreshes.delete(id));
+  credentialRefreshes.set(id, refresh);
+  return refresh;
 }
 
 export async function hasSecret(id: string): Promise<boolean> {
-  return (await getSecret(id)) !== null;
+  return (await SecureStore.getItemAsync(secretKey(id))) !== null;
 }
 
 export async function getActiveProfileId(): Promise<string | null> {

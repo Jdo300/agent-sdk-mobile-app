@@ -36,7 +36,7 @@ async function testCloud(baseUrl: string, apiKey: string): Promise<TestResult> {
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (response.status === 401 || response.status === 403) {
-      return { ok: false, reason: "unauthorized", detail: "The API key was rejected." };
+      return { ok: false, reason: "unauthorized", detail: "Your credentials were rejected." };
     }
     if (!response.ok) {
       return { ok: false, reason: "unreachable", detail: `The server answered ${response.status}.` };

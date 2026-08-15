@@ -52,7 +52,8 @@ applications.
 
 ## Session lifecycle
 
-1. Read a redacted profile descriptor and secret from SecureStore.
+1. Read a redacted profile descriptor and credential from SecureStore. Refresh an OAuth
+   access token when it is near expiry.
 2. Construct one portable `LettaAgentClient`.
 3. Select an agent and conversation through management namespaces.
 4. Resume the conversation and hydrate history before enabling send.
@@ -77,4 +78,3 @@ real credentials. Required fixtures cover:
 - foreground reconnect and reconciliation.
 
 Fixtures contain synthetic IDs and content only.
-
