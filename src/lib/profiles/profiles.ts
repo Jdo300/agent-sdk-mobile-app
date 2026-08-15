@@ -36,6 +36,7 @@ const INDEX_KEY = "letta.profiles.v1";
 const ACTIVE_KEY = "letta.profiles.active.v1";
 const secretKey = (id: string) => `letta.secret.${id}`;
 const credentialRefreshes = new Map<string, Promise<string>>();
+const deletingProfiles = new Set<string>();
 
 export const CLOUD_DEFAULT_URL = "https://api.letta.com";
 
@@ -76,27 +77,41 @@ export async function saveOAuthProfile(
 }
 
 export async function deleteProfile(id: string): Promise<void> {
-  const stored = await SecureStore.getItemAsync(secretKey(id));
-  const oauth = stored ? parseOAuthCredential(stored) : null;
-  if (oauth) {
+  deletingProfiles.add(id);
+  try {
+    // A refresh can rotate the refresh token. Wait for it, then revoke the
+    // newest stored credential so deletion cannot leave a valid session or
+    // let the refresh write the credential back after local cleanup.
     try {
-      await revokeOAuthCredential(oauth);
+      await credentialRefreshes.get(id);
     } catch {
-      // Local deletion must still work when the account is offline.
+      // Revoke the last stored credential below when refresh fails.
     }
-  }
-  const profiles = (await listProfiles()).filter((p) => p.id !== id);
-  await writeProfiles(profiles);
-  await SecureStore.deleteItemAsync(secretKey(id));
-  if ((await getActiveProfileId()) === id) {
-    await AsyncStorage.removeItem(ACTIVE_KEY);
+    const stored = await SecureStore.getItemAsync(secretKey(id));
+    const oauth = stored ? parseOAuthCredential(stored) : null;
+    if (oauth) {
+      try {
+        await revokeOAuthCredential(oauth);
+      } catch {
+        // Local deletion must still work when the account is offline.
+      }
+    }
+    const profiles = (await listProfiles()).filter((p) => p.id !== id);
+    await writeProfiles(profiles);
+    await SecureStore.deleteItemAsync(secretKey(id));
+    if ((await getActiveProfileId()) === id) {
+      await AsyncStorage.removeItem(ACTIVE_KEY);
+    }
+  } finally {
+    deletingProfiles.delete(id);
   }
 }
 
 /** Secrets never leave this module except through this call at connect time. */
 export async function getSecret(id: string): Promise<string | null> {
+  if (deletingProfiles.has(id)) return null;
   const stored = await SecureStore.getItemAsync(secretKey(id));
-  if (!stored) return null;
+  if (!stored || deletingProfiles.has(id)) return null;
   const oauth = parseOAuthCredential(stored);
   if (!oauth) return stored;
   if (oauth.expiresAt > Date.now() + 5 * 60 * 1000) return oauth.accessToken;
