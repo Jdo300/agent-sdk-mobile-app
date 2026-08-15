@@ -48,6 +48,7 @@ import { haptic } from "../lib/haptics";
 import { ChatSession } from "../lib/letta/ChatSession";
 import {
   getConversationModel,
+  isAuthError,
   listModels,
   updateConversationModel,
   type ModelOption,
@@ -265,18 +266,28 @@ export default function ChatScreen() {
     let cancelled = false;
     let opened: ChatSession | null = null;
     void (async () => {
-      const secret = (await getSecret(activeProfile.id)) ?? "";
-      const session = ChatSession.open({ profile: activeProfile, secret }, params.conversationId);
-      if (cancelled) {
-        session.close();
-        return;
+      try {
+        const secret = (await getSecret(activeProfile.id)) ?? "";
+        const session = ChatSession.open({ profile: activeProfile, secret }, params.conversationId);
+        if (cancelled) {
+          session.close();
+          return;
+        }
+        opened = session;
+        sessionRef.current = session;
+        // Scrolling belongs to the list's onContentSizeChange, not here: a
+        // snapshot-time scroll races layout, since the hydration batch measures
+        // after the scroll fires.
+        session.subscribe(setSnapshot);
+      } catch (error) {
+        if (!cancelled) {
+          setSnapshot({
+            ...emptyChat,
+            hydrating: false,
+            connection: isAuthError(error) ? "auth_failed" : "offline",
+          });
+        }
       }
-      opened = session;
-      sessionRef.current = session;
-      // Scrolling belongs to the list's onContentSizeChange, not here: a
-      // snapshot-time scroll races layout, since the hydration batch measures
-      // after the scroll fires.
-      session.subscribe(setSnapshot);
     })();
     return () => {
       cancelled = true;
