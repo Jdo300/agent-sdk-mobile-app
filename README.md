@@ -17,7 +17,14 @@ Built with Expo (React Native), TypeScript, and
 
 ## Try it on your phone
 
-Install [Expo Go](https://expo.dev/go) on your iPhone or Android device, then run:
+Install an Expo Go build compatible with this project's Expo SDK 57:
+
+- **iPhone or iPad:** open [sign.expo.dev](https://sign.expo.dev), select SDK 57, and
+  follow the install steps. The App Store build does not support SDK 57. Free Apple
+  developer signing lasts about seven days.
+- **Android:** install the SDK 57 build from [expo.dev/go](https://expo.dev/go).
+
+Then run:
 
 ```bash
 git clone https://github.com/letta-ai/agent-sdk-mobile-app.git
