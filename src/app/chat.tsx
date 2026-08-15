@@ -534,7 +534,9 @@ export default function ChatScreen() {
               ) : null
             }
             ListEmptyComponent={
-              <EmptyState message={`No messages yet. Say hello to ${agentName}.`} />
+              <View style={styles.invertedEmpty}>
+                <EmptyState message={`No messages yet. Say hello to ${agentName}.`} />
+              </View>
             }
             // Dragging the transcript pulls the keyboard down with the gesture.
             keyboardDismissMode="interactive"
@@ -793,6 +795,8 @@ const styles = StyleSheet.create({
   // Inverted list: style paddingTop renders at the VISUAL bottom (above the
   // composer), paddingBottom at the visual top.
   transcript: { paddingHorizontal: space.gutter, paddingTop: space.xl, paddingBottom: space.md, gap: space.md },
+  // FlatList does not counter-rotate ListEmptyComponent when `inverted` is set.
+  invertedEmpty: { transform: [{ scaleY: -1 }] },
   latestWrap: { position: "absolute", left: 0, right: 0, bottom: space.md, alignItems: "center" },
   olderSpinner: { paddingVertical: space.md, alignItems: "center" },
   attachRow: { flexDirection: "row", gap: space.sm, paddingBottom: space.sm },
