@@ -176,6 +176,57 @@ export class ChatSession {
     return this.session;
   }
 
+  /** List agent-scoped secret names without retaining plaintext values.
+   * The App Server response necessarily contains values for its native secret
+   * editor; Bloop immediately projects it to names so values never enter UI
+   * state, logs, transcript, or persistence.
+   */
+  async listAgentSecretNames(agentId: string): Promise<string[]> {
+    const response = await this.ensureSession().sendCommand(
+      { type: "secret_list", request_id: this.id("secret-list"), agent_id: agentId },
+      { responseType: "secret_list_response", timeoutMs: 15000 },
+    );
+    if (!response || response.success !== true) {
+      throw new Error(typeof response?.error === "string" ? response.error : "Could not load agent secrets.");
+    }
+    const entries = Array.isArray(response.secrets) ? response.secrets : [];
+    return entries
+      .map((entry) =>
+        entry && typeof entry === "object" && typeof (entry as { key?: unknown }).key === "string"
+          ? (entry as { key: string }).key
+          : null,
+      )
+      .filter((key): key is string => Boolean(key))
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  /** Atomically add/replace and remove agent-scoped secrets through Letta's
+   * native App Server secret store. Values exist only for the duration of this
+   * call and are never appended to the conversation.
+   */
+  async applyAgentSecrets(
+    agentId: string,
+    set: Record<string, string>,
+    unset: string[],
+  ): Promise<string[]> {
+    const response = await this.ensureSession().sendCommand(
+      {
+        type: "secret_apply",
+        request_id: this.id("secret-apply"),
+        agent_id: agentId,
+        set,
+        unset,
+      },
+      { responseType: "secret_apply_response", timeoutMs: 15000 },
+    );
+    if (!response || response.success !== true) {
+      throw new Error(typeof response?.error === "string" ? response.error : "Could not update agent secrets.");
+    }
+    return (Array.isArray(response.names) ? response.names : [])
+      .filter((name): name is string => typeof name === "string")
+      .sort((a, b) => a.localeCompare(b));
+  }
+
   subscribe(listener: SnapshotListener): () => void {
     this.listeners.add(listener);
     listener(this.snapshot);

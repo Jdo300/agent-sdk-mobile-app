@@ -34,6 +34,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ApprovalCard } from "../components/chat/ApprovalCard";
 import { ConnectionBanner } from "../components/chat/Banner";
 import { ModelSheet } from "../components/chat/ModelSheet";
+import { SecretSheet } from "../components/chat/SecretSheet";
 import { QueueCapsule } from "../components/chat/QueueCapsule";
 import { QueueSheet } from "../components/chat/QueueSheet";
 import {
@@ -55,6 +56,7 @@ import { Text } from "../components/ui/Text";
 import { Touchable } from "../components/ui/Touchable";
 import { haptic } from "../lib/haptics";
 import { ChatSession } from "../lib/letta/ChatSession";
+import { isSecretSlashCommand } from "../lib/letta/secretCommands";
 import {
   getConversationModel,
   isAuthError,
@@ -319,7 +321,13 @@ export default function ChatScreen() {
   useEffect(() => {
     let cancelled = false;
     void AsyncStorage.getItem(draftKey).then((saved) => {
-      if (!cancelled && saved && !draftTouched.current) setDraft(saved);
+      if (cancelled || !saved || draftTouched.current) return;
+      if (isSecretSlashCommand(saved)) {
+        // A secret command belongs in the secure manager, never draft storage.
+        void AsyncStorage.removeItem(draftKey);
+        return;
+      }
+      setDraft(saved);
     });
     return () => {
       cancelled = true;
@@ -327,14 +335,16 @@ export default function ChatScreen() {
   }, [draftKey]);
   useEffect(() => {
     const timer = setTimeout(() => {
-      void AsyncStorage.setItem(draftKey, draftRef.current);
+      if (isSecretSlashCommand(draftRef.current)) void AsyncStorage.removeItem(draftKey);
+      else void AsyncStorage.setItem(draftKey, draftRef.current);
     }, 300);
     return () => clearTimeout(timer);
   }, [draft, draftKey]);
   // Unmount can beat the debounce; persist the last keystrokes synchronously.
   useEffect(
     () => () => {
-      void AsyncStorage.setItem(draftKey, draftRef.current);
+      if (isSecretSlashCommand(draftRef.current)) void AsyncStorage.removeItem(draftKey);
+      else void AsyncStorage.setItem(draftKey, draftRef.current);
     },
     [draftKey],
   );
@@ -352,6 +362,10 @@ export default function ChatScreen() {
   const modelSheetRef = useRef<BottomSheetModal>(null);
   const queueSheetRef = useRef<BottomSheetModal>(null);
   const controlsSheetRef = useRef<BottomSheetModal>(null);
+  const secretSheetRef = useRef<BottomSheetModal>(null);
+  const [secretNames, setSecretNames] = useState<string[]>([]);
+  const [secretLoading, setSecretLoading] = useState(false);
+  const [secretError, setSecretError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
@@ -522,6 +536,50 @@ export default function ChatScreen() {
     return () => clearTimeout(timer);
   }, [snapshot.run, snapshot.transcript, voiceMode, playVoiceText]);
 
+  const refreshAgentSecrets = useCallback(async () => {
+    const session = sessionRef.current;
+    if (!session || !params.agentId) return;
+    setSecretLoading(true);
+    setSecretError(null);
+    try {
+      setSecretNames(await session.listAgentSecretNames(params.agentId));
+    } catch (error) {
+      setSecretError(error instanceof Error ? error.message : "Could not load agent secrets.");
+    } finally {
+      setSecretLoading(false);
+    }
+  }, [params.agentId]);
+
+  const openSecretManager = useCallback(() => {
+    // Present first so a slow remote refresh never makes the command look ignored.
+    secretSheetRef.current?.present();
+    void refreshAgentSecrets();
+  }, [refreshAgentSecrets]);
+
+  const applyAgentSecrets = useCallback(
+    async (set: Record<string, string>, unset: string[]) => {
+      const session = sessionRef.current;
+      if (!session || !params.agentId) throw new Error("Agent session is unavailable.");
+      setSecretError(null);
+      const names = await session.applyAgentSecrets(params.agentId, set, unset);
+      setSecretNames(names);
+    },
+    [params.agentId],
+  );
+
+  const interceptSecretCommand = useCallback(
+    (text: string): boolean => {
+      if (!isSecretSlashCommand(text)) return false;
+      // Never parse a value from `/secret set KEY value`: discard the entire
+      // composer command and make the user enter it in secureTextEntry instead.
+      clearDraft();
+      openSecretManager();
+      haptic.tap();
+      return true;
+    },
+    [clearDraft, openSecretManager],
+  );
+
   // Send ↔ stop morph.
   const morph = useSharedValue(0);
   useEffect(() => {
@@ -541,6 +599,7 @@ export default function ChatScreen() {
     }
     const text = draft.trim();
     if (!text && attachments.length === 0) return;
+    if (text && interceptSecretCommand(text)) return;
     haptic.send();
     const images = attachments;
     setAttachments([]);
@@ -548,19 +607,20 @@ export default function ChatScreen() {
     // Sending always re-enters follow mode — your own message must be visible.
     pinToLatest();
     await session.send(text, images);
-  }, [running, draft, attachments, pinToLatest, clearDraft]);
+  }, [running, draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const sendWhileRunning = useCallback(async () => {
     const session = sessionRef.current;
     const text = draft.trim();
     if (!session || (!text && attachments.length === 0)) return;
+    if (text && interceptSecretCommand(text)) return;
     haptic.queue();
     const images = attachments;
     setAttachments([]);
     clearDraft();
     pinToLatest();
     await session.send(text, images);
-  }, [draft, attachments, pinToLatest, clearDraft]);
+  }, [draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const canSend = draft.trim().length > 0 || attachments.length > 0;
   const agentName = params.agentName ?? "Agent";
@@ -984,6 +1044,14 @@ export default function ChatScreen() {
           </Text>
         ) : null}
       </Sheet>
+      <SecretSheet
+        ref={secretSheetRef}
+        names={secretNames}
+        loading={secretLoading}
+        error={secretError}
+        onRefresh={refreshAgentSecrets}
+        onApply={applyAgentSecrets}
+      />
       <ToolDetailSheet ref={toolSheetRef} tool={detailTool} />
       <ModelSheet
         ref={modelSheetRef}
