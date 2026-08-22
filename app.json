@@ -54,7 +54,8 @@
         {
           "microphonePermission": "Allow Local Milo to record voice messages."
         }
-      ]
+      ],
+      "expo-asset"
     ],
     "experiments": {
       "typedRoutes": true
