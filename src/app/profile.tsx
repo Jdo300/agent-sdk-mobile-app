@@ -137,8 +137,8 @@ export default function ProfileEditorScreen() {
   const [authMethod, setAuthMethod] = useState<CloudAuthMethod>(
     existing ? existingAuthMethod : type === "remote" ? "api_key" : "oauth",
   );
-  const [name, setName] = useState(existing?.name ?? "");
-  const [url, setUrl] = useState(existing?.url ?? "");
+  const [name, setName] = useState(existing?.name ?? (type === "remote" ? "Local Milo" : ""));
+  const [url, setUrl] = useState(existing?.url ?? (type === "remote" ? "wss://letta-app.resonancegroupusa.com" : ""));
   const [secret, setSecret] = useState("");
   const [storedSecret, setStoredSecret] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -348,7 +348,7 @@ export default function ProfileEditorScreen() {
                 label="WebSocket URL"
                 value={url}
                 onChange={setUrl}
-                placeholder="wss://your-server:4500"
+                placeholder="wss://letta-app.resonancegroupusa.com"
               />
               <Field
                 label="Capability token"
