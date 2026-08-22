@@ -77,6 +77,7 @@ export const SecretSheet = forwardRef<BottomSheetModal, Props>(function SecretSh
         <BottomSheetTextInput
           value={key}
           onChangeText={(next) => setKey(next.toUpperCase())}
+          autoFocus
           placeholder="SECRET_NAME"
           placeholderTextColor={colors.ink3}
           autoCapitalize="characters"
