@@ -9,6 +9,7 @@
         "@letta-ai/letta-agent-sdk": "0.7.1",
         "@react-native-async-storage/async-storage": "~2.2.0",
         "expo": "~54.0.0",
+        "expo-asset": "~12.0.13",
         "expo-audio": "~1.1.1",
         "expo-auth-session": "~7.0.11",
         "expo-clipboard": "~8.0.8",
