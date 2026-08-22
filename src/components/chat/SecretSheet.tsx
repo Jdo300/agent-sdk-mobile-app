@@ -1,6 +1,6 @@
-import type { BottomSheetModal } from "@gorhom/bottom-sheet";
+import { BottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
 import { forwardRef, useCallback, useState } from "react";
-import { ActivityIndicator, Alert, StyleSheet, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, StyleSheet, View } from "react-native";
 
 import { useTheme } from "../../theme/ThemeProvider";
 import { radius, space } from "../../theme/tokens";
@@ -74,7 +74,7 @@ export const SecretSheet = forwardRef<BottomSheetModal, Props>(function SecretSh
       </Text>
 
       <View style={styles.form}>
-        <TextInput
+        <BottomSheetTextInput
           value={key}
           onChangeText={(next) => setKey(next.toUpperCase())}
           placeholder="SECRET_NAME"
@@ -84,7 +84,7 @@ export const SecretSheet = forwardRef<BottomSheetModal, Props>(function SecretSh
           accessibilityLabel="Secret name"
           style={[styles.input, { borderColor: colors.surfaceEdge, color: colors.ink }]}
         />
-        <TextInput
+        <BottomSheetTextInput
           value={value}
           onChangeText={setValue}
           placeholder={normalizedKey && names.includes(normalizedKey) ? "New value (replaces stored value)" : "Secret value"}
