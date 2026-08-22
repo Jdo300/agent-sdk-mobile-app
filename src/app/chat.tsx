@@ -19,6 +19,15 @@ import {
   View,
 } from "react-native";
 import { Image } from "expo-image";
+import {
+  RecordingPresets,
+  createAudioPlayer,
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+  useAudioRecorder,
+  useAudioRecorderState,
+  type AudioPlayer,
+} from "expo-audio";
 import Animated, { FadeIn, FadeOut, useAnimatedStyle, useSharedValue, withSpring } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -64,6 +73,15 @@ import {
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
 import { pickImages, type Attachment } from "../lib/letta/attachments";
 import { getSecret } from "../lib/profiles/profiles";
+import {
+  getVoiceMode,
+  nextVoiceMode,
+  setVoiceMode as persistVoiceMode,
+  speechSource,
+  transcribeVoice,
+  voiceModeLabel,
+  type VoiceMode,
+} from "../lib/voice";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
 import { motion, radius, space } from "../theme/tokens";
@@ -132,6 +150,115 @@ export default function ChatScreen() {
   // Collapsed tool runs the reader has opened (see lib/letta/grouping).
   const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(() => new Set());
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [voiceMode, setVoiceModeState] = useState<VoiceMode>("tap");
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [transcribingVoice, setTranscribingVoice] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voiceReply, setVoiceReply] = useState<{ id: string; text: string } | null>(null);
+  const [voicePlaying, setVoicePlaying] = useState(false);
+  const [voiceProgress, setVoiceProgress] = useState({ current: 0, duration: 0 });
+  const voicePlayerRef = useRef<AudioPlayer | null>(null);
+  const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
+  const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
+  const recorderState = useAudioRecorderState(recorder, 100);
+
+  useEffect(() => {
+    void getVoiceMode().then(setVoiceModeState);
+    return () => {
+      voicePlayerSubRef.current?.remove();
+      voicePlayerRef.current?.remove();
+    };
+  }, []);
+
+  const cycleVoiceMode = useCallback(() => {
+    const next = nextVoiceMode(voiceMode);
+    setVoiceModeState(next);
+    void persistVoiceMode(next);
+    if (next === "off") {
+      voicePlayerRef.current?.pause();
+      setVoicePlaying(false);
+    }
+    haptic.tap();
+  }, [voiceMode]);
+
+  const startVoiceRecording = useCallback(async () => {
+    if (!activeProfile || voiceRecording || transcribingVoice) return;
+    setVoiceError(null);
+    const permission = await requestRecordingPermissionsAsync();
+    if (!permission.granted) {
+      setVoiceError("Microphone permission is required for voice messages.");
+      return;
+    }
+    await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+    await recorder.prepareToRecordAsync();
+    recorder.record();
+    setVoiceRecording(true);
+    haptic.tap();
+  }, [activeProfile, voiceRecording, transcribingVoice, recorder]);
+
+  const cancelVoiceRecording = useCallback(async () => {
+    try {
+      if (recorderState.isRecording) await recorder.stop();
+    } finally {
+      setVoiceRecording(false);
+      setVoiceError(null);
+      await setAudioModeAsync({ allowsRecording: false });
+    }
+  }, [recorder, recorderState.isRecording]);
+
+  const finishVoiceRecording = useCallback(async () => {
+    if (!activeProfile) return;
+    setVoiceError(null);
+    try {
+      if (recorderState.isRecording) await recorder.stop();
+      setVoiceRecording(false);
+      setTranscribingVoice(true);
+      const uri = recorder.uri;
+      if (!uri) throw new Error("The recording could not be saved.");
+      const token = (await getSecret(activeProfile.id)) ?? "";
+      if (!token) throw new Error("The Local Milo capability token is unavailable.");
+      const text = await transcribeVoice(uri, token);
+      setDraft(text);
+    } catch (error) {
+      setVoiceError(error instanceof Error ? error.message : "Voice transcription failed.");
+    } finally {
+      setTranscribingVoice(false);
+      await setAudioModeAsync({ allowsRecording: false });
+    }
+  }, [activeProfile, recorder, recorderState.isRecording]);
+
+  const playVoiceText = useCallback(async (text: string) => {
+    if (!activeProfile || !text.trim()) return;
+    try {
+      setVoiceError(null);
+      const token = (await getSecret(activeProfile.id)) ?? "";
+      if (!token) throw new Error("The Local Milo capability token is unavailable.");
+      voicePlayerSubRef.current?.remove();
+      voicePlayerRef.current?.remove();
+      const player = createAudioPlayer(speechSource(text, token), { updateInterval: 150 });
+      voicePlayerRef.current = player;
+      voicePlayerSubRef.current = player.addListener("playbackStatusUpdate", (status) => {
+        setVoicePlaying(status.playing);
+        setVoiceProgress({ current: status.currentTime || 0, duration: status.duration || 0 });
+        if (status.didJustFinish) setVoicePlaying(false);
+      });
+      player.play();
+      setVoicePlaying(true);
+    } catch (error) {
+      setVoicePlaying(false);
+      setVoiceError(error instanceof Error ? error.message : "Voice playback failed.");
+    }
+  }, [activeProfile]);
+
+  const toggleVoicePlayback = useCallback(() => {
+    const player = voicePlayerRef.current;
+    if (player) {
+      if (voicePlaying) player.pause();
+      else player.play();
+      return;
+    }
+    if (voiceReply) void playVoiceText(voiceReply.text);
+  }, [voicePlaying, voiceReply, playVoiceText]);
   const attach = useCallback(async () => {
     haptic.tap();
     const picked = await pickImages();
@@ -374,6 +501,26 @@ export default function ChatScreen() {
 
   const running = snapshot.run === "running" || snapshot.run === "awaiting_approval";
   const aborting = snapshot.run === "aborting";
+  const previousRunRef = useRef(snapshot.run);
+  useEffect(() => {
+    const previous = previousRunRef.current;
+    previousRunRef.current = snapshot.run;
+    if (previous === "idle" || snapshot.run !== "idle") return;
+    const last = [...snapshot.transcript].reverse().find(
+      (item) => item.kind === "assistant" && !item.streaming && !item.interrupted && item.text.trim().length > 0,
+    );
+    if (!last || last.kind !== "assistant") return;
+    const timer = setTimeout(() => {
+      setVoiceReply({ id: last.id, text: last.text });
+      setVoiceProgress({ current: 0, duration: 0 });
+      voicePlayerSubRef.current?.remove();
+      voicePlayerRef.current?.remove();
+      voicePlayerRef.current = null;
+      setVoicePlaying(false);
+      if (voiceMode === "auto") void playVoiceText(last.text);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [snapshot.run, snapshot.transcript, voiceMode, playVoiceText]);
 
   // Send ↔ stop morph.
   const morph = useSharedValue(0);
@@ -485,6 +632,18 @@ export default function ChatScreen() {
             </Text>
             <StatusDot tone={status.tone} />
           </View>
+        }
+        trailing={
+          <Touchable
+            accessibilityRole="button"
+            accessibilityLabel={`Voice output: ${voiceMode}. Tap to change`}
+            onPress={cycleVoiceMode}
+            style={[styles.voiceModePill, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
+          >
+            <Text role="sub" tone={voiceMode === "auto" ? "accent" : undefined}>
+              {voiceModeLabel(voiceMode)}
+            </Text>
+          </Touchable>
         }
       />
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.flex}>
@@ -622,6 +781,46 @@ export default function ChatScreen() {
               ))}
             </View>
           ) : null}
+          {voiceRecording || transcribingVoice ? (
+            <View style={[styles.voiceRecorderPanel, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}>
+              <Text role="bodyEm" tone="accent">{transcribingVoice ? "Transcribing…" : "Listening…"}</Text>
+              <Text role="title">{Math.floor(recorderState.durationMillis / 60000).toString().padStart(2, "0")}:{Math.floor((recorderState.durationMillis % 60000) / 1000).toString().padStart(2, "0")}</Text>
+              <View style={styles.waveform}>
+                {Array.from({ length: 24 }, (_, index) => {
+                  const level = Math.max(0.15, Math.min(1, ((recorderState.metering ?? -52) + 60) / 42));
+                  const shape = 0.35 + ((index * 7) % 11) / 16;
+                  return <View key={index} style={[styles.waveBar, { backgroundColor: colors.accent, height: 8 + 30 * level * shape }]} />;
+                })}
+              </View>
+              <View style={styles.voiceRecorderActions}>
+                <Touchable accessibilityRole="button" accessibilityLabel="Cancel voice recording" onPress={() => void cancelVoiceRecording()} style={[styles.voiceActionButton, { borderColor: colors.surfaceEdge }]}>
+                  <Text role="bodyEm" ink={2}>Cancel</Text>
+                </Touchable>
+                <Touchable accessibilityRole="button" accessibilityLabel="Use voice recording" disabled={transcribingVoice} onPress={() => void finishVoiceRecording()} style={[styles.voiceActionButton, { backgroundColor: colors.accent, borderColor: colors.accent, opacity: transcribingVoice ? 0.5 : 1 }]}>
+                  <Text role="bodyEm" style={styles.voiceActionPrimary}>Use voice</Text>
+                </Touchable>
+              </View>
+            </View>
+          ) : null}
+          {voiceMode !== "off" && voiceReply && !voiceRecording ? (
+            <View style={[styles.voiceReplyCard, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}>
+              <View style={styles.voiceReplyTop}>
+                <View>
+                  <Text role="bodyEm">Milo’s reply</Text>
+                  <Text role="sub" ink={2}>{voiceMode === "auto" ? "Auto voice reply" : "Tap to listen"}</Text>
+                </View>
+                <Touchable accessibilityRole="button" accessibilityLabel={voicePlaying ? "Pause Milo voice reply" : "Play Milo voice reply"} onPress={toggleVoicePlayback} style={[styles.voicePlayButton, { backgroundColor: colors.accent }]}>
+                  <Text role="bodyEm" style={styles.voiceActionPrimary}>{voicePlaying ? "Ⅱ" : "▶"}</Text>
+                </Touchable>
+              </View>
+              <View style={[styles.voiceTrack, { backgroundColor: colors.surfaceEdge }]}>
+                <View style={[styles.voiceTrackFill, { backgroundColor: colors.accent, flex: voiceProgress.duration > 0 ? Math.max(0.02, Math.min(1, voiceProgress.current / voiceProgress.duration)) : 0.02 }]} />
+                <View style={{ flex: voiceProgress.duration > 0 ? Math.max(0, 1 - Math.min(1, voiceProgress.current / voiceProgress.duration)) : 0.98 }} />
+              </View>
+              <Text role="micro" ink={2}>{Math.floor(voiceProgress.current / 60)}:{Math.floor(voiceProgress.current % 60).toString().padStart(2, "0")}{voiceProgress.duration > 0 ? ` / ${Math.floor(voiceProgress.duration / 60)}:${Math.floor(voiceProgress.duration % 60).toString().padStart(2, "0")}` : ""}</Text>
+            </View>
+          ) : null}
+          {voiceError ? <Text role="sub" tone="danger">{voiceError}</Text> : null}
           <View
             style={[
               styles.composer,
@@ -652,6 +851,15 @@ export default function ChatScreen() {
               scrollEnabled
               editable={!snapshot.hydrating}
             />
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Record voice message"
+              disabled={snapshot.hydrating || transcribingVoice}
+              onPress={() => void startVoiceRecording()}
+              style={[styles.micButton, { backgroundColor: voiceRecording ? colors.accent : colors.bubble, borderColor: voiceRecording ? colors.accent : colors.surfaceEdge }]}
+            >
+              <Text role="bodyEm" style={voiceRecording ? styles.voiceActionPrimary : undefined}>🎙</Text>
+            </Touchable>
           </View>
           <View style={styles.chipRow}>
             <Touchable
@@ -838,6 +1046,19 @@ const styles = StyleSheet.create({
   // screen so the transcript never disappears behind the composer.
   input: { flex: 1, fontSize: 16, lineHeight: 21, maxHeight: 168, padding: 0 },
   chipRow: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  voiceModePill: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.chip, paddingHorizontal: space.md, paddingVertical: 7 },
+  micButton: { width: 38, height: 38, borderRadius: 19, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", marginLeft: space.sm },
+  voiceRecorderPanel: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.sheet, padding: space.lg, gap: space.md, alignItems: "center" },
+  waveform: { height: 48, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3, width: "100%" },
+  waveBar: { width: 3, borderRadius: 2 },
+  voiceRecorderActions: { flexDirection: "row", gap: space.sm, width: "100%" },
+  voiceActionButton: { flex: 1, minHeight: 44, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, alignItems: "center", justifyContent: "center" },
+  voiceActionPrimary: { color: "#FFFFFF" },
+  voiceReplyCard: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, padding: space.md, gap: space.sm },
+  voiceReplyTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  voicePlayButton: { width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center" },
+  voiceTrack: { height: 4, borderRadius: 2, flexDirection: "row", overflow: "hidden" },
+  voiceTrackFill: { height: 4 },
   hidden: { display: "none" },
   spacer: { flex: 1 },
   queueSend: { paddingHorizontal: space.sm },
