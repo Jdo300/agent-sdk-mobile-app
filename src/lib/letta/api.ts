@@ -365,12 +365,25 @@ export async function listModels(conn: Connection): Promise<ModelOption[]> {
   // Session-less on every backend since SDK 0.3.1 — no sandbox just to open a picker.
   const result = await sdkClient(conn).models.list();
 
+  // App Server returns a broad catalog plus `availableHandles`, which is the
+  // authoritative subset actually available through this connection. A remote
+  // (local App Server) profile must not expose generic cloud catalog entries
+  // merely because Letta knows about them. Cloud already reports its available
+  // catalog through the same field.
+  const available = result.availableHandles == null ? null : new Set(result.availableHandles);
+  const entries =
+    conn.profile.type === "remote"
+      ? available
+        ? result.entries.filter((entry) => available.has(entry.handle))
+        : []
+      : result.entries;
+
   // Some backends can expose the same selectable model through more than one
   // catalog entry. The handle is what we send back when selecting a model, so
   // collapse duplicates here rather than rendering duplicate rows (and duplicate
   // React keys) in every model picker. Preserve server order and the first label.
   const unique = new Map<string, ModelOption>();
-  for (const entry of result.entries) {
+  for (const entry of entries) {
     if (!unique.has(entry.handle)) {
       unique.set(entry.handle, { id: entry.id, handle: entry.handle, label: entry.label });
     }
