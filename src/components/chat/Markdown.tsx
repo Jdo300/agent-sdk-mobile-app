@@ -6,7 +6,7 @@
  * streaming flush only re-parses the tail block. Everything visual resolves
  * through the token system; links open externally via Linking.
  */
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Linking, Platform, ScrollView, StyleSheet, View, type TextStyle } from "react-native";
 import MarkdownDisplay, { MarkdownIt, type ASTNode, type RenderRules } from "react-native-markdown-display";
 import * as Clipboard from "expo-clipboard";
@@ -143,9 +143,48 @@ function fenceLanguage(node: ASTNode): string | null {
   return info ? info.split(/\s+/)[0]! : null;
 }
 
+function TableRow({
+  node,
+  children,
+  parentNodes,
+  baseStyle,
+}: {
+  node: ASTNode;
+  children: ReactNode[];
+  parentNodes: ReadonlyArray<ASTNode>;
+  baseStyle: object;
+}) {
+  const { colors } = useTheme();
+  const parent = parentNodes[0];
+  const rowIndex = parent?.children?.findIndex((child) => child.key === node.key) ?? 0;
+  const isHeader = parent?.type === "thead";
+  // Header is strongest; body rows alternate between raised and bubble fills.
+  // The alternating fill makes wide tables much easier to track horizontally.
+  const backgroundColor = isHeader
+    ? colors.bubble
+    : rowIndex % 2 === 0
+      ? colors.surface
+      : colors.pressed;
+
+  return (
+    <View key={node.key} style={[baseStyle, { backgroundColor }]}>
+      {children}
+    </View>
+  );
+}
+
 const rules: RenderRules = {
   fence: (node) => <CodeFence key={node.key} code={node.content} language={fenceLanguage(node)} />,
   code_block: (node) => <CodeFence key={node.key} code={node.content} language={null} />,
+  tr: (node, children, parentNodes, markdownStyle) => (
+    <TableRow
+      key={node.key}
+      node={node}
+      children={children}
+      parentNodes={parentNodes as ReadonlyArray<ASTNode>}
+      baseStyle={markdownStyle._VIEW_SAFE_tr ?? markdownStyle.tr}
+    />
+  ),
 };
 
 const mono: TextStyle = {
@@ -194,11 +233,35 @@ function markdownStyles(colors: Palette) {
     bullet_list_icon: { color: colors.ink2, marginLeft: 0, marginRight: space.sm },
     ordered_list_icon: { color: colors.ink2, marginLeft: 0, marginRight: space.sm },
     hr: { backgroundColor: colors.surfaceEdge, height: StyleSheet.hairlineWidth, marginVertical: space.sm },
-    table: { borderWidth: StyleSheet.hairlineWidth, borderColor: colors.surfaceEdge, borderRadius: 4 },
+    table: {
+      borderWidth: 1,
+      borderColor: colors.surfaceEdge,
+      borderRadius: radius.row,
+      overflow: "hidden",
+    },
     thead: {},
-    th: { padding: space.xs, ...typeScale.sub, fontWeight: "600" },
-    tr: { borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.surfaceEdge, flexDirection: "row" },
-    td: { padding: space.xs, ...typeScale.sub },
+    th: {
+      paddingHorizontal: space.sm,
+      paddingVertical: 7,
+      ...typeScale.sub,
+      fontWeight: "700",
+      color: colors.ink,
+      borderRightWidth: StyleSheet.hairlineWidth,
+      borderRightColor: colors.surfaceEdge,
+    },
+    tr: {
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.surfaceEdge,
+      flexDirection: "row",
+    },
+    td: {
+      paddingHorizontal: space.sm,
+      paddingVertical: 7,
+      ...typeScale.sub,
+      color: colors.ink,
+      borderRightWidth: StyleSheet.hairlineWidth,
+      borderRightColor: colors.surfaceEdge,
+    },
   } as const;
 }
 
