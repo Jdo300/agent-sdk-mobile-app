@@ -364,5 +364,16 @@ function modelSettingsFor(model: string, effort?: ReasoningEffort): ModelSetting
 export async function listModels(conn: Connection): Promise<ModelOption[]> {
   // Session-less on every backend since SDK 0.3.1 — no sandbox just to open a picker.
   const result = await sdkClient(conn).models.list();
-  return result.entries.map((e) => ({ id: e.id, handle: e.handle, label: e.label }));
+
+  // Some backends can expose the same selectable model through more than one
+  // catalog entry. The handle is what we send back when selecting a model, so
+  // collapse duplicates here rather than rendering duplicate rows (and duplicate
+  // React keys) in every model picker. Preserve server order and the first label.
+  const unique = new Map<string, ModelOption>();
+  for (const entry of result.entries) {
+    if (!unique.has(entry.handle)) {
+      unique.set(entry.handle, { id: entry.id, handle: entry.handle, label: entry.label });
+    }
+  }
+  return [...unique.values()];
 }
