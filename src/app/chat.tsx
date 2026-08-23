@@ -112,6 +112,22 @@ function SpeakerIcon({ color, muted = false, size = 19 }: { color: string; muted
   );
 }
 
+function CloseIcon({ color, size = 20 }: { color: string; size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d="M6 6l12 12M18 6 6 18" stroke={color} strokeWidth={2} strokeLinecap="round" />
+    </Svg>
+  );
+}
+
+function CheckIcon({ color, size = 21 }: { color: string; size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d="m5 12.5 4.2 4.2L19 7" stroke={color} strokeWidth={2.1} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
 // Memoized so a streaming flush only re-renders the row whose item changed:
 // upsertItem preserves untouched item identity, so reference equality holds.
 const TranscriptRow = memo(function TranscriptRow({
@@ -886,11 +902,22 @@ export default function ChatScreen() {
                 })}
               </View>
               <View style={styles.voiceRecorderActions}>
-                <Touchable accessibilityRole="button" accessibilityLabel="Cancel voice recording" onPress={() => void cancelVoiceRecording()} style={[styles.voiceActionButton, { borderColor: colors.surfaceEdge }]}>
-                  <Text role="bodyEm" ink={2}>Cancel</Text>
+                <Touchable
+                  accessibilityRole="button"
+                  accessibilityLabel="Cancel voice recording"
+                  onPress={() => void cancelVoiceRecording()}
+                  style={[styles.voiceActionIcon, { backgroundColor: colors.bubble, borderColor: colors.surfaceEdge }]}
+                >
+                  <CloseIcon color={colors.ink2} />
                 </Touchable>
-                <Touchable accessibilityRole="button" accessibilityLabel="Use voice recording" disabled={transcribingVoice} onPress={() => void finishVoiceRecording()} style={[styles.voiceActionButton, { backgroundColor: colors.accent, borderColor: colors.accent, opacity: transcribingVoice ? 0.5 : 1 }]}>
-                  <Text role="bodyEm" style={styles.voiceActionPrimary}>Use voice</Text>
+                <Touchable
+                  accessibilityRole="button"
+                  accessibilityLabel="Use voice recording"
+                  disabled={transcribingVoice}
+                  onPress={() => void finishVoiceRecording()}
+                  style={[styles.voiceActionIcon, { backgroundColor: colors.accent, borderColor: colors.accent, opacity: transcribingVoice ? 0.5 : 1 }]}
+                >
+                  <CheckIcon color="#FFFFFF" />
                 </Touchable>
               </View>
             </View>
@@ -1150,11 +1177,11 @@ const styles = StyleSheet.create({
   voiceModePill: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.chip, paddingHorizontal: space.md, paddingVertical: 7 },
   voiceModeContent: { flexDirection: "row", alignItems: "center", gap: 7 },
   micButton: { width: 38, height: 38, borderRadius: 19, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", marginLeft: space.sm },
-  voiceRecorderPanel: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.sheet, padding: space.lg, gap: space.md, alignItems: "center" },
+  voiceRecorderPanel: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.sheet, paddingHorizontal: space.lg, paddingVertical: space.md, gap: space.sm, alignItems: "center" },
   waveform: { height: 48, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3, width: "100%" },
   waveBar: { width: 3, borderRadius: 2 },
-  voiceRecorderActions: { flexDirection: "row", gap: space.sm, width: "100%" },
-  voiceActionButton: { flex: 1, minHeight: 44, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, alignItems: "center", justifyContent: "center" },
+  voiceRecorderActions: { flexDirection: "row", gap: space.md, justifyContent: "center", paddingTop: 2 },
+  voiceActionIcon: { width: 44, height: 44, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center" },
   voiceActionPrimary: { color: "#FFFFFF" },
   voiceReplyCard: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, padding: space.md, gap: space.sm },
   voiceReplyTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
