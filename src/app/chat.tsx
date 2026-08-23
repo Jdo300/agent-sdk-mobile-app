@@ -31,6 +31,7 @@ import {
 } from "expo-audio";
 import Animated, { FadeIn, FadeOut, useAnimatedStyle, useSharedValue, withSpring } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import Svg, { Path } from "react-native-svg";
 
 import { ApprovalCard } from "../components/chat/ApprovalCard";
 import { ConnectionBanner } from "../components/chat/Banner";
@@ -88,6 +89,28 @@ import {
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
 import { motion, radius, space } from "../theme/tokens";
+
+function MicrophoneIcon({ color, size = 21 }: { color: string; size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V6.5a3.5 3.5 0 1 0-7 0V12a3.5 3.5 0 0 0 3.5 3.5Z" stroke={color} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+      <Path d="M5.8 11.7v.3a6.2 6.2 0 0 0 12.4 0v-.3M12 18.2V22M8.8 22h6.4" stroke={color} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+function SpeakerIcon({ color, muted = false, size = 19 }: { color: string; muted?: boolean; size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d="M4 9.2h3.4L12 5.5v13l-4.6-3.7H4V9.2Z" stroke={color} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+      {muted ? (
+        <Path d="m16 9 5 5M21 9l-5 5" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+      ) : (
+        <Path d="M15.4 8.3a5 5 0 0 1 0 7.4M18.1 5.8a8.3 8.3 0 0 1 0 12.4" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+      )}
+    </Svg>
+  );
+}
 
 // Memoized so a streaming flush only re-renders the row whose item changed:
 // upsertItem preserves untouched item identity, so reference equality holds.
@@ -703,9 +726,15 @@ export default function ChatScreen() {
             onPress={cycleVoiceMode}
             style={[styles.voiceModePill, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
           >
-            <Text role="sub" tone={voiceMode === "auto" ? "accent" : undefined}>
-              {voiceModeLabel(voiceMode)}
-            </Text>
+            <View style={styles.voiceModeContent}>
+              <SpeakerIcon
+                color={voiceMode === "auto" ? colors.accent : colors.ink2}
+                muted={voiceMode === "off"}
+              />
+              <Text role="sub" tone={voiceMode === "auto" ? "accent" : undefined}>
+                {voiceModeLabel(voiceMode)}
+              </Text>
+            </View>
           </Touchable>
         }
       />
@@ -922,7 +951,7 @@ export default function ChatScreen() {
               onPress={() => void startVoiceRecording()}
               style={[styles.micButton, { backgroundColor: voiceRecording ? colors.accent : colors.bubble, borderColor: voiceRecording ? colors.accent : colors.surfaceEdge }]}
             >
-              <Text role="bodyEm" style={voiceRecording ? styles.voiceActionPrimary : undefined}>🎙</Text>
+              <MicrophoneIcon color={voiceRecording ? "#FFFFFF" : colors.ink2} />
             </Touchable>
           </View>
           <View style={styles.chipRow}>
@@ -1108,17 +1137,18 @@ const styles = StyleSheet.create({
   },
   composer: {
     flexDirection: "row",
-    alignItems: "flex-end",
+    alignItems: "center",
     borderRadius: radius.bubble,
     borderWidth: StyleSheet.hairlineWidth,
     paddingHorizontal: space.lg,
-    paddingVertical: 10,
+    paddingVertical: 6,
   },
   // ~7 lines before it scrolls: references cap growth near a third of the
   // screen so the transcript never disappears behind the composer.
-  input: { flex: 1, fontSize: 16, lineHeight: 21, maxHeight: 168, padding: 0 },
+  input: { flex: 1, minHeight: 38, fontSize: 16, lineHeight: 21, maxHeight: 168, paddingHorizontal: 0, paddingVertical: 8 },
   chipRow: { flexDirection: "row", alignItems: "center", gap: space.sm },
   voiceModePill: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.chip, paddingHorizontal: space.md, paddingVertical: 7 },
+  voiceModeContent: { flexDirection: "row", alignItems: "center", gap: 7 },
   micButton: { width: 38, height: 38, borderRadius: 19, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", marginLeft: space.sm },
   voiceRecorderPanel: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.sheet, padding: space.lg, gap: space.md, alignItems: "center" },
   waveform: { height: 48, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3, width: "100%" },

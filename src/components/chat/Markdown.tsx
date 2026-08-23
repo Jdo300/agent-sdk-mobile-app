@@ -163,10 +163,10 @@ function TableRow({
   // a neutral row alternating with an accent-colored pressed state.
   const backgroundColor = themeName === "dark"
     ? isHeader
-      ? "#242A31"
+      ? "#25272B"
       : rowIndex % 2 === 0
-        ? "#171A1E"
-        : "#20252B"
+        ? "#191A1C"
+        : "#202225"
     : isHeader
       ? colors.bubble
       : rowIndex % 2 === 0

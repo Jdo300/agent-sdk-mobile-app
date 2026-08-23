@@ -55,17 +55,17 @@ export const palettes: Record<ThemeName, Palette> = {
     // Keep VOX-UI's text/accent hierarchy, but deepen the canvas and raised
     // surfaces to match the richer near-black contrast seen in ChatGPT on iOS.
     bg: "#0C0C0C",
-    surface: "#191B1F",
-    surfaceEdge: "#59616D",
+    surface: "#191A1C",
+    surfaceEdge: "#5A5E64",
     ink: "#FFFFFF",
-    ink2: "#DCE1E8",
-    ink3: "#B7C0CB",
+    ink2: "#DDDFE3",
+    ink3: "#BABEC4",
     accent: "#347AB8",
     run: "#4CAF50",
     wait: "#FF9800",
     danger: "#FF5252",
-    bubble: "#24272C",
-    pressed: "rgba(95,120,150,0.15)",
+    bubble: "#242528",
+    pressed: "rgba(105,112,124,0.15)",
   },
 };
 

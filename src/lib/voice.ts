@@ -23,9 +23,9 @@ export function nextVoiceMode(mode: VoiceMode): VoiceMode {
 }
 
 export function voiceModeLabel(mode: VoiceMode): string {
-  if (mode === "off") return "🔇 Off";
-  if (mode === "tap") return "▶ Tap";
-  return "🔊 Auto";
+  if (mode === "off") return "Off";
+  if (mode === "tap") return "Tap";
+  return "Auto";
 }
 
 export async function transcribeVoice(uri: string, token: string): Promise<string> {
