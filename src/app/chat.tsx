@@ -202,6 +202,7 @@ export default function ChatScreen() {
   const [voiceProgress, setVoiceProgress] = useState({ current: 0, duration: 0 });
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
+  const voiceTrackWidthRef = useRef(0);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 100);
 
@@ -308,6 +309,39 @@ export default function ChatScreen() {
     }
     if (voiceReply) void playVoiceText(voiceReply.text);
   }, [voicePlaying, voiceReply, playVoiceText]);
+
+  // Native status events are not guaranteed to tick at a visually useful cadence
+  // for streamed TTS. While playing, sample the player's authoritative clock so
+  // the progress bar and timestamp move smoothly and stay correct after seeks.
+  useEffect(() => {
+    if (!voicePlaying) return;
+    const timer = setInterval(() => {
+      const player = voicePlayerRef.current;
+      if (!player) return;
+      setVoiceProgress({ current: player.currentTime || 0, duration: player.duration || 0 });
+    }, 100);
+    return () => clearInterval(timer);
+  }, [voicePlaying]);
+
+  const seekVoiceReply = useCallback((fraction: number) => {
+    const player = voicePlayerRef.current;
+    const duration = player?.duration || voiceProgress.duration;
+    if (!player || !duration || !Number.isFinite(duration)) return;
+    const clamped = Math.max(0, Math.min(1, fraction));
+    const nextTime = duration * clamped;
+    setVoiceProgress({ current: nextTime, duration });
+    void player.seekTo(nextTime);
+  }, [voiceProgress.duration]);
+
+  const dismissVoiceReply = useCallback(() => {
+    voicePlayerSubRef.current?.remove();
+    voicePlayerSubRef.current = null;
+    voicePlayerRef.current?.remove();
+    voicePlayerRef.current = null;
+    setVoicePlaying(false);
+    setVoiceProgress({ current: 0, duration: 0 });
+    setVoiceReply(null);
+  }, []);
   const attach = useCallback(async () => {
     haptic.tap();
     const picked = await pickImages();
@@ -961,13 +995,61 @@ export default function ChatScreen() {
                   <Text role="bodyEm">Milo’s reply</Text>
                   <Text role="sub" ink={2}>{voiceMode === "auto" ? "Auto voice reply" : "Tap to listen"}</Text>
                 </View>
-                <Touchable accessibilityRole="button" accessibilityLabel={voicePlaying ? "Pause Milo voice reply" : "Play Milo voice reply"} onPress={toggleVoicePlayback} style={[styles.voicePlayButton, { backgroundColor: colors.accent }]}>
-                  <Text role="bodyEm" style={styles.voiceActionPrimary}>{voicePlaying ? "Ⅱ" : "▶"}</Text>
-                </Touchable>
+                <View style={styles.voiceReplyActions}>
+                  <Touchable
+                    accessibilityRole="button"
+                    accessibilityLabel={voicePlaying ? "Pause Milo voice reply" : "Play Milo voice reply"}
+                    onPress={toggleVoicePlayback}
+                    style={[styles.voicePlayButton, { backgroundColor: colors.accent }]}
+                  >
+                    <Text role="bodyEm" style={styles.voiceActionPrimary}>{voicePlaying ? "Ⅱ" : "▶"}</Text>
+                  </Touchable>
+                  <Touchable
+                    accessibilityRole="button"
+                    accessibilityLabel="Dismiss Milo voice reply"
+                    onPress={dismissVoiceReply}
+                    style={[styles.voiceDismissButton, { borderColor: colors.surfaceEdge }]}
+                  >
+                    <CloseIcon color={colors.ink2} />
+                  </Touchable>
+                </View>
               </View>
-              <View style={[styles.voiceTrack, { backgroundColor: colors.surfaceEdge }]}>
-                <View style={[styles.voiceTrackFill, { backgroundColor: colors.accent, flex: voiceProgress.duration > 0 ? Math.max(0.02, Math.min(1, voiceProgress.current / voiceProgress.duration)) : 0.02 }]} />
-                <View style={{ flex: voiceProgress.duration > 0 ? Math.max(0, 1 - Math.min(1, voiceProgress.current / voiceProgress.duration)) : 0.98 }} />
+              <View
+                style={styles.voiceTrackTouch}
+                onStartShouldSetResponder={() => true}
+                onMoveShouldSetResponder={() => true}
+                onResponderGrant={(event) => {
+                  // `locationX` is relative to this track; layout width is cached below.
+                  if (voiceTrackWidthRef.current > 0) {
+                    seekVoiceReply(event.nativeEvent.locationX / voiceTrackWidthRef.current);
+                  }
+                }}
+                onResponderMove={(event) => {
+                  if (voiceTrackWidthRef.current > 0) seekVoiceReply(event.nativeEvent.locationX / voiceTrackWidthRef.current);
+                }}
+                onLayout={(event) => { voiceTrackWidthRef.current = event.nativeEvent.layout.width; }}
+              >
+                <View pointerEvents="none" style={[styles.voiceTrackBase, { backgroundColor: colors.surfaceEdge }]} />
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.voiceTrackFill,
+                    {
+                      backgroundColor: colors.accent,
+                      width: `${voiceProgress.duration > 0 ? Math.max(0, Math.min(100, (voiceProgress.current / voiceProgress.duration) * 100)) : 0}%`,
+                    },
+                  ]}
+                />
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.voiceScrubber,
+                    {
+                      backgroundColor: colors.accent,
+                      left: `${voiceProgress.duration > 0 ? Math.max(0, Math.min(100, (voiceProgress.current / voiceProgress.duration) * 100)) : 0}%`,
+                    },
+                  ]}
+                />
               </View>
               <Text role="micro" ink={2}>{Math.floor(voiceProgress.current / 60)}:{Math.floor(voiceProgress.current % 60).toString().padStart(2, "0")}{voiceProgress.duration > 0 ? ` / ${Math.floor(voiceProgress.duration / 60)}:${Math.floor(voiceProgress.duration % 60).toString().padStart(2, "0")}` : ""}</Text>
             </View>
@@ -1012,6 +1094,27 @@ export default function ChatScreen() {
             >
               <MicrophoneIcon color={voiceRecording ? "#FFFFFF" : colors.ink2} />
             </Touchable>
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel={running ? "Stop" : "Send"}
+              disabled={aborting || (!running && !canSend)}
+              onPress={onPrimaryAction}
+              style={styles.composerSendTouch}
+            >
+              <Animated.View
+                style={[
+                  styles.send,
+                  morphStyle,
+                  { backgroundColor: running || aborting ? colors.danger : colors.accent, opacity: !running && !canSend ? 0.4 : 1 },
+                ]}
+              >
+                {running || aborting ? (
+                  <View style={styles.stopGlyph} />
+                ) : (
+                  <Text role="bodyEm" style={styles.sendGlyph}>↑</Text>
+                )}
+              </Animated.View>
+            </Touchable>
           </View>
           <View style={styles.chipRow}>
             <Touchable
@@ -1052,29 +1155,6 @@ export default function ChatScreen() {
                 </Text>
               </Touchable>
             ) : null}
-            <Touchable
-              accessibilityRole="button"
-              accessibilityLabel={running ? "Stop" : "Send"}
-              disabled={aborting || (!running && !canSend)}
-              onPress={onPrimaryAction}
-              style={styles.sendTouch}
-            >
-              <Animated.View
-                style={[
-                  styles.send,
-                  morphStyle,
-                  { backgroundColor: running || aborting ? colors.danger : colors.accent, opacity: !running && !canSend ? 0.4 : 1 },
-                ]}
-              >
-                {running || aborting ? (
-                  <View style={styles.stopGlyph} />
-                ) : (
-                  <Text role="bodyEm" style={styles.sendGlyph}>
-                    ↑
-                  </Text>
-                )}
-              </Animated.View>
-            </Touchable>
           </View>
         </View>
       </KeyboardAvoidingView>
@@ -1220,9 +1300,13 @@ const styles = StyleSheet.create({
   voiceActionPrimary: { color: "#FFFFFF" },
   voiceReplyCard: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, padding: space.md, gap: space.sm },
   voiceReplyTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  voicePlayButton: { width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center" },
-  voiceTrack: { height: 4, borderRadius: 2, flexDirection: "row", overflow: "hidden" },
-  voiceTrackFill: { height: 4 },
+  voiceReplyActions: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  voicePlayButton: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center" },
+  voiceDismissButton: { width: 44, height: 44, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center" },
+  voiceTrackTouch: { height: 18, justifyContent: "center", position: "relative", overflow: "visible" },
+  voiceTrackBase: { position: "absolute", left: 0, right: 0, top: 7, height: 4, borderRadius: 2 },
+  voiceTrackFill: { height: 4, borderRadius: 2, zIndex: 1 },
+  voiceScrubber: { position: "absolute", width: 12, height: 12, borderRadius: 6, top: 3, marginLeft: -6, zIndex: 2 },
   hidden: { display: "none" },
   spacer: { flex: 1 },
   queueSend: { paddingHorizontal: space.sm },
@@ -1230,7 +1314,7 @@ const styles = StyleSheet.create({
   permissionRow: { minHeight: 52 },
   permissionRowInner: { flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: 6 },
   permissionText: { flex: 1, gap: 1 },
-  sendTouch: { minHeight: 34 },
+  composerSendTouch: { width: 44, height: 44, marginLeft: space.sm, alignItems: "center", justifyContent: "center" },
   send: {
     width: 34,
     height: 34,
