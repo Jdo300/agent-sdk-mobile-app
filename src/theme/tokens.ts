@@ -52,21 +52,20 @@ export const palettes: Record<ThemeName, Palette> = {
     pressed: "rgba(32,32,32,0.06)",
   },
   dark: {
-    // Based on the actively used VOX-UI flutter-webui dark theme. Keep Bloop's
-    // secondary text a touch brighter for accessibility, but preserve Vox's
-    // neutral charcoal hierarchy and original blue action accent.
-    bg: "#1E1E1E",
-    surface: "#252526",
+    // Keep VOX-UI's text/accent hierarchy, but deepen the canvas and raised
+    // surfaces to match the richer near-black contrast seen in ChatGPT on iOS.
+    bg: "#0C0C0C",
+    surface: "#171717",
     surfaceEdge: "#444444",
     ink: "#FFFFFF",
-    ink2: "#CCCCCC",
+    ink2: "#D2D2D2",
     ink3: "#AAAAAA",
     accent: "#347AB8",
     run: "#4CAF50",
     wait: "#FF9800",
     danger: "#FF5252",
-    bubble: "#2C2C2C",
-    pressed: "rgba(52,122,184,0.16)",
+    bubble: "#222222",
+    pressed: "rgba(52,122,184,0.18)",
   },
 };
 
