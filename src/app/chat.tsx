@@ -193,6 +193,7 @@ export default function ChatScreen() {
   const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(() => new Set());
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [voiceMode, setVoiceModeState] = useState<VoiceMode>("tap");
+  const [voiceModeLoaded, setVoiceModeLoaded] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [transcribingVoice, setTranscribingVoice] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
@@ -205,7 +206,10 @@ export default function ChatScreen() {
   const recorderState = useAudioRecorderState(recorder, 100);
 
   useEffect(() => {
-    void getVoiceMode().then(setVoiceModeState);
+    void getVoiceMode().then((mode) => {
+      setVoiceModeState(mode);
+      setVoiceModeLoaded(true);
+    });
     return () => {
       voicePlayerSubRef.current?.remove();
       voicePlayerRef.current?.remove();
@@ -273,6 +277,9 @@ export default function ChatScreen() {
     if (!activeProfile || !text.trim()) return;
     try {
       setVoiceError(null);
+      // Playback should be reliable regardless of whether the microphone was
+      // used first, and should remain audible with the iPhone silent switch on.
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
       const token = (await getSecret(activeProfile.id)) ?? "";
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
       voicePlayerSubRef.current?.remove();
@@ -557,25 +564,43 @@ export default function ChatScreen() {
   const running = snapshot.run === "running" || snapshot.run === "awaiting_approval";
   const aborting = snapshot.run === "aborting";
   const previousRunRef = useRef(snapshot.run);
+  const voiceRunPendingRef = useRef(false);
+  const voiceBaselineAssistantIdRef = useRef<string | null>(null);
   useEffect(() => {
-    const previous = previousRunRef.current;
-    previousRunRef.current = snapshot.run;
-    if (previous === "idle" || snapshot.run !== "idle") return;
-    const last = [...snapshot.transcript].reverse().find(
+    const latestCompletedAssistant = [...snapshot.transcript].reverse().find(
       (item) => item.kind === "assistant" && !item.streaming && !item.interrupted && item.text.trim().length > 0,
     );
-    if (!last || last.kind !== "assistant") return;
-    const timer = setTimeout(() => {
-      setVoiceReply({ id: last.id, text: last.text });
-      setVoiceProgress({ current: 0, duration: 0 });
-      voicePlayerSubRef.current?.remove();
-      voicePlayerRef.current?.remove();
-      voicePlayerRef.current = null;
-      setVoicePlaying(false);
-      if (voiceMode === "auto") void playVoiceText(last.text);
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [snapshot.run, snapshot.transcript, voiceMode, playVoiceText]);
+    const previous = previousRunRef.current;
+    previousRunRef.current = snapshot.run;
+
+    // Mark the beginning of a new run and remember the last completed reply that
+    // existed before it. The app-server can report idle a moment before the final
+    // assistant transcript row is marked complete, so do not require both events
+    // to land in the same render.
+    if (previous === "idle" && snapshot.run !== "idle") {
+      voiceRunPendingRef.current = true;
+      voiceBaselineAssistantIdRef.current =
+        latestCompletedAssistant?.kind === "assistant" ? latestCompletedAssistant.id : null;
+      return;
+    }
+
+    if (!voiceRunPendingRef.current || snapshot.run !== "idle") return;
+    if (!voiceModeLoaded) return;
+    if (!latestCompletedAssistant || latestCompletedAssistant.kind !== "assistant") return;
+    if (latestCompletedAssistant.id === voiceBaselineAssistantIdRef.current) return;
+
+    // We now have the completed assistant reply for the run that just ended.
+    // Clear the pending flag only after the new row actually arrives so a small
+    // protocol/transcript timing skew cannot make auto voice silently miss it.
+    voiceRunPendingRef.current = false;
+    setVoiceReply({ id: latestCompletedAssistant.id, text: latestCompletedAssistant.text });
+    setVoiceProgress({ current: 0, duration: 0 });
+    voicePlayerSubRef.current?.remove();
+    voicePlayerRef.current?.remove();
+    voicePlayerRef.current = null;
+    setVoicePlaying(false);
+    if (voiceMode === "auto") void playVoiceText(latestCompletedAssistant.text);
+  }, [snapshot.run, snapshot.transcript, voiceMode, voiceModeLoaded, playVoiceText]);
 
   const refreshAgentSecrets = useCallback(async () => {
     const session = sessionRef.current;
@@ -1186,7 +1211,7 @@ const styles = StyleSheet.create({
   chipRow: { flexDirection: "row", alignItems: "center", gap: space.sm },
   voiceModePill: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.chip, paddingHorizontal: space.md, paddingVertical: 7 },
   voiceModeContent: { flexDirection: "row", alignItems: "center", gap: 7 },
-  micButton: { width: 38, height: 38, borderRadius: 19, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", marginLeft: space.sm },
+  micButton: { width: 44, height: 44, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", marginLeft: space.sm },
   voiceRecorderPanel: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.sheet, paddingHorizontal: space.lg, paddingVertical: space.md, gap: space.sm, alignItems: "center" },
   waveform: { height: 48, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3, width: "100%" },
   waveBar: { width: 3, borderRadius: 2 },
