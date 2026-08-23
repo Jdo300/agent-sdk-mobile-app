@@ -20,6 +20,9 @@ import { Text } from "../ui/Text";
 import { Touchable } from "../ui/Touchable";
 import { SyntaxCode } from "./SyntaxCode";
 import { setViewerPayload } from "../../lib/viewerPayload";
+import { getSecret } from "../../lib/profiles/profiles";
+import { useProfiles } from "../../lib/profiles/ProfilesContext";
+import { VOICE_BASE_URL } from "../../lib/voice";
 
 // ── Fence-aware block splitting (paseo packages/app/src/utils) ──────────────
 
@@ -83,6 +86,8 @@ export function splitMarkdownBlocks(text: string): string[] {
 
 // linkify makes bare URLs tappable — agent replies rarely bother with [](…).
 const parser = MarkdownIt({ typographer: true, linkify: true });
+const defaultValidateLink = parser.validateLink.bind(parser);
+parser.validateLink = (url) => url.startsWith("file:///mnt/shared/") || defaultValidateLink(url);
 
 function openLink(url: string): boolean {
   Linking.openURL(url).catch(() => {});
@@ -158,6 +163,57 @@ function fenceLanguage(node: ASTNode): string | null {
   return info ? info.split(/\s+/)[0]! : null;
 }
 
+function localMiloImagePath(src: string): string | null {
+  if (src.startsWith("/mnt/shared/")) return src;
+  if (src.startsWith("file:///mnt/shared/")) return src.slice("file://".length);
+  if (src.startsWith("milo-file:///mnt/shared/")) return src.slice("milo-file://".length);
+  return null;
+}
+
+function MarkdownImage({ uri, alt, style }: { uri: string; alt?: string; style: object }) {
+  const { activeProfile } = useProfiles();
+  const localPath = localMiloImagePath(uri);
+  const [token, setToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    if (!localPath || !activeProfile) {
+      setToken(null);
+      return () => { live = false; };
+    }
+    void getSecret(activeProfile.id).then((value) => {
+      if (live) setToken(value);
+    });
+    return () => { live = false; };
+  }, [activeProfile, localPath]);
+
+  const resolvedUri = localPath
+    ? `${VOICE_BASE_URL}/voice/image?path=${encodeURIComponent(localPath)}`
+    : uri;
+  const headers = localPath && token ? { Authorization: `Bearer ${token}` } : undefined;
+  if (localPath && !token) return null;
+
+  return (
+    <Touchable
+      accessibilityRole="button"
+      accessibilityLabel={alt ? `Open image: ${alt}` : "Open image"}
+      onPress={() => {
+        setViewerPayload({ kind: "image", uri: resolvedUri, ...(alt ? { alt } : {}), ...(headers ? { headers } : {}) });
+        router.push("/image-viewer");
+      }}
+      scaleOnPress={false}
+    >
+      <FitImage
+        indicator
+        source={{ uri: resolvedUri, ...(headers ? { headers } : {}) }}
+        style={style}
+        accessible={Boolean(alt)}
+        accessibilityLabel={alt}
+      />
+    </Touchable>
+  );
+}
+
 function TableRow({
   node,
   children,
@@ -200,31 +256,13 @@ const rules: RenderRules = {
   image: (node, _children, _parentNodes, markdownStyle, allowedImageHandlers, defaultImageHandler) => {
     const src = String(node.attributes.src ?? "");
     const alt = node.attributes.alt ? String(node.attributes.alt) : undefined;
-    const show = allowedImageHandlers.some((handler) => src.toLowerCase().startsWith(handler.toLowerCase()));
+    const localPath = localMiloImagePath(src);
+    const show = localPath !== null
+      || src.toLowerCase().startsWith("data:image/webp;base64")
+      || allowedImageHandlers.some((handler) => src.toLowerCase().startsWith(handler.toLowerCase()));
     if (!show && defaultImageHandler === null) return null;
-    const uri = show ? src : `${defaultImageHandler}${src}`;
-    // React 19 warns when `key` is included in a spread props object. The
-    // upstream renderer still does that, so pass key directly instead.
-    return (
-      <Touchable
-        key={node.key}
-        accessibilityRole="button"
-        accessibilityLabel={alt ? `Open image: ${alt}` : "Open image"}
-        onPress={() => {
-          setViewerPayload({ kind: "image", uri, ...(alt ? { alt } : {}) });
-          router.push("/image-viewer");
-        }}
-        scaleOnPress={false}
-      >
-        <FitImage
-          indicator
-          source={{ uri }}
-          style={markdownStyle._VIEW_SAFE_image}
-          accessible={Boolean(alt)}
-          accessibilityLabel={alt}
-        />
-      </Touchable>
-    );
+    const uri = localPath !== null ? src : show ? src : `${defaultImageHandler}${src}`;
+    return <MarkdownImage key={node.key} uri={uri} alt={alt} style={markdownStyle._VIEW_SAFE_image} />;
   },
   tr: (node, children, parentNodes, markdownStyle) => (
     <TableRow

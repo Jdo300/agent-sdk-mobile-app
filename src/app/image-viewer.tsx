@@ -10,6 +10,7 @@ export default function ImageViewerScreen() {
   const payload = getViewerPayload();
   const uri = payload?.kind === "image" ? payload.uri : null;
   const alt = payload?.kind === "image" ? payload.alt : undefined;
+  const headers = payload?.kind === "image" ? payload.headers : undefined;
   const { colors } = useTheme();
   const { width, height } = useWindowDimensions();
 
@@ -28,7 +29,7 @@ export default function ImageViewerScreen() {
           showsVerticalScrollIndicator={false}
         >
           <Image
-            source={{ uri }}
+            source={{ uri, ...(headers ? { headers } : {}) }}
             style={{ width, height: Math.max(300, height - 120), backgroundColor: colors.bg }}
             contentFit="contain"
             accessible={Boolean(alt)}

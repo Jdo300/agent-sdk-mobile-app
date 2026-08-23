@@ -309,6 +309,17 @@ export default function ChatScreen() {
         setVoicePlaying(false);
       } else {
         const duration = player.duration || voiceProgress.duration;
+        // Cards created against the old chunked TTS endpoint can have an
+        // exhausted player with no duration. Recreate those against the now
+        // seekable, range-enabled gateway instead of trying to resume a dead stream.
+        if (duration <= 0 && player.currentTime > 0 && voiceReply) {
+          voicePlayerSubRef.current?.remove();
+          voicePlayerSubRef.current = null;
+          player.remove();
+          voicePlayerRef.current = null;
+          void playVoiceText(voiceReply.text);
+          return;
+        }
         const atEnd = duration > 0 && player.currentTime >= duration - 0.15;
         const resume = async () => {
           if (atEnd) await player.seekTo(0);
