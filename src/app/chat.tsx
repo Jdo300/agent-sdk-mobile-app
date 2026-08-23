@@ -424,6 +424,7 @@ export default function ChatScreen() {
   );
   const onToolPress = useCallback((id: string) => {
     setDetailToolId(id);
+    Keyboard.dismiss();
     toolSheetRef.current?.present();
   }, []);
 
@@ -854,7 +855,13 @@ export default function ChatScreen() {
               onEditProfile={() => router.push("/profile")}
             />
           ) : null}
-          <QueueCapsule queue={snapshot.queue} onPress={() => queueSheetRef.current?.present()} />
+          <QueueCapsule
+            queue={snapshot.queue}
+            onPress={() => {
+              Keyboard.dismiss();
+              queueSheetRef.current?.present();
+            }}
+          />
           {snapshot.approvals[0] ? (
             <ApprovalCard
               request={snapshot.approvals[0]}
@@ -997,7 +1004,10 @@ export default function ChatScreen() {
               <Touchable
                 accessibilityRole="button"
                 accessibilityLabel={`Permission mode: ${snapshot.device.permissionMode}. Change controls`}
-                onPress={() => controlsSheetRef.current?.present()}
+                onPress={() => {
+                  Keyboard.dismiss();
+                  controlsSheetRef.current?.present();
+                }}
                 style={styles.modelChip}
               >
                 <Text role="sub" ink={2}>

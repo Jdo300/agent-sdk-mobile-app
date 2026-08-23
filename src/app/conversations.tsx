@@ -3,7 +3,7 @@
  * pagination (docs/design-doc.md §4.3). Cloud lists via REST, remote via
  * protocol `conversation_list`.
  */
-import type { BottomSheetModal } from "@gorhom/bottom-sheet";
+import { BottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
 import { router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Alert, FlatList, RefreshControl, StyleSheet, TextInput, View } from "react-native";
@@ -310,7 +310,7 @@ export default function ConversationsScreen() {
         />
       )}
       <Sheet ref={renameSheetRef} title="Rename conversation">
-        <TextInput
+        <BottomSheetTextInput
           value={draftTitle}
           onChangeText={setDraftTitle}
           placeholder="Conversation title"
