@@ -52,21 +52,20 @@ export const palettes: Record<ThemeName, Palette> = {
     pressed: "rgba(32,32,32,0.06)",
   },
   dark: {
-    // Accessibility-leaning dark palette: stronger separation between the
-    // canvas, raised surfaces, borders, and secondary/tertiary text while
-    // keeping the same neutral Bloop character.
-    bg: "#101114",
-    surface: "#1B1D22",
-    surfaceEdge: "#444852",
-    ink: "#F7F8FA",
-    ink2: "#C4C8D0",
-    ink3: "#969CA7",
-    accent: "#A8B2FF",
-    run: "#49D9A0",
-    wait: "#F0B24B",
-    danger: "#FF7061",
-    bubble: "#292C34",
-    pressed: "rgba(247,248,250,0.13)",
+    // High-contrast cool dark palette: near-black navy canvas with blue-gray
+    // raised surfaces, brighter text, and stronger boundaries for low vision.
+    bg: "#070A0F",
+    surface: "#111722",
+    surfaceEdge: "#3B4658",
+    ink: "#FFFFFF",
+    ink2: "#D7DDE8",
+    ink3: "#AAB4C4",
+    accent: "#A7B5FF",
+    run: "#4CE0A6",
+    wait: "#F4B84F",
+    danger: "#FF7468",
+    bubble: "#1C2635",
+    pressed: "rgba(167,181,255,0.16)",
   },
 };
 

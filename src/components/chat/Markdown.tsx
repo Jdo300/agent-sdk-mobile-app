@@ -10,6 +10,7 @@ import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from 
 import { Linking, Platform, ScrollView, StyleSheet, View, type TextStyle } from "react-native";
 import MarkdownDisplay, { MarkdownIt, type ASTNode, type RenderRules } from "react-native-markdown-display";
 import * as Clipboard from "expo-clipboard";
+import FitImage from "react-native-fit-image";
 
 import { haptic } from "../../lib/haptics";
 import { useTheme } from "../../theme/ThemeProvider";
@@ -176,6 +177,25 @@ function TableRow({
 const rules: RenderRules = {
   fence: (node) => <CodeFence key={node.key} code={node.content} language={fenceLanguage(node)} />,
   code_block: (node) => <CodeFence key={node.key} code={node.content} language={null} />,
+  image: (node, _children, _parentNodes, markdownStyle, allowedImageHandlers, defaultImageHandler) => {
+    const src = String(node.attributes.src ?? "");
+    const alt = node.attributes.alt ? String(node.attributes.alt) : undefined;
+    const show = allowedImageHandlers.some((handler) => src.toLowerCase().startsWith(handler.toLowerCase()));
+    if (!show && defaultImageHandler === null) return null;
+    const uri = show ? src : `${defaultImageHandler}${src}`;
+    // React 19 warns when `key` is included in a spread props object. The
+    // upstream renderer still does that, so pass key directly instead.
+    return (
+      <FitImage
+        key={node.key}
+        indicator
+        source={{ uri }}
+        style={markdownStyle._VIEW_SAFE_image}
+        accessible={Boolean(alt)}
+        accessibilityLabel={alt}
+      />
+    );
+  },
   tr: (node, children, parentNodes, markdownStyle) => (
     <TableRow
       key={node.key}
