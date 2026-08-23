@@ -52,20 +52,21 @@ export const palettes: Record<ThemeName, Palette> = {
     pressed: "rgba(32,32,32,0.06)",
   },
   dark: {
-    // High-contrast cool dark palette: near-black navy canvas with blue-gray
-    // raised surfaces, brighter text, and stronger boundaries for low vision.
-    bg: "#070A0F",
-    surface: "#111722",
-    surfaceEdge: "#3B4658",
+    // Based on the actively used VOX-UI flutter-webui dark theme. Keep Bloop's
+    // secondary text a touch brighter for accessibility, but preserve Vox's
+    // neutral charcoal hierarchy and original blue action accent.
+    bg: "#1E1E1E",
+    surface: "#252526",
+    surfaceEdge: "#444444",
     ink: "#FFFFFF",
-    ink2: "#D7DDE8",
-    ink3: "#AAB4C4",
-    accent: "#A7B5FF",
-    run: "#4CE0A6",
-    wait: "#F4B84F",
-    danger: "#FF7468",
-    bubble: "#1C2635",
-    pressed: "rgba(167,181,255,0.16)",
+    ink2: "#CCCCCC",
+    ink3: "#AAAAAA",
+    accent: "#347AB8",
+    run: "#4CAF50",
+    wait: "#FF9800",
+    danger: "#FF5252",
+    bubble: "#2C2C2C",
+    pressed: "rgba(52,122,184,0.16)",
   },
 };
 
