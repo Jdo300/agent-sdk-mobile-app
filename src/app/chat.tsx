@@ -710,7 +710,7 @@ export default function ChatScreen() {
     morph.set(withSpring(running || aborting ? 1 : 0, motion.move));
   }, [running, aborting, morph]);
   const morphStyle = useAnimatedStyle(() => ({
-    borderRadius: 17 - morph.get() * 9,
+    borderRadius: 22 - morph.get() * 14,
   }));
 
   const onPrimaryAction = useCallback(async () => {
