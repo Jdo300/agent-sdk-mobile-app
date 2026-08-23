@@ -11,7 +11,7 @@ import { Linking, Platform, ScrollView, StyleSheet, View, type TextStyle } from 
 import { router } from "expo-router";
 import MarkdownDisplay, { MarkdownIt, type ASTNode, type RenderRules } from "react-native-markdown-display";
 import * as Clipboard from "expo-clipboard";
-import FitImage from "react-native-fit-image";
+import { Image } from "expo-image";
 
 import { haptic } from "../../lib/haptics";
 import { useTheme } from "../../theme/ThemeProvider";
@@ -174,6 +174,7 @@ function MarkdownImage({ uri, alt, style }: { uri: string; alt?: string; style: 
   const { activeProfile } = useProfiles();
   const localPath = localMiloImagePath(uri);
   const [token, setToken] = useState<string | null>(null);
+  const [aspectRatio, setAspectRatio] = useState(16 / 9);
 
   useEffect(() => {
     let live = true;
@@ -202,11 +203,17 @@ function MarkdownImage({ uri, alt, style }: { uri: string; alt?: string; style: 
         router.push("/image-viewer");
       }}
       scaleOnPress={false}
+      style={{ width: "100%" }}
     >
-      <FitImage
-        indicator
+      <Image
         source={{ uri: resolvedUri, ...(headers ? { headers } : {}) }}
-        style={style}
+        style={[style, { width: "100%", aspectRatio, borderRadius: radius.row }]}
+        contentFit="contain"
+        transition={120}
+        onLoad={(event) => {
+          const { width, height } = event.source;
+          if (width > 0 && height > 0) setAspectRatio(width / height);
+        }}
         accessible={Boolean(alt)}
         accessibilityLabel={alt}
       />
