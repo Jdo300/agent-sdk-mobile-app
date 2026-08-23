@@ -34,7 +34,10 @@ export interface AgentSummary {
 }
 
 /** Display projection of the SDK's model entry — same fields, same names. */
-export type ModelOption = Pick<LettaCodeModelEntry, "id" | "handle" | "label">;
+export interface ModelOption extends Pick<LettaCodeModelEntry, "id" | "handle" | "label"> {
+  /** Reasoning tiers the server catalog actually exposes for this model. */
+  supportedEfforts?: ReasoningEffort[];
+}
 
 interface Connection {
   profile: Profile;
@@ -382,10 +385,27 @@ export async function listModels(conn: Connection): Promise<ModelOption[]> {
   // catalog entry. The handle is what we send back when selecting a model, so
   // collapse duplicates here rather than rendering duplicate rows (and duplicate
   // React keys) in every model picker. Preserve server order and the first label.
+  const effortOrder: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
   const unique = new Map<string, ModelOption>();
   for (const entry of entries) {
-    if (!unique.has(entry.handle)) {
-      unique.set(entry.handle, { id: entry.id, handle: entry.handle, label: entry.label });
+    const rawEffort = entry.updateArgs?.reasoning_effort;
+    const effort = effortOrder.includes(rawEffort as ReasoningEffort)
+      ? (rawEffort as ReasoningEffort)
+      : null;
+    const existing = unique.get(entry.handle);
+    if (!existing) {
+      unique.set(entry.handle, {
+        id: entry.id,
+        handle: entry.handle,
+        label: entry.label,
+        ...(conn.profile.type === "remote" ? { supportedEfforts: effort ? [effort] : [] } : {}),
+      });
+      continue;
+    }
+    if (conn.profile.type === "remote" && effort && !existing.supportedEfforts?.includes(effort)) {
+      existing.supportedEfforts = [...(existing.supportedEfforts ?? []), effort].sort(
+        (a, b) => effortOrder.indexOf(a) - effortOrder.indexOf(b),
+      );
     }
   }
   return [...unique.values()];

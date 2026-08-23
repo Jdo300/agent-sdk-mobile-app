@@ -39,6 +39,8 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
       m.label.toLowerCase().includes(search.toLowerCase()) ||
       m.handle.toLowerCase().includes(search.toLowerCase()),
   );
+  const activeModel = models.find((m) => m.handle === currentModel) ?? (models.length === 1 ? models[0] : undefined);
+  const efforts = activeModel?.supportedEfforts ?? EFFORTS;
 
   return (
     <Sheet ref={ref} title="Model">
@@ -51,12 +53,13 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
         autoFocus
         style={[styles.search, { borderColor: colors.surfaceEdge, color: colors.ink }]}
       />
-      <View style={styles.effortBlock}>
-        <Text role="micro" ink={3}>
-          Reasoning effort
-        </Text>
-        <View style={[styles.segment, { borderColor: colors.surfaceEdge }]}>
-          {EFFORTS.map((e) => (
+      {efforts.length > 0 ? (
+        <View style={styles.effortBlock}>
+          <Text role="micro" ink={3}>
+            Reasoning effort
+          </Text>
+          <View style={[styles.segment, { borderColor: colors.surfaceEdge }]}>
+            {efforts.map((e) => (
             <Touchable
               key={e}
               accessibilityRole="button"
@@ -68,9 +71,10 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
                 {e}
               </Text>
             </Touchable>
-          ))}
+            ))}
+          </View>
         </View>
-      </View>
+      ) : null}
       {error ? (
         <Text role="sub" tone="danger">
           {error}
