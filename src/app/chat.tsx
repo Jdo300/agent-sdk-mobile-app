@@ -288,8 +288,9 @@ export default function ChatScreen() {
       const player = createAudioPlayer(speechSource(text, token), { updateInterval: 150 });
       voicePlayerRef.current = player;
       voicePlayerSubRef.current = player.addListener("playbackStatusUpdate", (status) => {
-        setVoicePlaying(status.playing);
-        setVoiceProgress({ current: status.currentTime || 0, duration: status.duration || 0 });
+        if (status.duration > 0) {
+          setVoiceProgress({ current: status.currentTime || 0, duration: status.duration });
+        }
         if (status.didJustFinish) setVoicePlaying(false);
       });
       player.play();
@@ -303,25 +304,37 @@ export default function ChatScreen() {
   const toggleVoicePlayback = useCallback(() => {
     const player = voicePlayerRef.current;
     if (player) {
-      if (voicePlaying) player.pause();
-      else player.play();
+      if (player.playing) {
+        player.pause();
+        setVoicePlaying(false);
+      } else {
+        const duration = player.duration || voiceProgress.duration;
+        const atEnd = duration > 0 && player.currentTime >= duration - 0.15;
+        const resume = async () => {
+          if (atEnd) await player.seekTo(0);
+          player.play();
+          setVoicePlaying(true);
+        };
+        void resume();
+      }
       return;
     }
     if (voiceReply) void playVoiceText(voiceReply.text);
-  }, [voicePlaying, voiceReply, playVoiceText]);
+  }, [voiceReply, voiceProgress.duration, playVoiceText]);
 
-  // Native status events are not guaranteed to tick at a visually useful cadence
-  // for streamed TTS. While playing, sample the player's authoritative clock so
-  // the progress bar and timestamp move smoothly and stay correct after seeks.
+  // Sample the native player's authoritative state for as long as the card has
+  // a player. This avoids an early non-playing load event freezing the React
+  // progress state even though native audio has actually started.
   useEffect(() => {
-    if (!voicePlaying) return;
+    if (!voiceReply) return;
     const timer = setInterval(() => {
       const player = voicePlayerRef.current;
       if (!player) return;
+      setVoicePlaying(player.playing);
       setVoiceProgress({ current: player.currentTime || 0, duration: player.duration || 0 });
     }, 100);
     return () => clearInterval(timer);
-  }, [voicePlaying]);
+  }, [voiceReply]);
 
   const seekVoiceReply = useCallback((fraction: number) => {
     const player = voicePlayerRef.current;
@@ -1316,9 +1329,9 @@ const styles = StyleSheet.create({
   permissionText: { flex: 1, gap: 1 },
   composerSendTouch: { width: 44, height: 44, marginLeft: space.sm, alignItems: "center", justifyContent: "center" },
   send: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     alignItems: "center",
     justifyContent: "center",
   },

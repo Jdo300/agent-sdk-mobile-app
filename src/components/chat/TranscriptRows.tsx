@@ -5,6 +5,7 @@
  */
 import { memo, useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { router } from "expo-router";
 import { Image } from "expo-image";
 import Animated, {
   Easing,
@@ -21,6 +22,7 @@ import { Touchable } from "../ui/Touchable";
 import { Markdown, useCopyFeedback } from "./Markdown";
 import type { AssistantItem, ErrorItem, ReasoningItem, ToolItem, UserItem } from "../../lib/letta/model";
 import type { ToolGroupItem } from "../../lib/letta/grouping";
+import { setViewerPayload } from "../../lib/viewerPayload";
 
 // ── User ────────────────────────────────────────────────────────────────────
 
@@ -51,7 +53,18 @@ export const UserBubble = memo(function UserBubble({ item, onRetry }: { item: Us
             <View style={styles.userImages}>
               {/* Indexed: the same image can legitimately be attached twice. */}
               {item.images.map((uri, index) => (
-                <Image key={`${index}-${uri}`} source={{ uri }} style={styles.userImage} contentFit="cover" />
+                <Touchable
+                  key={`${index}-${uri}`}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open attached image"
+                  onPress={() => {
+                    setViewerPayload({ kind: "image", uri });
+                    router.push("/image-viewer");
+                  }}
+                  scaleOnPress={false}
+                >
+                  <Image source={{ uri }} style={styles.userImage} contentFit="cover" />
+                </Touchable>
               ))}
             </View>
           ) : null}

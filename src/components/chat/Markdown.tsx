@@ -8,6 +8,7 @@
  */
 import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Linking, Platform, ScrollView, StyleSheet, View, type TextStyle } from "react-native";
+import { router } from "expo-router";
 import MarkdownDisplay, { MarkdownIt, type ASTNode, type RenderRules } from "react-native-markdown-display";
 import * as Clipboard from "expo-clipboard";
 import FitImage from "react-native-fit-image";
@@ -17,6 +18,8 @@ import { useTheme } from "../../theme/ThemeProvider";
 import { radius, space, monoFamily, type as typeScale, type Palette } from "../../theme/tokens";
 import { Text } from "../ui/Text";
 import { Touchable } from "../ui/Touchable";
+import { SyntaxCode } from "./SyntaxCode";
+import { setViewerPayload } from "../../lib/viewerPayload";
 
 // ── Fence-aware block splitting (paseo packages/app/src/utils) ──────────────
 
@@ -117,21 +120,32 @@ function CodeFence({ code, language }: { code: string; language: string | null }
         <Text role="micro" ink={3}>
           {language ?? "code"}
         </Text>
-        <Touchable
-          accessibilityRole="button"
-          accessibilityLabel={copied ? "Code copied" : "Copy code"}
-          onPress={copy}
-          style={styles.fenceCopy}
-        >
-          <Text role="micro" ink={copied ? 2 : 3}>
-            {copied ? "copied ✓" : "copy"}
-          </Text>
-        </Touchable>
+        <View style={styles.fenceActions}>
+          <Touchable
+            accessibilityRole="button"
+            accessibilityLabel="Open code full screen"
+            onPress={() => {
+              setViewerPayload({ kind: "code", code: body, language });
+              router.push("/code-viewer");
+            }}
+            style={styles.fenceCopy}
+          >
+            <Text role="micro" ink={3}>expand</Text>
+          </Touchable>
+          <Touchable
+            accessibilityRole="button"
+            accessibilityLabel={copied ? "Code copied" : "Copy code"}
+            onPress={copy}
+            style={styles.fenceCopy}
+          >
+            <Text role="micro" ink={copied ? 2 : 3}>
+              {copied ? "copied ✓" : "copy"}
+            </Text>
+          </Touchable>
+        </View>
       </View>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.fenceScroll}>
-        <Text role="sub" mono>
-          {body}
-        </Text>
+        <SyntaxCode code={body} language={language} />
       </ScrollView>
     </View>
   );
@@ -192,14 +206,24 @@ const rules: RenderRules = {
     // React 19 warns when `key` is included in a spread props object. The
     // upstream renderer still does that, so pass key directly instead.
     return (
-      <FitImage
+      <Touchable
         key={node.key}
-        indicator
-        source={{ uri }}
-        style={markdownStyle._VIEW_SAFE_image}
-        accessible={Boolean(alt)}
-        accessibilityLabel={alt}
-      />
+        accessibilityRole="button"
+        accessibilityLabel={alt ? `Open image: ${alt}` : "Open image"}
+        onPress={() => {
+          setViewerPayload({ kind: "image", uri, ...(alt ? { alt } : {}) });
+          router.push("/image-viewer");
+        }}
+        scaleOnPress={false}
+      >
+        <FitImage
+          indicator
+          source={{ uri }}
+          style={markdownStyle._VIEW_SAFE_image}
+          accessible={Boolean(alt)}
+          accessibilityLabel={alt}
+        />
+      </Touchable>
     );
   },
   tr: (node, children, parentNodes, markdownStyle) => (
@@ -333,6 +357,7 @@ const styles = StyleSheet.create({
     paddingRight: space.sm,
     paddingTop: space.sm,
   },
+  fenceActions: { flexDirection: "row", alignItems: "center", gap: space.xs },
   fenceCopy: { minHeight: 28, paddingHorizontal: space.xs },
   fenceScroll: { paddingHorizontal: space.md, paddingBottom: space.md, paddingTop: space.xs },
 });
