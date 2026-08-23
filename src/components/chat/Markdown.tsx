@@ -155,17 +155,23 @@ function TableRow({
   parentNodes: ReadonlyArray<ASTNode>;
   baseStyle: object;
 }) {
-  const { colors } = useTheme();
+  const { colors, name: themeName } = useTheme();
   const parent = parentNodes[0];
   const rowIndex = parent?.children?.findIndex((child) => child.key === node.key) ?? 0;
   const isHeader = parent?.type === "thead";
-  // Header is strongest; body rows alternate between raised and bubble fills.
-  // The alternating fill makes wide tables much easier to track horizontally.
-  const backgroundColor = isHeader
-    ? colors.bubble
-    : rowIndex % 2 === 0
-      ? colors.surface
-      : colors.pressed;
+  // Keep dark-mode striping subtle and cool: two close blue-grays rather than
+  // a neutral row alternating with an accent-colored pressed state.
+  const backgroundColor = themeName === "dark"
+    ? isHeader
+      ? "#242A31"
+      : rowIndex % 2 === 0
+        ? "#171A1E"
+        : "#20252B"
+    : isHeader
+      ? colors.bubble
+      : rowIndex % 2 === 0
+        ? colors.surface
+        : colors.pressed;
 
   return (
     <View key={node.key} style={[baseStyle, { backgroundColor }]}>
