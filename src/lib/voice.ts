@@ -6,6 +6,7 @@ const MODE_KEY = "milo.voice.mode.v1";
 export const VOICE_BASE_URL = "https://rgai-letta.resonancegroupusa.com";
 export const WHISPER_MODEL = "Systran/faster-whisper-medium.en";
 export const KOKORO_VOICE = "bm_george";
+export const KOKORO_PLAYBACK_RATE = 1.1;
 
 export async function getVoiceMode(): Promise<VoiceMode> {
   const saved = await AsyncStorage.getItem(MODE_KEY);

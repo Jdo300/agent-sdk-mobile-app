@@ -83,6 +83,7 @@ import {
   setVoiceMode as persistVoiceMode,
   speechSource,
   transcribeVoice,
+  KOKORO_PLAYBACK_RATE,
   voiceModeLabel,
   type VoiceMode,
 } from "../lib/voice";
@@ -202,6 +203,8 @@ export default function ChatScreen() {
   const [voiceProgress, setVoiceProgress] = useState({ current: 0, duration: 0 });
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
+  const voicePlayRequestRef = useRef(0);
+  const autoPlayedVoiceIdsRef = useRef(new Set<string>());
   const voiceTrackWidthRef = useRef(0);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 100);
@@ -212,6 +215,7 @@ export default function ChatScreen() {
       setVoiceModeLoaded(true);
     });
     return () => {
+      voicePlayRequestRef.current += 1;
       voicePlayerSubRef.current?.remove();
       voicePlayerRef.current?.remove();
     };
@@ -222,6 +226,7 @@ export default function ChatScreen() {
     setVoiceModeState(next);
     void persistVoiceMode(next);
     if (next === "off") {
+      voicePlayRequestRef.current += 1;
       voicePlayerRef.current?.pause();
       setVoicePlaying(false);
     }
@@ -276,16 +281,32 @@ export default function ChatScreen() {
 
   const playVoiceText = useCallback(async (text: string) => {
     if (!activeProfile || !text.trim()) return;
+
+    // A voice start has async setup work before AVPlayer can be created. Retire
+    // the current player immediately and invalidate any older start still in
+    // flight so two clips can never survive that setup window together.
+    const requestId = ++voicePlayRequestRef.current;
+    voicePlayerSubRef.current?.remove();
+    voicePlayerSubRef.current = null;
+    voicePlayerRef.current?.remove();
+    voicePlayerRef.current = null;
+    setVoicePlaying(false);
+    setVoiceProgress({ current: 0, duration: 0 });
+
     try {
       setVoiceError(null);
       // Playback should be reliable regardless of whether the microphone was
       // used first, and should remain audible with the iPhone silent switch on.
       await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
       const token = (await getSecret(activeProfile.id)) ?? "";
+      if (requestId !== voicePlayRequestRef.current) return;
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
-      voicePlayerSubRef.current?.remove();
-      voicePlayerRef.current?.remove();
       const player = createAudioPlayer(speechSource(text, token), { updateInterval: 150 });
+      if (requestId !== voicePlayRequestRef.current) {
+        player.remove();
+        return;
+      }
+      player.setPlaybackRate(KOKORO_PLAYBACK_RATE, "high");
       voicePlayerRef.current = player;
       voicePlayerSubRef.current = player.addListener("playbackStatusUpdate", (status) => {
         if (status.duration > 0) {
@@ -296,6 +317,7 @@ export default function ChatScreen() {
       player.play();
       setVoicePlaying(true);
     } catch (error) {
+      if (requestId !== voicePlayRequestRef.current) return;
       setVoicePlaying(false);
       setVoiceError(error instanceof Error ? error.message : "Voice playback failed.");
     }
@@ -358,6 +380,7 @@ export default function ChatScreen() {
   }, [voiceProgress.duration]);
 
   const dismissVoiceReply = useCallback(() => {
+    voicePlayRequestRef.current += 1;
     voicePlayerSubRef.current?.remove();
     voicePlayerSubRef.current = null;
     voicePlayerRef.current?.remove();
@@ -657,7 +680,12 @@ export default function ChatScreen() {
     voicePlayerRef.current?.remove();
     voicePlayerRef.current = null;
     setVoicePlaying(false);
-    if (voiceMode === "auto") void playVoiceText(latestCompletedAssistant.text);
+    if (voiceMode === "auto" && !autoPlayedVoiceIdsRef.current.has(latestCompletedAssistant.id)) {
+      // The run/transcript protocol can briefly revisit the same completed row.
+      // Auto voice is a side effect, so make it idempotent by the row's stable ID.
+      autoPlayedVoiceIdsRef.current.add(latestCompletedAssistant.id);
+      void playVoiceText(latestCompletedAssistant.text);
+    }
   }, [snapshot.run, snapshot.transcript, voiceMode, voiceModeLoaded, playVoiceText]);
 
   const refreshAgentSecrets = useCallback(async () => {
