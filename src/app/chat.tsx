@@ -12,6 +12,7 @@ import {
   ActivityIndicator,
   AppState,
   FlatList,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   StyleSheet,
@@ -600,6 +601,7 @@ export default function ChatScreen() {
     const text = draft.trim();
     if (!text && attachments.length === 0) return;
     if (text && interceptSecretCommand(text)) return;
+    Keyboard.dismiss();
     haptic.send();
     const images = attachments;
     setAttachments([]);
@@ -614,6 +616,7 @@ export default function ChatScreen() {
     const text = draft.trim();
     if (!session || (!text && attachments.length === 0)) return;
     if (text && interceptSecretCommand(text)) return;
+    Keyboard.dismiss();
     haptic.queue();
     const images = attachments;
     setAttachments([]);
@@ -760,6 +763,7 @@ export default function ChatScreen() {
             // Dragging the transcript pulls the keyboard down with the gesture.
             keyboardDismissMode="interactive"
             keyboardShouldPersistTaps="handled"
+            onScrollBeginDrag={() => Keyboard.dismiss()}
             onScroll={(e) => {
               const offset = e.nativeEvent.contentOffset.y;
               nearBottomRef.current = offset < 80;
