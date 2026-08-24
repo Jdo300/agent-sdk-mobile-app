@@ -46,7 +46,7 @@ export const UserBubble = memo(function UserBubble({ item, onRetry }: { item: Us
         <View
           style={[
             styles.userBubble,
-            { backgroundColor: "#13315F", opacity: item.pending ? 0.6 : 1 },
+            { backgroundColor: colors.bubble, opacity: item.pending ? 0.6 : 1 },
           ]}
         >
           {item.images?.length ? (

@@ -38,18 +38,20 @@ export interface Palette {
 
 export const palettes: Record<ThemeName, Palette> = {
   light: {
-    bg: "#FBFBFA",
+    // VOX-UI light palette, with stronger separation between canvas, raised
+    // surfaces, borders, and chat bubbles for easier visual scanning.
+    bg: "#F5F5F5",
     surface: "#FFFFFF",
-    surfaceEdge: "#E7E8E5",
-    ink: "#202020",
-    ink2: "#5A5E63",
-    ink3: "#8B9096",
-    accent: "#3939BD",
-    run: "#1B7F5C",
-    wait: "#A66A16",
-    danger: "#B4362B",
-    bubble: "#EFF0ED",
-    pressed: "rgba(32,32,32,0.06)",
+    surfaceEdge: "#CCCCCC",
+    ink: "#333333",
+    ink2: "#666666",
+    ink3: "#888888",
+    accent: "#347AB8",
+    run: "#4CAF50",
+    wait: "#B77900",
+    danger: "#D63C32",
+    bubble: "#E5E5E5",
+    pressed: "rgba(52,122,184,0.10)",
   },
   dark: {
     // Keep VOX-UI's text/accent hierarchy, but deepen the canvas and raised
@@ -64,7 +66,7 @@ export const palettes: Record<ThemeName, Palette> = {
     run: "#4CAF50",
     wait: "#FF9800",
     danger: "#FF5252",
-    bubble: "#242528",
+    bubble: "#13315F",
     pressed: "rgba(105,112,124,0.15)",
   },
 };

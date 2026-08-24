@@ -19,6 +19,7 @@ import type {
 
 import { CLOUD_DEFAULT_URL, type Profile } from "../profiles/profiles";
 import { OAuthTokenError } from "../auth/oauthTokens";
+import { createBrowserBridgeWebSocketConstructor, isBrowserRuntime } from "./browserWebSocket";
 
 // Re-exported so UI code imports from the app's data module, but the
 // definition is the SDK's — no drift (previously narrowed to low|medium|high,
@@ -102,7 +103,9 @@ export function sdkClient(conn: Connection): LettaAgentClient {
     // `--ws-auth capability-token` for simulator/device connections.
     ...(isReactNative()
       ? { WebSocket: createReactNativeWebSocketConstructor(globalThis.WebSocket as never) }
-      : {}),
+      : isBrowserRuntime()
+        ? { WebSocket: createBrowserBridgeWebSocketConstructor(globalThis.WebSocket) as never }
+        : {}),
   });
 }
 

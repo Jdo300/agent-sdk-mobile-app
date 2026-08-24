@@ -10,6 +10,7 @@
 import { createReactNativeWebSocketConstructor } from "@letta-ai/letta-agent-sdk/client";
 import { createAppServerClient } from "@letta-ai/letta-code/app-server-client";
 import type { ProfileType } from "../profiles/profiles";
+import { createBrowserBridgeWebSocketConstructor, isBrowserRuntime } from "./browserWebSocket";
 
 export type TestResult =
   | { ok: true; detail: string }
@@ -62,11 +63,13 @@ async function testRemote(wsUrl: string, token: string): Promise<TestResult> {
     return { ok: false, reason: "invalid_url", detail: "That URL doesn't look valid." };
   }
 
-  const WebSocketCtor = createReactNativeWebSocketConstructor(globalThis.WebSocket as never);
+  const WebSocketCtor = isBrowserRuntime()
+    ? createBrowserBridgeWebSocketConstructor(globalThis.WebSocket)
+    : createReactNativeWebSocketConstructor(globalThis.WebSocket as never);
   const client = createAppServerClient({
     url: target.toString(),
     ...(token ? { authToken: token } : {}),
-    WebSocket: WebSocketCtor,
+    WebSocket: WebSocketCtor as never,
     requestTimeoutMs: TIMEOUT_MS,
   });
 

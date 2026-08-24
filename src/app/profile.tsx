@@ -5,6 +5,7 @@
 import { router, useLocalSearchParams } from "expo-router";
 import { useEffect, useState } from "react";
 import {
+  Alert,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -21,6 +22,7 @@ import { OAuthCancelledError, signInWithLetta } from "../lib/auth/oauth";
 import { testConnection, type TestResult } from "../lib/letta/testConnection";
 import {
   CLOUD_DEFAULT_URL,
+  deleteProfile,
   hasSecret,
   newProfileId,
   saveOAuthProfile,
@@ -146,6 +148,7 @@ export default function ProfileEditorScreen() {
   const [result, setResult] = useState<TestResult | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     if (existing) void hasSecret(existing.id).then(setStoredSecret);
@@ -223,6 +226,37 @@ export default function ProfileEditorScreen() {
     } finally {
       setOAuthWorking(false);
     }
+  };
+
+
+  const confirmDelete = () => {
+    if (!existing || deleting) return;
+    Alert.alert(
+      "Delete connection?",
+      `Remove “${existing.name}” from this device? Its saved credential will also be removed.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: () => {
+            setDeleting(true);
+            void deleteProfile(existing.id)
+              .then(async () => {
+                await refresh();
+                router.replace("/");
+              })
+              .catch((error) => {
+                Alert.alert(
+                  "Couldn’t delete connection",
+                  error instanceof Error ? error.message : "Please try again.",
+                );
+              })
+              .finally(() => setDeleting(false));
+          },
+        },
+      ],
+    );
   };
 
   const save = async () => {
@@ -421,6 +455,20 @@ export default function ProfileEditorScreen() {
               ) : null}
             </>
           )}
+
+          {existing ? (
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel={`Delete connection ${existing.name}`}
+              disabled={deleting}
+              onPress={confirmDelete}
+              style={[styles.deleteAction, { borderColor: colors.danger, opacity: deleting ? 0.5 : 1 }]}
+            >
+              <Text role="bodyEm" tone="danger" style={styles.actionLabel}>
+                {deleting ? "Deleting…" : "Delete connection"}
+              </Text>
+            </Touchable>
+          ) : null}
         </ScrollView>
       </KeyboardAvoidingView>
     </Screen>
@@ -480,4 +528,10 @@ const styles = StyleSheet.create({
   },
   save: { flex: 1, borderRadius: radius.row, alignItems: "center" },
   actionLabel: { paddingVertical: 13 },
+  deleteAction: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radius.row,
+    alignItems: "center",
+    marginTop: space.md,
+  },
 });

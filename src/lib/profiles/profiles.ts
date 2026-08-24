@@ -8,6 +8,7 @@
  */
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
+import { Platform } from "react-native";
 
 import {
   parseOAuthCredential,
@@ -35,6 +36,34 @@ export interface Profile {
 const INDEX_KEY = "letta.profiles.v1";
 const ACTIVE_KEY = "letta.profiles.active.v1";
 const secretKey = (id: string) => `letta.secret.${id}`;
+
+async function readStoredSecret(key: string): Promise<string | null> {
+  if (Platform.OS === "web") {
+    try {
+      return globalThis.localStorage?.getItem(key) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  return SecureStore.getItemAsync(key);
+}
+
+async function writeStoredSecret(key: string, value: string): Promise<void> {
+  if (Platform.OS === "web") {
+    globalThis.localStorage?.setItem(key, value);
+    return;
+  }
+  await SecureStore.setItemAsync(key, value);
+}
+
+async function removeStoredSecret(key: string): Promise<void> {
+  if (Platform.OS === "web") {
+    globalThis.localStorage?.removeItem(key);
+    return;
+  }
+  await SecureStore.deleteItemAsync(key);
+}
+
 const credentialRefreshes = new Map<string, Promise<string>>();
 const deletingProfiles = new Set<string>();
 
@@ -62,7 +91,7 @@ export async function saveProfile(profile: Profile, secret: string | null): Prom
   await writeProfiles(profiles);
   // Empty secret means "keep the stored one" when editing.
   if (secret !== null && secret.length > 0) {
-    await SecureStore.setItemAsync(secretKey(profile.id), secret);
+    await writeStoredSecret(secretKey(profile.id), secret);
   }
 }
 
@@ -87,7 +116,7 @@ export async function deleteProfile(id: string): Promise<void> {
     } catch {
       // Revoke the last stored credential below when refresh fails.
     }
-    const stored = await SecureStore.getItemAsync(secretKey(id));
+    const stored = await readStoredSecret(secretKey(id));
     const oauth = stored ? parseOAuthCredential(stored) : null;
     if (oauth) {
       try {
@@ -98,7 +127,7 @@ export async function deleteProfile(id: string): Promise<void> {
     }
     const profiles = (await listProfiles()).filter((p) => p.id !== id);
     await writeProfiles(profiles);
-    await SecureStore.deleteItemAsync(secretKey(id));
+    await removeStoredSecret(secretKey(id));
     if ((await getActiveProfileId()) === id) {
       await AsyncStorage.removeItem(ACTIVE_KEY);
     }
@@ -110,7 +139,7 @@ export async function deleteProfile(id: string): Promise<void> {
 /** Secrets never leave this module except through this call at connect time. */
 export async function getSecret(id: string): Promise<string | null> {
   if (deletingProfiles.has(id)) return null;
-  const stored = await SecureStore.getItemAsync(secretKey(id));
+  const stored = await readStoredSecret(secretKey(id));
   if (!stored || deletingProfiles.has(id)) return null;
   const oauth = parseOAuthCredential(stored);
   if (!oauth) return stored;
@@ -119,7 +148,7 @@ export async function getSecret(id: string): Promise<string | null> {
   if (currentRefresh) return currentRefresh;
   const refresh = refreshOAuthCredential(oauth)
     .then(async (refreshed) => {
-      await SecureStore.setItemAsync(secretKey(id), JSON.stringify(refreshed));
+      await writeStoredSecret(secretKey(id), JSON.stringify(refreshed));
       return refreshed.accessToken;
     })
     .finally(() => credentialRefreshes.delete(id));
@@ -128,7 +157,7 @@ export async function getSecret(id: string): Promise<string | null> {
 }
 
 export async function hasSecret(id: string): Promise<boolean> {
-  return (await SecureStore.getItemAsync(secretKey(id))) !== null;
+  return (await readStoredSecret(secretKey(id))) !== null;
 }
 
 export async function getActiveProfileId(): Promise<string | null> {

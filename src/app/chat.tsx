@@ -205,6 +205,7 @@ export default function ChatScreen() {
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
   const voicePlayRequestRef = useRef(0);
   const autoPlayedVoiceIdsRef = useRef(new Set<string>());
+  const voiceHistorySeededRef = useRef(false);
   const voiceTrackWidthRef = useRef(0);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 100);
@@ -419,19 +420,30 @@ export default function ChatScreen() {
     return () => clearTimeout(timer);
   }, [params.autosend, snapshot.hydrating]);
 
-  // Foreground resume: refetch authoritative state when the app returns, but
-  // only after a real absence — a glance at a notification shouldn't cost a
-  // full rehydrate and a banner flash.
+  // Foreground resume: iOS can suspend JS while backgrounded, so the App
+  // Server may expire the WebSocket heartbeat while React Native still retains
+  // a stale socket object. A real background -> active transition therefore
+  // replaces the transport proactively and rehydrates authoritative state.
+  // Brief `inactive` transitions (notification shade, system UI) keep the
+  // existing transport unless they last long enough to merit a normal resync.
   const backgroundedAt = useRef<number | null>(null);
+  const wasBackgrounded = useRef(false);
   useEffect(() => {
     const sub = AppState.addEventListener("change", (state) => {
       if (state === "active") {
-        const away = backgroundedAt.current ? Date.now() - backgroundedAt.current : Infinity;
+        const away = backgroundedAt.current ? Date.now() - backgroundedAt.current : 0;
+        const replaceTransport = wasBackgrounded.current;
         backgroundedAt.current = null;
-        if (away > 30_000) void sessionRef.current?.reconnect();
+        wasBackgrounded.current = false;
+        if (replaceTransport) {
+          void sessionRef.current?.reconnect({ forceNewTransport: true });
+        } else if (away > 30_000) {
+          void sessionRef.current?.reconnect();
+        }
         return;
       }
       backgroundedAt.current ??= Date.now();
+      if (state === "background") wasBackgrounded.current = true;
     });
     return () => sub.remove();
   }, []);
@@ -648,11 +660,24 @@ export default function ChatScreen() {
   const voiceRunPendingRef = useRef(false);
   const voiceBaselineAssistantIdRef = useRef<string | null>(null);
   useEffect(() => {
-    const latestCompletedAssistant = [...snapshot.transcript].reverse().find(
+    const completedAssistants = snapshot.transcript.filter(
       (item) => item.kind === "assistant" && !item.streaming && !item.interrupted && item.text.trim().length > 0,
     );
+    const latestCompletedAssistant = completedAssistants[completedAssistants.length - 1];
     const previous = previousRunRef.current;
     previousRunRef.current = snapshot.run;
+
+    // Hydration replays historical transcript rows into a fresh screen. They are
+    // display state, not new replies, so they must never trigger auto voice. Seed
+    // the idempotency set from that history before observing live run changes.
+    if (snapshot.hydrating) {
+      for (const item of completedAssistants) autoPlayedVoiceIdsRef.current.add(item.id);
+      return;
+    }
+    if (!voiceHistorySeededRef.current) {
+      for (const item of completedAssistants) autoPlayedVoiceIdsRef.current.add(item.id);
+      voiceHistorySeededRef.current = true;
+    }
 
     // Mark the beginning of a new run and remember the last completed reply that
     // existed before it. The app-server can report idle a moment before the final

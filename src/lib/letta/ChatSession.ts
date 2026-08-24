@@ -578,7 +578,7 @@ export class ChatSession {
    * clear the offline banner if it succeeds. A live session keeps its own
    * socket; if it died, the next send() lazily opens a fresh one.
    */
-  async reconnect(): Promise<void> {
+  async reconnect(options?: { forceNewTransport?: boolean }): Promise<void> {
     // A visible failure state means the user pressed Retry — acknowledge
     // instantly. Otherwise hold the "reconnecting" commit briefly so a fast
     // resume resync never flashes the banner over a healthy screen.
@@ -591,16 +591,21 @@ export class ChatSession {
         this.commit(patch(this.snapshot, { connection: "reconnecting" }));
       }, RECONNECT_BANNER_DELAY_MS);
     }
+    // A dead or background-suspended SDK session must be discarded BEFORE
+    // hydrate(): remote history hydration itself uses ensureSession(), so
+    // hydrating first would route recovery through the stale socket. iOS may
+    // suspend JS while backgrounded, preventing WebSocket pong handling even
+    // though the native socket object still looks open when the app wakes.
+    if (this.sessionDead || options?.forceNewTransport) {
+      const stale = this.session;
+      this.session = null;
+      this.sessionDead = false;
+      stale?.close();
+    }
     const ok = await this.hydrate();
     if (pending) clearTimeout(pending);
     // On failure hydrate() already committed offline/auth_failed.
     if (!ok || this.closed) return;
-    // A dead session object can't be reused; drop it so send() reopens.
-    if (this.sessionDead) {
-      this.session?.close();
-      this.session = null;
-      this.sessionDead = false;
-    }
     this.commit(patch(this.snapshot, { connection: "connected" }));
   }
 
@@ -763,9 +768,9 @@ export class ChatSession {
   }
 
   private async consume(): Promise<void> {
+    const session = this.session;
+    if (!session) return;
     try {
-      const session = this.session;
-      if (!session) return;
       // The SDK stream covers one turn and returns after its result. Open the
       // next stream immediately so later sends use the same live session.
       while (!this.closed && this.session === session) {
@@ -781,20 +786,30 @@ export class ChatSession {
         if (!received) throw new Error("Session stream closed.");
       }
     } catch (e) {
-      if (this.closed) return;
+      // A deliberately replaced transport can finish/error after its successor
+      // is already live. Never let that stale callback poison the new session.
+      if (this.closed || this.session !== session) return;
       this.sessionDead = true;
-      this.settleActivityWaiters(e instanceof Error ? e : new Error("Stream ended unexpectedly."));
+      const detail = e instanceof Error && e.message ? e.message : "Stream ended unexpectedly.";
+      this.settleActivityWaiters(e instanceof Error ? e : new Error(detail));
       // No streaming visual may outlive the stream (the caret would pulse on
       // dead text forever — nothing else retires it after this point).
       this.interruptedKey = newestTextKey(this.accumulator.rows());
       const swept = this.project(this.drainStreamBuffer(this.snapshot));
-      const detail = e instanceof Error && e.message ? e.message : "Stream ended unexpectedly.";
       this.commit(
         patch(isTransportError(detail) ? swept : this.appendError(swept, detail, true), {
           run: "idle",
           connection: isAuthError(e) ? "auth_failed" : "offline",
         }),
       );
+      // App Server heartbeat expiry and transient mobile-network drops are
+      // recoverable. Rebuild the SDK session automatically instead of leaving
+      // the user stranded on a dead socket until the app is relaunched.
+      if (isTransportError(detail) && !isAuthError(e)) {
+        setTimeout(() => {
+          if (!this.closed && this.sessionDead) void this.reconnect();
+        }, 500);
+      }
     }
   }
 
