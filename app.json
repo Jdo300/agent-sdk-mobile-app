@@ -18,7 +18,13 @@
     ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.example.bloop"
+      "bundleIdentifier": "com.example.bloop",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        },
+        "NSLocalNetworkUsageDescription": "Bloop connects directly to the local Milo server for chat and voice services."
+      }
     },
     "android": {
       "adaptiveIcon": {

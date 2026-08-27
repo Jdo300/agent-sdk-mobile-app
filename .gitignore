@@ -14,3 +14,6 @@ expo-env.d.ts
 # @end expo-cli
 
 .env.local
+# Local Bloop E2E state / one-off diagnostics
+e2e/.conversation-id
+e2e/.diag*.mjs

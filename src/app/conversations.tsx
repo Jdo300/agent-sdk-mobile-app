@@ -1,13 +1,15 @@
 /**
- * Conversations for one agent — live list with create, rename, and cursor
+ * Conversations for one agent — live list with create, rename, delete, and cursor
  * pagination (docs/design-doc.md §4.3). Cloud lists via REST, remote via
  * protocol `conversation_list`.
  */
-import { BottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
+import { BottomSheetTextInput as NativeBottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
 import { router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { Alert, FlatList, RefreshControl, StyleSheet, TextInput, View } from "react-native";
+import { Alert, FlatList, Platform, RefreshControl, StyleSheet, TextInput, View } from "react-native";
 
+
+const SheetTextInput = Platform.OS === "web" ? TextInput : NativeBottomSheetTextInput;
 import { EmptyState } from "../components/ui/EmptyState";
 import { Header, Screen } from "../components/ui/Screen";
 import { Sheet } from "../components/ui/Sheet";
@@ -221,7 +223,7 @@ export default function ConversationsScreen() {
     const deletable = activeProfile ? canDeleteConversations({ profile: activeProfile, secret: "" }) : false;
     Alert.alert(conversation.title, undefined, [
       { text: "Rename", onPress: () => openRename(conversation) },
-      // Remote app-servers have no delete command — don't offer what can't work.
+      // Local Milo exposes deletion through the App Server management protocol.
       ...(deletable
         ? [{ text: "Delete", style: "destructive" as const, onPress: () => confirmDelete(conversation) }]
         : []),
@@ -310,7 +312,7 @@ export default function ConversationsScreen() {
         />
       )}
       <Sheet ref={renameSheetRef} title="Rename conversation">
-        <BottomSheetTextInput
+        <SheetTextInput
           value={draftTitle}
           onChangeText={setDraftTitle}
           placeholder="Conversation title"

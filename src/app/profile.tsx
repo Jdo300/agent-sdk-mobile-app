@@ -140,7 +140,7 @@ export default function ProfileEditorScreen() {
     existing ? existingAuthMethod : type === "remote" ? "api_key" : "oauth",
   );
   const [name, setName] = useState(existing?.name ?? (type === "remote" ? "Local Milo" : ""));
-  const [url, setUrl] = useState(existing?.url ?? (type === "remote" ? "wss://rgai-letta.resonancegroupusa.com" : ""));
+  const [url, setUrl] = useState(existing?.url ?? (type === "remote" ? "ws://10.0.0.128:4610" : ""));
   const [secret, setSecret] = useState("");
   const [storedSecret, setStoredSecret] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -382,7 +382,7 @@ export default function ProfileEditorScreen() {
                 label="WebSocket URL"
                 value={url}
                 onChange={setUrl}
-                placeholder="wss://rgai-letta.resonancegroupusa.com"
+                placeholder="ws://10.0.0.128:4610"
               />
               <Field
                 label="Capability token"

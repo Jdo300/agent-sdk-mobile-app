@@ -35,6 +35,8 @@ export interface UserItem {
   /** Local echo until the server confirms the message. */
   pending?: boolean;
   failed?: boolean;
+  /** Wall-clock time this row occurred (server time for history, local arrival time while live). */
+  occurredAt?: number;
 }
 
 export interface AssistantItem {
@@ -44,6 +46,7 @@ export interface AssistantItem {
   streaming?: boolean;
   /** Run ended before the assistant finished (abort or error). */
   interrupted?: boolean;
+  occurredAt?: number;
 }
 
 export interface ReasoningItem {
@@ -57,6 +60,7 @@ export interface ReasoningItem {
    *  from this, independent of delta cadence. */
   startedAt?: number;
   streaming?: boolean;
+  occurredAt?: number;
 }
 
 export type ToolStatus =
@@ -80,6 +84,10 @@ export interface ToolItem {
   /** Full input/result payloads for the detail sheet. */
   input?: string;
   result?: string;
+  /** Tool invocation start time. */
+  occurredAt?: number;
+  /** Tool result arrival time, once settled. */
+  completedAt?: number;
 }
 
 export interface ErrorItem {
@@ -87,6 +95,7 @@ export interface ErrorItem {
   id: string;
   message: string;
   retryable?: boolean;
+  occurredAt?: number;
 }
 
 export type TranscriptItem = UserItem | AssistantItem | ReasoningItem | ToolItem | ErrorItem;

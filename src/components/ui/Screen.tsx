@@ -32,9 +32,12 @@ interface HeaderProps {
   back?: boolean;
   /** Right-side actions. */
   trailing?: ReactNode;
+  /** Optional tap target for compact chat headers (conversation details). */
+  onTitlePress?: () => void;
+  titleAccessibilityLabel?: string;
 }
 
-export function Header({ title, large, subtitle, back, trailing }: HeaderProps) {
+export function Header({ title, large, subtitle, back, trailing, onTitlePress, titleAccessibilityLabel }: HeaderProps) {
   return (
     <View style={[styles.header, large && styles.headerLarge]}>
       <View style={styles.headerRow}>
@@ -50,12 +53,26 @@ export function Header({ title, large, subtitle, back, trailing }: HeaderProps) 
             </Text>
           </Touchable>
         ) : null}
-        <View style={styles.titleBlock}>
-          <Text role={large ? "display" : "bodyEm"} numberOfLines={1}>
-            {title}
-          </Text>
-          {subtitle}
-        </View>
+        {onTitlePress ? (
+          <Touchable
+            accessibilityRole="button"
+            accessibilityLabel={titleAccessibilityLabel ?? `${title} details`}
+            onPress={onTitlePress}
+            style={styles.titleBlock}
+          >
+            <Text role={large ? "display" : "bodyEm"} numberOfLines={1}>
+              {title}
+            </Text>
+            {subtitle}
+          </Touchable>
+        ) : (
+          <View style={styles.titleBlock}>
+            <Text role={large ? "display" : "bodyEm"} numberOfLines={1}>
+              {title}
+            </Text>
+            {subtitle}
+          </View>
+        )}
         {trailing ? <View style={styles.trailing}>{trailing}</View> : null}
       </View>
     </View>

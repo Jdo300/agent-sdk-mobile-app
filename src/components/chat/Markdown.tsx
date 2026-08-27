@@ -95,23 +95,43 @@ function openLink(url: string): boolean {
   return false;
 }
 
+/** Convert chat markdown to readable clipboard text without changing its words. */
+export function markdownToPlainText(markdown: string): string {
+  return markdown
+    .replace(/```[^\n]*\n([\s\S]*?)```/g, "$1")
+    .replace(/~~~[^\n]*\n([\s\S]*?)~~~/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/^\s*[-+*]\s+/gm, "• ")
+    .replace(/^\s*(\d+)\.\s+/gm, "$1. ")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)(.*?)\1/g, "$2")
+    .replace(/~~(.*?)~~/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 /**
  * Clipboard write + haptic tick + a transient flag the caller renders as a
  * "Copied" acknowledgement. One vocabulary for every copy affordance.
  */
-export function useCopyFeedback(text: string): { copied: boolean; copy: () => void } {
+export function useCopyFeedback(text: string): { copied: boolean; copy: () => void; copyText: (value: string) => void } {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
     const timer = setTimeout(() => setCopied(false), 1500);
     return () => clearTimeout(timer);
   }, [copied]);
-  const copy = useCallback(() => {
-    void Clipboard.setStringAsync(text);
+  const copyText = useCallback((value: string) => {
+    void Clipboard.setStringAsync(value);
     haptic.copy();
     setCopied(true);
-  }, [text]);
-  return { copied, copy };
+  }, []);
+  const copy = useCallback(() => copyText(text), [copyText, text]);
+  return { copied, copy, copyText };
 }
 
 /** Fenced code with a quiet copy affordance and horizontal overflow scroll. */

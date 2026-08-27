@@ -4,11 +4,13 @@
  * creation goes through the Agent SDK client (docs/design-doc.md §4.2,
  * Appendix A).
  */
-import { BottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
+import { BottomSheetTextInput as NativeBottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
 import { router, useFocusEffect } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, FlatList, RefreshControl, StyleSheet, TextInput, View } from "react-native";
+import { Alert, FlatList, Platform, RefreshControl, StyleSheet, TextInput, View } from "react-native";
 
+
+const SheetTextInput = Platform.OS === "web" ? TextInput : NativeBottomSheetTextInput;
 import { Bloop } from "../components/ui/Bloop";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Header, Screen } from "../components/ui/Screen";
@@ -283,7 +285,7 @@ export default function AgentsScreen() {
       )}
 
       <Sheet ref={sheetRef} title={editing ? "Rename agent" : "New agent"}>
-        <BottomSheetTextInput
+        <SheetTextInput
           value={draftName}
           onChangeText={setDraftName}
           placeholder="Agent name"

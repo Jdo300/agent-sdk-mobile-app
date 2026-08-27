@@ -3,11 +3,13 @@
  * with mono handles, and an effort segment. Saving state stays on the chip
  * until the server confirms; failures revert with an inline error.
  */
-import { BottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
+import { BottomSheetTextInput as NativeBottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
 import { forwardRef, useState } from "react";
-import { StyleSheet, View } from "react-native";
+import { Platform, StyleSheet, TextInput, View } from "react-native";
 
 import type { ModelOption, ReasoningEffort } from "../../lib/letta/api";
+
+const SheetTextInput = Platform.OS === "web" ? TextInput : NativeBottomSheetTextInput;
 import { useTheme } from "../../theme/ThemeProvider";
 import { radius, space } from "../../theme/tokens";
 import { Sheet } from "../ui/Sheet";
@@ -21,18 +23,21 @@ interface Props {
   currentModel: string | null;
   currentEffort: string | null;
   onSelect: (model: string, effort?: ReasoningEffort) => void;
+  onSelectEffort: (effort: ReasoningEffort) => void;
   error?: string | null;
 }
 
 export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelSheet(
-  { models, currentModel, currentEffort, onSelect, error },
+  { models, currentModel, currentEffort, onSelect, onSelectEffort, error },
   ref,
 ) {
   const { colors } = useTheme();
   const [search, setSearch] = useState("");
-  const [effort, setEffort] = useState<ReasoningEffort | null>(
-    EFFORTS.includes(currentEffort as ReasoningEffort) ? (currentEffort as ReasoningEffort) : null,
-  );
+  // The parent owns the authoritative conversation effort. Keeping a second
+  // sheet-local copy let the highlight drift from the server-backed value.
+  const effort = EFFORTS.includes(currentEffort as ReasoningEffort)
+    ? (currentEffort as ReasoningEffort)
+    : null;
 
   const filtered = models.filter(
     (m) =>
@@ -44,7 +49,7 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
 
   return (
     <Sheet ref={ref} title="Model">
-      <BottomSheetTextInput
+      <SheetTextInput
         value={search}
         onChangeText={setSearch}
         placeholder="Search models…"
@@ -64,7 +69,7 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
               key={e}
               accessibilityRole="button"
               accessibilityLabel={`Effort ${e}${effort === e ? ", selected" : ""}`}
-              onPress={() => setEffort(effort === e ? null : e)}
+              onPress={() => onSelectEffort(e)}
               style={[styles.segmentItem, effort === e && { backgroundColor: colors.bubble }]}
             >
               <Text role="sub" ink={effort === e ? 1 : 2} style={styles.segmentLabel}>

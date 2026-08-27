@@ -3,7 +3,7 @@
  * (docs/design-doc.md §4.4 Reconnect). The transcript stays readable;
  * this row explains what's happening and what survives.
  */
-import { StyleSheet, View } from "react-native";
+import { ActivityIndicator, StyleSheet, View } from "react-native";
 
 import type { ConnectionPhase } from "../../lib/letta/model";
 import { useTheme } from "../../theme/ThemeProvider";
@@ -20,14 +20,11 @@ interface Props {
 }
 
 const copy: Record<Props["phase"], (target?: string) => { title: string; detail?: string }> = {
-  reconnecting: (t) => ({
-    title: `Reconnecting${t ? ` to ${t}` : ""}…`,
-    detail: "Your draft is safe.",
-  }),
-  reconciling: () => ({ title: "Catching up…", detail: "Syncing the latest run state." }),
+  reconnecting: () => ({ title: "Reconnecting…" }),
+  reconciling: () => ({ title: "Catching up…" }),
   offline: (t) => ({
     title: `Can't reach ${t ?? "the server"}`,
-    detail: "Check the connection and try again.",
+    detail: "Retrying in the background. You can also retry now.",
   }),
   auth_failed: () => ({
     title: "Connection was rejected",
@@ -39,11 +36,17 @@ export function ConnectionBanner({ phase, target, onRetry, onEditProfile }: Prop
   const { colors } = useTheme();
   const tone = phase === "offline" || phase === "auth_failed" ? "danger" : "wait";
   const { title, detail } = copy[phase](target);
+  const transient = phase === "reconnecting" || phase === "reconciling";
   return (
     <View
       accessibilityLiveRegion="polite"
-      style={[styles.banner, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
+      style={[
+        styles.banner,
+        transient && styles.transientBanner,
+        { backgroundColor: colors.surface, borderColor: colors.surfaceEdge },
+      ]}
     >
+      {transient ? <ActivityIndicator size="small" /> : null}
       <View style={styles.textBlock}>
         <Text role="sub" tone={tone}>
           {title}
@@ -86,6 +89,10 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: space.md,
+  },
+  transientBanner: {
+    borderWidth: 0,
+    paddingVertical: space.xs,
   },
   textBlock: { flex: 1, gap: 1 },
   action: { minHeight: 36, paddingHorizontal: space.xs },

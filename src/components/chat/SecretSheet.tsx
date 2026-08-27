@@ -1,7 +1,9 @@
-import { BottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
+import { BottomSheetTextInput as NativeBottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
 import { forwardRef, useCallback, useState } from "react";
-import { ActivityIndicator, Alert, StyleSheet, View } from "react-native";
+import { ActivityIndicator, Alert, Platform, StyleSheet, TextInput, View } from "react-native";
 
+
+const SheetTextInput = Platform.OS === "web" ? TextInput : NativeBottomSheetTextInput;
 import { useTheme } from "../../theme/ThemeProvider";
 import { radius, space } from "../../theme/tokens";
 import { Sheet } from "../ui/Sheet";
@@ -74,7 +76,7 @@ export const SecretSheet = forwardRef<BottomSheetModal, Props>(function SecretSh
       </Text>
 
       <View style={styles.form}>
-        <BottomSheetTextInput
+        <SheetTextInput
           value={key}
           onChangeText={(next) => setKey(next.toUpperCase())}
           autoFocus
@@ -85,7 +87,7 @@ export const SecretSheet = forwardRef<BottomSheetModal, Props>(function SecretSh
           accessibilityLabel="Secret name"
           style={[styles.input, { borderColor: colors.surfaceEdge, color: colors.ink }]}
         />
-        <BottomSheetTextInput
+        <SheetTextInput
           value={value}
           onChangeText={setValue}
           placeholder={normalizedKey && names.includes(normalizedKey) ? "New value (replaces stored value)" : "Secret value"}

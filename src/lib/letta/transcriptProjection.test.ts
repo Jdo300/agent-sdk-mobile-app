@@ -7,7 +7,7 @@
 import { describe, expect, it } from "bun:test";
 
 import type { TranscriptRow } from "@letta-ai/letta-agent-sdk/client";
-import { newestTextKey, projectRow, projectRows, type ProjectionState } from "./transcriptProjection";
+import { newestTextKey, projectRow, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import type { ToolItem, ToolStatus } from "./model";
 
 const base: ProjectionState = {
@@ -17,6 +17,8 @@ const base: ProjectionState = {
   thinkStartedAt: new Map(),
   thinkSeconds: new Map(),
   toolDurationMs: new Map(),
+  rowOccurredAt: new Map(),
+  toolCompletedAt: new Map(),
 };
 
 function text(kind: "user" | "assistant" | "reasoning", key: string, value: string): TranscriptRow {
@@ -84,6 +86,17 @@ describe("transcript projection", () => {
       base,
     );
     expect(item).toMatchObject({ kind: "user", text: "Real question?" });
+  });
+
+  it("does not treat assistant/reasoning rows with a turn OTID as the persisted user echo", () => {
+    const rows = [
+      { ...text("assistant", "a1", "reply"), otid: "turn-1" } as TranscriptRow,
+      { ...text("reasoning", "r1", "thinking"), otid: "turn-1" } as TranscriptRow,
+    ];
+    expect(userRowOtids(rows).has("turn-1")).toBe(false);
+
+    rows.push({ ...text("user", "u1", "question"), otid: "turn-1" } as TranscriptRow);
+    expect(userRowOtids(rows).has("turn-1")).toBe(true);
   });
 
   it("finds the newest text row, ignoring tool rows after it", () => {

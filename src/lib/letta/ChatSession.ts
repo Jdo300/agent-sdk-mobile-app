@@ -21,11 +21,11 @@ import { createTranscriptAccumulator } from "@letta-ai/letta-agent-sdk/client";
 
 import { toImageContent, type Attachment } from "./attachments";
 import type { Profile } from "../profiles/profiles";
-import { getConversationModel, isAuthError, listConversationMessages, sdkClient } from "./api";
+import { getConversationModel, getConversationStaticDiagnostics, isAuthError, listConversationMessages, sdkClient, type ConversationDiagnostics } from "./api";
 import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode, type ToolStatus, type TranscriptItem } from "./model";
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
-import { newestTextKey, projectRows, type ProjectionState } from "./transcriptProjection";
+import { newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -52,6 +52,21 @@ const APPROVAL_CONFIRM_TIMEOUT_MS = 15000;
  * revalidation the same way).
  */
 const RECONNECT_BANNER_DELAY_MS = 400;
+const ABORT_ACK_TIMEOUT_MS = 2000;
+const ABORT_CONFIRM_TIMEOUT_MS = 5000;
+const ABORT_CONFIRM_INTERVAL_MS = 250;
+const RECONNECT_CATCHUP_INTERVAL_MS = 1500;
+const RECONNECT_CATCHUP_FINAL_DELAY_MS = 250;
+const AUTHORITATIVE_PAGE_SIZE = 50;
+const AUTHORITATIVE_MAX_PAGES = 8;
+const RECONNECT_CATCHUP_SECOND_PASS_MS = 900;
+const RECONNECT_RETRY_BASE_MS = 1000;
+const RECONNECT_RETRY_MAX_MS = 5000;
+
+/** A transport loss does not imply the server-side run stopped. */
+function preserveRunAcrossTransportLoss(run: ChatSnapshot["run"]): ChatSnapshot["run"] {
+  return run === "running" || run === "awaiting_approval" || run === "aborting" ? run : "idle";
+}
 
 /**
  * Live activity for conversations this device currently has open, so list rows
@@ -63,6 +78,18 @@ export type ConversationActivity = "running" | "awaiting_approval";
 
 const activityByConversation = new Map<string, ConversationActivity>();
 const activityListeners = new Set<() => void>();
+
+/**
+ * Screen navigation must not own the execution lifetime. A conversation can keep
+ * running while no ChatScreen is mounted, so active sessions are retained here
+ * until their server-authoritative run settles. Reopening the same conversation
+ * simply reattaches a view to the existing stream/snapshot.
+ */
+const retainedChatSessions = new Map<string, ChatSession>();
+
+function retainedSessionKey(profileId: string, conversationId: string): string {
+  return `${profileId}:${conversationId}`;
+}
 
 function publishActivity(conversationId: string, activity: ConversationActivity | null): void {
   const previous = activityByConversation.get(conversationId) ?? null;
@@ -89,6 +116,9 @@ export class ChatSession {
   private snapshot: ChatSnapshot;
   private listeners = new Set<SnapshotListener>();
   private closed = false;
+  /** Number of mounted ChatScreen views currently attached to this session. */
+  private viewRefs = 0;
+  private readonly retainedKey: string;
   /** Set when the stream errored terminally; reconnect() replaces the session. */
   private sessionDead = false;
   /**
@@ -112,14 +142,33 @@ export class ChatSession {
   private thinkSeconds = new Map<string, number>();
   private toolStartedAt = new Map<string, number>();
   private toolDurationMs = new Map<string, number>();
+  /** Stable display timestamps, keyed by accumulator row / tool call identity. */
+  private rowOccurredAt = new Map<string, number>();
+  private toolCompletedAt = new Map<string, number>();
   /** awaiting_approval / denied — states only the approval flow knows about. */
   private toolStatusOverride = new Map<string, ToolStatus>();
   /** Row the last turn left unfinished, rendered as "Stopped". */
   private interruptedKey: string | null = null;
+  /** App preference re-applied whenever a suspended transport is recreated. */
+  private preferredPermissionMode: PermissionMode | null = null;
+  /**
+   * Last authoritative processing state reported by the executing device.
+   * Loop-status messages describe the attached viewer's loop bookkeeping and can
+   * transiently say WAITING_ON_INPUT immediately after a resume even while the
+   * server-side device is still processing the existing turn.
+   */
+  private deviceIsProcessing = false;
   /** Cursor to the next older history page. */
   private nextBefore: string | null = null;
+  /** Raw persisted history currently loaded in the transcript, oldest first. */
+  private loadedHistoryMessages: unknown[] = [];
   private pendingStream: SDKMessage[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Foreground, stream-failure and Retry triggers all join one recovery. */
+  private reconnectInFlight: Promise<void> | null = null;
+  /** Quiet background retry after a transient socket-open failure. */
+  private reconnectRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectRetryAttempt = 0;
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
@@ -130,9 +179,15 @@ export class ChatSession {
   /** Resolved approvals waiting for post-decision stream traffic. */
   private activityWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
 
-  private constructor(conn: { profile: Profile; secret: string }, conversationId: string) {
+  private constructor(
+    conn: { profile: Profile; secret: string },
+    conversationId: string,
+    initialPermissionMode?: PermissionMode,
+  ) {
     this.conn = conn;
     this.conversationId = conversationId;
+    this.retainedKey = retainedSessionKey(conn.profile.id, conversationId);
+    this.preferredPermissionMode = initialPermissionMode ?? null;
     this.snapshot = { ...emptyChat, hydrating: true };
   }
 
@@ -142,10 +197,52 @@ export class ChatSession {
    * a cloud session provisions a sandbox, which is too heavy to pay for just
    * reading a conversation (see SDK-FEEDBACK.md #3).
    */
-  static open(conn: { profile: Profile; secret: string }, conversationId: string): ChatSession {
-    const chat = new ChatSession(conn, conversationId);
+  static open(
+    conn: { profile: Profile; secret: string },
+    conversationId: string,
+    initialPermissionMode?: PermissionMode,
+  ): ChatSession {
+    const key = retainedSessionKey(conn.profile.id, conversationId);
+    const existing = retainedChatSessions.get(key);
+    if (existing && !existing.closed) {
+      // Refresh credentials/profile metadata in case the saved connection changed
+      // while the screen was away, but preserve the live SDK session and stream.
+      existing.conn = conn;
+      if (initialPermissionMode) existing.preferredPermissionMode = initialPermissionMode;
+      existing.viewRefs += 1;
+      return existing;
+    }
+
+    const chat = new ChatSession(conn, conversationId, initialPermissionMode);
+    chat.viewRefs = 1;
+    retainedChatSessions.set(key, chat);
     void chat.hydrate();
     return chat;
+  }
+
+  /**
+   * Release one mounted chat view without terminating an active Milo turn.
+   * The session disposes immediately when idle, or automatically once an
+   * unobserved active run later settles.
+   */
+  releaseView(): void {
+    this.viewRefs = Math.max(0, this.viewRefs - 1);
+    this.maybeDisposeWhenUnobserved();
+  }
+
+  /** Credential already associated with the active authenticated session. */
+  authToken(): string {
+    return this.conn.secret;
+  }
+
+  private maybeDisposeWhenUnobserved(): void {
+    if (this.closed || this.viewRefs > 0) return;
+    const active =
+      this.deviceIsProcessing ||
+      this.snapshot.run === "running" ||
+      this.snapshot.run === "awaiting_approval" ||
+      this.snapshot.run === "aborting";
+    if (!active) this.close();
   }
 
   /** Create the SDK session on demand and start consuming its stream. */
@@ -159,6 +256,7 @@ export class ChatSession {
     // when the SDK sends runtime_start, even with the listener online (see
     // SDK-FEEDBACK.md). Re-enable pickCloudEnvironment() once fixed.
     this.session = client.resumeSession(this.conversationId, {
+      ...(this.preferredPermissionMode ? { permissionMode: this.preferredPermissionMode } : {}),
       // Tool approvals surface as an ApprovalRequest in the snapshot; the
       // ApprovalCard resolves it via resolveApproval(). The run stays in
       // awaiting_approval until the user decides.
@@ -250,6 +348,7 @@ export class ChatSession {
         id: otid,
         text,
         pending: true,
+        occurredAt: Date.now(),
         ...(attachments.length > 0 ? { images: attachments.map((a) => a.uri) } : {}),
       }),
     );
@@ -267,17 +366,21 @@ export class ChatSession {
         { otid },
       );
     } catch (e) {
-      // Session init/send failed (e.g. sandbox unavailable): mark the echo
-      // failed and surface the reason — never leave a silently-pending bubble.
-      // Fully handled here (no re-throw): the failed bubble + error row ARE
-      // the error report, and composer call sites fire-and-forget.
-      this.markEcho(otid, { failed: true });
-      this.commit(
-        this.appendError(
-          patch(this.project(this.snapshot), { run: "idle" }),
-          e instanceof Error ? e.message : "Send failed.",
-        ),
-      );
+      // send() returns immediately after the SDK writes the turn to the socket,
+      // so an exception here means the message was not submitted. Keep the failed
+      // bubble as the durable user-visible signal, but transport failures belong
+      // in connection UI rather than as permanent transcript error rows.
+      const detail = e instanceof Error ? e.message : "Send failed.";
+      const transportFailure = isTransportError(detail);
+      this.markEcho(otid, { pending: false, failed: true });
+      const next = patch(this.project(this.snapshot), {
+        run: "idle" as const,
+        ...(transportFailure
+          ? { connection: isAuthError(e) ? ("auth_failed" as const) : ("reconnecting" as const) }
+          : {}),
+      });
+      this.commit(transportFailure ? this.scrubTransportErrors(next) : this.appendError(next, detail));
+      if (transportFailure && !isAuthError(e)) this.scheduleReconnectRetry();
       return;
     }
     this.pendingAttachments.delete(otid);
@@ -417,15 +520,18 @@ export class ChatSession {
       this.commit(patch(this.snapshot, { approvals, run }));
       return;
     }
-    // The stream died while waiting: consume() already owns run/connection —
-    // only retire the card and say the decision may be lost. Fully handled
-    // here (no throw): the error row IS the report, and the caller only
-    // clears its submitting state.
+    // The stream died while waiting. Approval recovery is an App Server/SDK
+    // concern on reconnect; do not turn transport uncertainty into transcript
+    // content. Retire the stale card and preserve the active run until the fresh
+    // device status tells us what actually happened.
     this.commit(
-      patch(this.appendError(this.snapshot, "The session dropped — your decision may not have reached the agent."), {
+      patch(this.scrubTransportErrors(this.snapshot), {
         approvals,
+        run: preserveRunAcrossTransportLoss(this.snapshot.run),
+        connection: "reconnecting",
       }),
     );
+    this.scheduleReconnectRetry();
   }
 
   /**
@@ -477,6 +583,99 @@ export class ChatSession {
     return getConversationModel(this.conn, this.conversationId);
   }
 
+  /** Live context diagnostics from the exact App Server conversation runtime. */
+  async getConversationDiagnostics(): Promise<ConversationDiagnostics> {
+    const staticInfo = await getConversationStaticDiagnostics(this.conn, this.conversationId);
+    const response = await this.ensureSession().sendCommand(
+      {
+        type: "execute_command",
+        command_id: "context",
+        runtime: { agent_id: staticInfo.agentId, conversation_id: this.conversationId },
+      },
+      {
+        timeoutMs: 15000,
+        predicate: (message) =>
+          message.type === "slash_command_end" && message.command_id === "context",
+      },
+    );
+    if (response.success !== true) {
+      throw new Error(typeof response.output === "string" ? response.output : "Couldn't read context status.");
+    }
+    let live: {
+      context_tokens?: unknown;
+      context_history?: unknown;
+      pending_compaction?: unknown;
+    } = {};
+    try {
+      if (typeof response.output === "string") live = JSON.parse(response.output) as typeof live;
+    } catch {
+      // An older App Server may return human-readable /context output. Static
+      // model/memory diagnostics still render rather than failing the sheet.
+    }
+    const history = Array.isArray(live.context_history)
+      ? live.context_history
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+          .map((item) => ({
+            timestamp: typeof item.timestamp === "number" ? item.timestamp : 0,
+            tokens: typeof item.tokens === "number" ? item.tokens : 0,
+            ...(typeof item.turnId === "number" ? { turnId: item.turnId } : {}),
+            ...(item.compacted === true ? { compacted: true } : {}),
+          }))
+      : [];
+    const compactedIndex = history.findLastIndex((item) => item.compacted === true);
+    const after = compactedIndex >= 0 ? history[compactedIndex] : undefined;
+    const before = compactedIndex > 0 ? history[compactedIndex - 1] : undefined;
+    const contextTokens = typeof live.context_tokens === "number" && live.context_tokens > 0
+      ? live.context_tokens
+      : history.at(-1)?.tokens ?? null;
+    return {
+      model: staticInfo.model,
+      contextTokens,
+      contextWindow: staticInfo.contextWindow,
+      promptTokens: contextTokens,
+      completionTokens: null,
+      reasoningTokens: null,
+      cachedInputTokens: null,
+      coreMemoryEstimatedTokens: staticInfo.coreMemoryEstimatedTokens,
+      coreMemoryCharacters: staticInfo.coreMemoryCharacters,
+      coreMemoryBlocks: staticInfo.coreMemoryBlocks,
+      latestStepId: null,
+      pendingCompaction: live.pending_compaction === true,
+      contextHistory: history,
+      lastCompaction: after
+        ? {
+            date: after.timestamp ? new Date(after.timestamp).toISOString() : null,
+            trigger: "runtime compaction",
+            contextTokensBefore: before?.tokens ?? null,
+            contextTokensAfter: after.tokens,
+            messagesBefore: null,
+            messagesAfter: null,
+          }
+        : null,
+    };
+  }
+
+  /** Run Letta's native compact command without injecting `/compact` into chat. */
+  async compactConversation(): Promise<string> {
+    const staticInfo = await getConversationStaticDiagnostics(this.conn, this.conversationId);
+    const response = await this.ensureSession().sendCommand(
+      {
+        type: "execute_command",
+        command_id: "compact",
+        runtime: { agent_id: staticInfo.agentId, conversation_id: this.conversationId },
+      },
+      {
+        timeoutMs: 120000,
+        predicate: (message) =>
+          message.type === "slash_command_end" && message.command_id === "compact",
+      },
+    );
+    if (response.success !== true) {
+      throw new Error(typeof response.output === "string" ? response.output : "Conversation compaction failed.");
+    }
+    return typeof response.output === "string" ? response.output : "Compaction completed.";
+  }
+
   /** Change the conversation model/effort through the session (first-class SDK API). */
   async setModel(model: string, reasoningEffort?: string): Promise<void> {
     await this.ensureSession().updateModel({
@@ -487,6 +686,7 @@ export class ChatSession {
 
   /** Change the runtime permission mode (SDK 0.3.0 #208 write, 0.3.1 #212 read). */
   async setPermissionMode(mode: PermissionMode): Promise<void> {
+    this.preferredPermissionMode = mode;
     await this.ensureSession().changeDeviceState({ permissionMode: mode });
     // The authoritative value lands via the next device-status update; show
     // the pending value immediately so the sheet feels responsive.
@@ -516,6 +716,7 @@ export class ChatSession {
    * button frozen) after the run it remembers has long since finished.
    */
   private applyDeviceStatus(snapshot: ChatSnapshot, status: SessionDeviceStatus): ChatSnapshot {
+    this.deviceIsProcessing = status.isProcessing;
     const pending = status.pendingControlRequests ?? [];
     // Approvals we still hold a resolver for stay as they are — those cards can
     // be acted on. Ones the device reports but we can't answer (resolvers died
@@ -578,10 +779,47 @@ export class ChatSession {
    * clear the offline banner if it succeeds. A live session keeps its own
    * socket; if it died, the next send() lazily opens a fresh one.
    */
+  private scheduleReconnectRetry(): void {
+    if (this.closed || this.snapshot.connection === "auth_failed" || this.reconnectRetryTimer) return;
+    const delay = Math.min(
+      RECONNECT_RETRY_MAX_MS,
+      RECONNECT_RETRY_BASE_MS * Math.max(1, 2 ** this.reconnectRetryAttempt),
+    );
+    this.reconnectRetryAttempt += 1;
+    this.reconnectRetryTimer = setTimeout(() => {
+      this.reconnectRetryTimer = null;
+      if (!this.closed && this.snapshot.connection !== "connected" && this.snapshot.connection !== "auth_failed") {
+        void this.reconnect({ forceNewTransport: true });
+      }
+    }, delay);
+  }
+
+  private clearReconnectRetry(): void {
+    if (this.reconnectRetryTimer) {
+      clearTimeout(this.reconnectRetryTimer);
+      this.reconnectRetryTimer = null;
+    }
+    this.reconnectRetryAttempt = 0;
+  }
+
   async reconnect(options?: { forceNewTransport?: boolean }): Promise<void> {
+    if (this.reconnectInFlight) return this.reconnectInFlight;
+    const recovery = this.performReconnect(options).finally(() => {
+      if (this.reconnectInFlight === recovery) this.reconnectInFlight = null;
+    });
+    this.reconnectInFlight = recovery;
+    return recovery;
+  }
+
+  private async performReconnect(options?: { forceNewTransport?: boolean }): Promise<void> {
+    // Transport failures never belong in chat history. Scrub any legacy/local
+    // transport rows before recovery so reconnect is visually transparent.
+    this.commit(this.scrubTransportErrors(this.snapshot));
     // A visible failure state means the user pressed Retry — acknowledge
-    // instantly. Otherwise hold the "reconnecting" commit briefly so a fast
-    // resume resync never flashes the banner over a healthy screen.
+    // instantly. Otherwise hold the banner briefly so fast foreground resumes
+    // remain visually seamless. Preserve any active server-side run while the
+    // transport is uncertain; a dropped viewer socket is not evidence the work
+    // stopped.
     let pending: ReturnType<typeof setTimeout> | null = null;
     if (this.snapshot.connection === "offline" || this.snapshot.connection === "auth_failed") {
       this.commit(patch(this.snapshot, { connection: "reconnecting" }));
@@ -591,24 +829,114 @@ export class ChatSession {
         this.commit(patch(this.snapshot, { connection: "reconnecting" }));
       }, RECONNECT_BANNER_DELAY_MS);
     }
+
     // A dead or background-suspended SDK session must be discarded BEFORE
     // hydrate(): remote history hydration itself uses ensureSession(), so
-    // hydrating first would route recovery through the stale socket. iOS may
-    // suspend JS while backgrounded, preventing WebSocket pong handling even
-    // though the native socket object still looks open when the app wakes.
+    // hydrating first would route recovery through the stale socket.
     if (this.sessionDead || options?.forceNewTransport) {
       const stale = this.session;
       this.session = null;
       this.sessionDead = false;
       stale?.close();
     }
-    const ok = await this.hydrate();
-    if (pending) clearTimeout(pending);
-    // On failure hydrate() already committed offline/auth_failed.
-    if (!ok || this.closed) return;
-    this.commit(patch(this.snapshot, { connection: "connected" }));
+
+    const ok = await this.hydrate({ reconcileDevice: false });
+    if (!ok || this.closed) {
+      if (pending) clearTimeout(pending);
+      if (!this.closed && this.snapshot.connection !== "auth_failed") this.scheduleReconnectRetry();
+      return;
+    }
+
+    // Recovery is atomic from the UI's point of view: history first, then the
+    // executing device's live state, then approvals. Do not advertise a healthy
+    // connection while any of those still reflect the pre-drop client snapshot.
+    try {
+      const session = this.ensureSession();
+      const status = await session.getDeviceStatus();
+      if (this.closed) return;
+      this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
+
+      // Close the acceptance/persistence race around a dropped send once the
+      // server is idle. While a run is still streaming, persisted assistant
+      // messages may not carry the same identity as anonymous live deltas. A
+      // mid-run rebase can therefore materialize an older persisted copy beside
+      // the live row and reorder both. Keep the live accumulator untouched until
+      // catchUpAfterReconnect() observes idle, then repair from authoritative
+      // history in one pass.
+      if (!status.isProcessing) {
+        const latest = await this.fetchAuthoritativeTail();
+        this.mergeLatestHistory(latest);
+        this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
+        this.captureHistoryTimestamps(latest);
+        this.commit(this.project(this.snapshot));
+      }
+
+      await session.recoverPendingApprovals().catch(() => {});
+      if (this.preferredPermissionMode) {
+        await session.changeDeviceState({ permissionMode: this.preferredPermissionMode }).catch(() => {});
+      }
+      if (pending) clearTimeout(pending);
+      this.clearReconnectRetry();
+      this.commit(patch(this.project(this.snapshot), { connection: "connected" }));
+      void this.catchUpAfterReconnect(session);
+    } catch (e) {
+      if (pending) clearTimeout(pending);
+      if (this.closed) return;
+      this.sessionDead = true;
+      const authFailure = isAuthError(e);
+      this.commit(
+        patch(this.snapshot, {
+          connection: authFailure ? "auth_failed" : "offline",
+          run: preserveRunAcrossTransportLoss(this.snapshot.run),
+        }),
+      );
+      if (!authFailure) this.scheduleReconnectRetry();
+    }
   }
 
+  private async catchUpAfterReconnect(session: LettaCodeSession): Promise<void> {
+    const refreshLatest = async (): Promise<void> => {
+      if (this.closed || this.session !== session) return;
+      const latest = await this.fetchAuthoritativeTail();
+      if (this.closed || this.session !== session) return;
+      this.mergeLatestHistory(latest);
+      this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
+      this.captureHistoryTimestamps(latest);
+      this.commit(this.project(this.snapshot));
+    };
+
+    try {
+      while (!this.closed && this.session === session) {
+        const status = await session.getDeviceStatus();
+        if (this.closed || this.session !== session) return;
+        this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
+        if (!status.isProcessing) {
+          // Do not rebase persisted history while the replacement session is
+          // actively streaming. Anonymous live deltas and their later persisted
+          // messages cannot always be identity-matched, which is what produced
+          // duplicate/out-of-order bubbles during long responses.
+          await new Promise((resolve) => setTimeout(resolve, RECONNECT_CATCHUP_FINAL_DELAY_MS));
+          await refreshLatest();
+          // Device idle can precede durable message persistence very slightly.
+          // A second bounded pass closes that race without leaving a poller alive.
+          await new Promise((resolve) => setTimeout(resolve, RECONNECT_CATCHUP_SECOND_PASS_MS));
+          await refreshLatest();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, RECONNECT_CATCHUP_INTERVAL_MS));
+      }
+    } catch {
+      // consume() owns transport recovery; a later reconnect starts a fresh pass.
+    }
+  }
+
+  /**
+   * Stop is server-authoritative. Some App Server versions apply abort_message
+   * but omit abort_message_response, which leaves the SDK's abort() promise
+   * pending forever. After a short acknowledgement window, repeat the same
+   * supported protocol command without waiting for an acknowledgement and
+   * confirm the device actually became idle.
+   */
   async abort(): Promise<void> {
     // With no live session there is no server to confirm the abort, so
     // "aborting" could never retire — nothing runs client-side anyway.
@@ -616,10 +944,39 @@ export class ChatSession {
       this.commit(patch(this.snapshot, { run: "idle" }));
       return;
     }
+    const session = this.session;
     const previous = this.snapshot.run;
     this.commit(patch(this.snapshot, { run: "aborting" }));
     try {
-      await this.session.abort();
+      const staticInfo = await getConversationStaticDiagnostics(this.conn, this.conversationId);
+      const acknowledged = await Promise.race([
+        session.abort().then(
+          () => true,
+          () => false,
+        ),
+        new Promise<boolean>((resolve) =>
+          setTimeout(() => resolve(false), ABORT_ACK_TIMEOUT_MS),
+        ),
+      ]);
+      if (!acknowledged) {
+        await session.sendCommand({
+          type: "abort_message",
+          runtime: { agent_id: staticInfo.agentId, conversation_id: this.conversationId },
+          run_id: null,
+        });
+      }
+
+      const deadline = Date.now() + ABORT_CONFIRM_TIMEOUT_MS;
+      while (true) {
+        const status = await session.getDeviceStatus();
+        if (this.closed || this.session !== session) return;
+        this.deviceIsProcessing = status.isProcessing;
+        this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
+        if (!status.isProcessing) return;
+        if (Date.now() >= deadline) break;
+        await new Promise((resolve) => setTimeout(resolve, ABORT_CONFIRM_INTERVAL_MS));
+      }
+      throw new Error("Stop was sent, but the server still reports this run as active.");
     } catch (e) {
       this.commit(
         patch(this.appendError(this.snapshot, e instanceof Error ? e.message : "Couldn't stop the run."), {
@@ -630,7 +987,12 @@ export class ChatSession {
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true;
+    this.clearReconnectRetry();
+    if (retainedChatSessions.get(this.retainedKey) === this) {
+      retainedChatSessions.delete(this.retainedKey);
+    }
     this.accumulator.reset();
     this.localRows = [];
     this.echoOtids.clear();
@@ -658,6 +1020,9 @@ export class ChatSession {
           : null,
     );
     for (const listener of this.listeners) listener(next);
+    // A session retained solely to finish background work can clean itself up as
+    // soon as the device/turn reaches a genuine idle state.
+    this.maybeDisposeWhenUnobserved();
   }
 
   private id(prefix: string): string {
@@ -674,7 +1039,7 @@ export class ChatSession {
    * the SDK's management transport here would hold the slot and deadlock the
    * session's own connect (SDK-FEEDBACK.md "Still open" #4).
    */
-  private async hydrate(): Promise<boolean> {
+  private async hydrate(options?: { reconcileDevice?: boolean }): Promise<boolean> {
     try {
       if (this.conn.profile.type === "remote") {
         // Survive React dev double-mounting: the first, immediately-closed
@@ -683,43 +1048,43 @@ export class ChatSession {
         await new Promise((resolve) => setTimeout(resolve, 400));
         if (this.closed) return false;
       }
-      const page = await this.fetchHistoryPage();
+      const page = await this.fetchInitialHistory();
       this.nextBefore = page.nextBefore;
+      this.mergeLatestHistory(page.messages);
       // rebase() merges history with replace semantics and is safe mid-run: it
       // lands rows on their existing keys instead of duplicating, and raises the
       // replay thresholds the page proves. Appending would double the transcript
       // on every foreground resume, which is exactly what it used to do.
-      this.accumulator.rebase({ messages: page.messages as never }, { order: "asc" });
-      this.commit(
-        this.project(patch(this.snapshot, { hydrating: false, hasMore: page.hasMore })),
-      );
-      // An approval left pending across a disconnect (or a previous app run)
-      // re-delivers through canUseTool, resurfacing the ApprovalCard instead
-      // of deadlocking the run. Best-effort: older servers lack the command,
-      // and cloud sessions don't exist until the first send.
-      void this.session?.recoverPendingApprovals().catch(() => {});
-      // Reconcile run phase + pending approvals with the device: an in-memory
-      // "running" from before the resume is a guess, and a stale one freezes
-      // the composer on stop with no way back.
-      void this.session
-        ?.getDeviceStatus()
-        .then((status) => {
-          if (!this.closed) this.commit(this.applyDeviceStatus(this.snapshot, status));
-        })
-        .catch(() => {});
+      this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
+      this.captureHistoryTimestamps(page.messages);
+
+      let next = this.project(patch(this.snapshot, { hasMore: page.hasMore }));
+      if (options?.reconcileDevice !== false && this.session) {
+        // Cold open/reload must establish runtime truth before the UI claims the
+        // conversation is ready. The SDK session was created with the saved
+        // permission mode, so approval recovery cannot race a later mode restore.
+        // A stranded unrestricted tool therefore resumes here instead of being
+        // rendered as an idle-looking forever-running card.
+        await this.session.recoverPendingApprovals().catch(() => {});
+        const status = await this.session.getDeviceStatus().catch(() => null);
+        if (status) next = this.applyDeviceStatus(next, status);
+      }
+      if (this.closed) return false;
+      this.commit(patch(next, { hydrating: false }));
       return true;
     } catch (e) {
       if (this.closed) return false;
-      // A failed load must leave a live affordance behind: the retryable row
-      // and the offline banner's Retry both route back through reconnect().
+      const detail = e instanceof Error ? e.message : "Couldn't load history.";
+      const transportFailure = isTransportError(detail);
+      // Connection failures are UI transport state, never transcript content.
+      // Keep any in-flight run intact while a replacement socket is retried.
+      const base = transportFailure ? this.scrubTransportErrors(this.snapshot) : this.appendError(this.snapshot, detail, true);
       this.commit(
-        patch(
-          this.appendError(this.snapshot, e instanceof Error ? e.message : "Couldn't load history.", true),
-          {
-            hydrating: false,
-            connection: isAuthError(e) ? "auth_failed" : "offline",
-          },
-        ),
+        patch(base, {
+          hydrating: false,
+          connection: isAuthError(e) ? "auth_failed" : "offline",
+          run: transportFailure ? preserveRunAcrossTransportLoss(this.snapshot.run) : this.snapshot.run,
+        }),
       );
       return false;
     }
@@ -736,8 +1101,11 @@ export class ChatSession {
     try {
       const page = await this.fetchHistoryPage(this.nextBefore);
       this.nextBefore = page.nextBefore;
-      // Backfilled rows order ahead of live-only rows inside the accumulator.
-      this.accumulator.rebase({ messages: page.messages as never }, { order: "asc" });
+      this.mergeOlderHistory(page.messages);
+      // Rebase the complete loaded history window so later authoritative newest-
+      // turn repairs cannot reorder an older page behind the live edge.
+      this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
+      this.captureHistoryTimestamps(page.messages);
       this.commit(
         this.project(patch(this.snapshot, { hasMore: page.hasMore, loadingOlder: false })),
       );
@@ -749,10 +1117,12 @@ export class ChatSession {
   }
 
   /** One page of history, oldest-first, with the cursor to the next older page. */
-  private async fetchHistoryPage(before?: string): Promise<{ messages: unknown[]; nextBefore: string | null; hasMore: boolean }> {
+  private async fetchHistoryPage(
+    before?: string,
+    limit = AUTHORITATIVE_PAGE_SIZE,
+  ): Promise<{ messages: unknown[]; nextBefore: string | null; hasMore: boolean }> {
     // Both backends page reliably now (letta-cloud#13377 + letta-code#3526), so
     // the first paint stays cheap and older pages arrive on scroll.
-    const limit = 50;
     if (this.conn.profile.type === "remote") {
       const result = await this.ensureSession().listMessages({ limit, ...(before ? { before } : {}) });
       const messages = result.messages.slice().reverse();
@@ -766,6 +1136,98 @@ export class ChatSession {
     }
     return listConversationMessages(this.conn, this.conversationId, { limit, ...(before ? { before } : {}) });
   }
+
+  /**
+   * Initial paint with a complete latest turn and a valid older-history cursor.
+   * If the newest page is entirely inside one very tool-heavy turn, page back
+   * until its user-message boundary is included. Unlike the lightweight
+   * reconciliation tail, keep all fetched rows so scrolling can continue from
+   * the oldest page's cursor without a gap.
+   */
+  private async fetchInitialHistory(): Promise<{ messages: unknown[]; nextBefore: string | null; hasMore: boolean }> {
+    let page = await this.fetchHistoryPage();
+    let messages = page.messages;
+    let nextBefore = page.nextBefore;
+    let hasMore = page.hasMore;
+
+    for (
+      let count = 1;
+      count < AUTHORITATIVE_MAX_PAGES && !containsUserMessage(messages) && hasMore && nextBefore;
+      count++
+    ) {
+      page = await this.fetchHistoryPage(nextBefore);
+      messages = [...page.messages, ...messages];
+      nextBefore = page.nextBefore;
+      hasMore = page.hasMore;
+    }
+
+    return { messages, nextBefore, hasMore };
+  }
+
+  /**
+   * Fetch the complete newest turn rather than trusting an arbitrary page cut.
+   * Tool-heavy turns can exceed 50 wire messages; a fixed tail can therefore
+   * begin after the user instruction or between a tool call and its return.
+   */
+  private async fetchAuthoritativeTail(): Promise<unknown[]> {
+    let page = await this.fetchHistoryPage();
+    let combined = page.messages;
+    let cursor = page.nextBefore;
+
+    for (let count = 1; count < AUTHORITATIVE_MAX_PAGES && !containsUserMessage(combined) && page.hasMore && cursor; count++) {
+      page = await this.fetchHistoryPage(cursor);
+      combined = [...page.messages, ...combined];
+      cursor = page.nextBefore;
+    }
+
+    for (let i = combined.length - 1; i >= 0; i--) {
+      if (isUserHistoryMessage(combined[i])) return combined.slice(i);
+    }
+    return combined;
+  }
+
+  /** Replace the newest persisted suffix while preserving all older loaded rows. */
+  private mergeLatestHistory(messages: readonly unknown[]): void {
+    if (messages.length === 0) return;
+    if (this.loadedHistoryMessages.length === 0) {
+      this.loadedHistoryMessages = [...messages];
+      return;
+    }
+
+    const firstId = historyMessageId(messages[0]);
+    if (firstId) {
+      const overlap = this.loadedHistoryMessages.findIndex((message) => historyMessageId(message) === firstId);
+      if (overlap >= 0) {
+        this.loadedHistoryMessages = [...this.loadedHistoryMessages.slice(0, overlap), ...messages];
+        return;
+      }
+    }
+
+    const existing = new Set(this.loadedHistoryMessages.map(historyMessageId).filter(Boolean));
+    const additions = messages.filter((message) => {
+      const id = historyMessageId(message);
+      return !id || !existing.has(id);
+    });
+    this.loadedHistoryMessages = [...this.loadedHistoryMessages, ...additions];
+  }
+
+  /** Prepend an older cursor page without duplicating its overlap boundary. */
+  private mergeOlderHistory(messages: readonly unknown[]): void {
+    if (messages.length === 0) return;
+    const existing = new Set(this.loadedHistoryMessages.map(historyMessageId).filter(Boolean));
+    const additions = messages.filter((message) => {
+      const id = historyMessageId(message);
+      return !id || !existing.has(id);
+    });
+    this.loadedHistoryMessages = [...additions, ...this.loadedHistoryMessages];
+  }
+
+  // A healthy live turn is intentionally NOT rebased from persisted history on
+  // completion. Some App Server text deltas are anonymous; the SDK cannot prove
+  // an anonymous live row and its later persisted message are the same identity,
+  // so rebasing a healthy turn can temporarily duplicate/reorder visible text.
+  // Persisted history is used when opening, paging, or recovering a transport
+  // gap — the cases where authoritative repair is actually required.
 
   private async consume(): Promise<void> {
     const session = this.session;
@@ -792,23 +1254,24 @@ export class ChatSession {
       this.sessionDead = true;
       const detail = e instanceof Error && e.message ? e.message : "Stream ended unexpectedly.";
       this.settleActivityWaiters(e instanceof Error ? e : new Error(detail));
-      // No streaming visual may outlive the stream (the caret would pulse on
-      // dead text forever — nothing else retires it after this point).
-      this.interruptedKey = newestTextKey(this.accumulator.rows());
+      const transportFailure = isTransportError(detail);
+      // A viewer transport failure is not a run failure. Keep the run and the
+      // live row intact until the replacement session asks the device what is
+      // actually happening. Only a genuine non-transport stream error marks
+      // the current text as interrupted.
+      if (!transportFailure) this.interruptedKey = newestTextKey(this.accumulator.rows());
       const swept = this.project(this.drainStreamBuffer(this.snapshot));
       this.commit(
-        patch(isTransportError(detail) ? swept : this.appendError(swept, detail, true), {
-          run: "idle",
-          connection: isAuthError(e) ? "auth_failed" : "offline",
+        patch(transportFailure ? swept : this.appendError(swept, detail, true), {
+          run: transportFailure ? preserveRunAcrossTransportLoss(this.snapshot.run) : "idle",
+          connection: isAuthError(e) ? "auth_failed" : transportFailure ? "reconnecting" : "offline",
         }),
       );
       // App Server heartbeat expiry and transient mobile-network drops are
       // recoverable. Rebuild the SDK session automatically instead of leaving
       // the user stranded on a dead socket until the app is relaunched.
       if (isTransportError(detail) && !isAuthError(e)) {
-        setTimeout(() => {
-          if (!this.closed && this.sessionDead) void this.reconnect();
-        }, 500);
+        this.scheduleReconnectRetry();
       }
     }
   }
@@ -874,12 +1337,18 @@ export class ChatSession {
       thinkStartedAt: this.thinkStartedAt,
       thinkSeconds: this.thinkSeconds,
       toolDurationMs: this.toolDurationMs,
+      rowOccurredAt: this.rowOccurredAt,
+      toolCompletedAt: this.toolCompletedAt,
     };
     const items = projectRows(rows, state);
 
     // An echo retires the moment the accumulator reports the persisted message
     // under the same otid — identity, not a guess about matching text.
-    const seenOtids = new Set(rows.map((row) => row.otid).filter(Boolean) as string[]);
+    // The OTID identifies the whole turn on some live rows, not just the user's
+    // persisted message. Retire an optimistic bubble only when the accumulator
+    // has an actual USER row with that OTID; assistant/reasoning/tool activity
+    // must never make the user's just-sent message disappear.
+    const seenOtids = userRowOtids(rows);
     this.localRows = this.localRows.filter(
       ({ item }) => !(item.kind === "user" && this.echoOtids.has(item.id) && seenOtids.has(item.id)),
     );
@@ -901,12 +1370,59 @@ export class ChatSession {
     return patch(snapshot, { transcript });
   }
 
+  /** Preserve persisted server timestamps when history is merged. */
+  private captureHistoryTimestamps(messages: unknown[]): void {
+    const byUuid = new Map<string, number>();
+    const byOtid = new Map<string, number>();
+    const byToolCall = new Map<string, number>();
+    const completedTool = new Map<string, number>();
+
+    for (const raw of messages) {
+      if (!raw || typeof raw !== "object") continue;
+      const record = raw as Record<string, unknown>;
+      const date = typeof record.date === "string" ? Date.parse(record.date) : Number.NaN;
+      if (!Number.isFinite(date)) continue;
+      if (typeof record.id === "string") byUuid.set(record.id, date);
+      if (typeof record.otid === "string") byOtid.set(record.otid, date);
+
+      const calls = Array.isArray(record.tool_calls) ? record.tool_calls : [];
+      for (const value of calls) {
+        if (!value || typeof value !== "object") continue;
+        const call = value as Record<string, unknown>;
+        const id =
+          typeof call.tool_call_id === "string"
+            ? call.tool_call_id
+            : typeof call.id === "string"
+              ? call.id
+              : undefined;
+        if (id) byToolCall.set(id, date);
+      }
+      if (typeof record.tool_call_id === "string" && record.message_type === "tool_return_message") {
+        completedTool.set(record.tool_call_id, date);
+      }
+    }
+
+    for (const row of this.accumulator.rows()) {
+      const timestamp =
+        (row.uuid ? byUuid.get(row.uuid) : undefined) ??
+        (row.otid ? byOtid.get(row.otid) : undefined) ??
+        (row.kind === "tool_call" ? byToolCall.get(row.toolCallId) : undefined);
+      if (timestamp !== undefined) this.rowOccurredAt.set(row.key, timestamp);
+      if (row.kind === "tool_call") {
+        const completed = completedTool.get(row.toolCallId);
+        if (completed !== undefined) this.toolCompletedAt.set(row.toolCallId, completed);
+      }
+    }
+  }
+
   /**
    * Durations are wall-clock, so they are stamped as rows appear and settle
-   * rather than derived from the rows themselves.
+   * rather than derived from the rows themselves. Live timestamps are captured
+   * on first appearance; history later replaces them with server time.
    */
   private recordTimings(rows: readonly TranscriptRow[], liveKey: string | null): void {
     for (const row of rows) {
+      if (!this.rowOccurredAt.has(row.key)) this.rowOccurredAt.set(row.key, Date.now());
       if (row.kind === "reasoning") {
         if (!this.thinkStartedAt.has(row.key)) this.thinkStartedAt.set(row.key, Date.now());
         if (row.key !== liveKey && !this.thinkSeconds.has(row.key)) {
@@ -915,6 +1431,9 @@ export class ChatSession {
         }
       } else if (row.kind === "tool_call") {
         if (!this.toolStartedAt.has(row.toolCallId)) this.toolStartedAt.set(row.toolCallId, Date.now());
+        if (row.status === "complete" && !this.toolCompletedAt.has(row.toolCallId)) {
+          this.toolCompletedAt.set(row.toolCallId, Date.now());
+        }
         if (row.status === "complete" && !this.toolDurationMs.has(row.toolCallId)) {
           const startedAt = this.toolStartedAt.get(row.toolCallId)!;
           // A denied call's elapsed time measures the user deliberating, not work.
@@ -950,6 +1469,14 @@ export class ChatSession {
     return this.project(snapshot);
   }
 
+  /** Remove viewer/transport failures from the transcript. They are connection UI, not chat history. */
+  private scrubTransportErrors(snapshot: ChatSnapshot): ChatSnapshot {
+    const next = this.localRows.filter(({ item }) => item.kind !== "error" || !isTransportError(item.message));
+    if (next.length === this.localRows.length) return snapshot;
+    this.localRows = next;
+    return this.project(snapshot);
+  }
+
   /** Consecutive identical failures (reconnect loops) must read as one event. */
   private appendError(snapshot: ChatSnapshot, message: string, retryable?: boolean): ChatSnapshot {
     const last = snapshot.transcript[snapshot.transcript.length - 1];
@@ -958,6 +1485,7 @@ export class ChatSession {
       kind: "error",
       id: this.id("err"),
       message,
+      occurredAt: Date.now(),
       ...(retryable ? { retryable: true } : {}),
     });
   }
@@ -1004,34 +1532,51 @@ export class ChatSession {
         if (!status.startsWith("WAITING") && status !== "IDLE") {
           return this.project(patch(snapshot, { run: snapshot.run === "idle" ? "running" : snapshot.run }));
         }
+        // Device status is more authoritative than loop bookkeeping. A freshly
+        // reattached viewer can report WAITING_ON_INPUT while the executing
+        // device is still processing the pre-existing turn. Never let that
+        // transient viewer status erase a confirmed active run.
+        if (this.deviceIsProcessing) {
+          return this.project(patch(snapshot, { run: "running" }));
+        }
         // Interruption is `result`'s call — a normal completion also lands here,
         // and marking the last row "Stopped" from this path would libel it.
         return this.project(patch(snapshot, { run: "idle" }));
       }
 
       case "result": {
+        const detail = message.errorDetail ?? message.error ?? "The run failed.";
+        if (!message.success && isTransportError(detail)) {
+          return patch(this.project(snapshot), {
+            run: preserveRunAcrossTransportLoss(snapshot.run),
+            connection: "reconnecting",
+          });
+        }
+        this.deviceIsProcessing = false;
         // An aborted turn completes as a result with stopReason "interrupted"
         // and no settled assistant message, so the row it left behind is the
         // only place "Stopped" can be shown.
         const interrupted = !message.success || message.stopReason === "interrupted";
         this.interruptedKey = interrupted ? newestTextKey(this.accumulator.rows()) : null;
         const idle = this.project(patch(snapshot, { run: "idle" }));
-        return message.success
-          ? idle
-          : this.appendError(idle, message.errorDetail ?? message.error ?? "The run failed.");
+        return message.success ? idle : this.appendError(idle, detail);
       }
 
-      case "error":
-        this.interruptedKey = newestTextKey(this.accumulator.rows());
-        return this.appendError(
-          this.project(snapshot),
-          // Error events don't always carry a message (e.g. an
-          // approval_conflict names only its code) — never render blank.
+      case "error": {
+        const detail =
           message.message ||
-            ((message as { code?: string }).code
-              ? `The server rejected the request (${(message as { code?: string }).code}).`
-              : "Something went wrong on the server."),
-        );
+          ((message as { code?: string }).code
+            ? `The server rejected the request (${(message as { code?: string }).code}).`
+            : "Something went wrong on the server.");
+        if (isTransportError(detail)) {
+          return patch(this.project(snapshot), {
+            run: preserveRunAcrossTransportLoss(snapshot.run),
+            connection: "reconnecting",
+          });
+        }
+        this.interruptedKey = newestTextKey(this.accumulator.rows());
+        return this.appendError(this.project(snapshot), detail);
+      }
 
       case "retry":
       default:
@@ -1043,6 +1588,24 @@ export class ChatSession {
 
 
 /** Restate one tool card's status; no-op when the call isn't in the transcript. */
+function historyMessageId(message: unknown): string | null {
+  if (!message || typeof message !== "object") return null;
+  const id = (message as { id?: unknown }).id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+function isUserHistoryMessage(message: unknown): boolean {
+  return Boolean(
+    message &&
+      typeof message === "object" &&
+      (message as { message_type?: unknown }).message_type === "user_message",
+  );
+}
+
+function containsUserMessage(messages: readonly unknown[]): boolean {
+  return messages.some(isUserHistoryMessage);
+}
+
 /**
  * Transport-class failures are the ConnectionBanner's to report — a transcript
  * row would double-report and outlive the outage (remodex filters the same

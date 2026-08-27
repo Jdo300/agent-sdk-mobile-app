@@ -4,7 +4,7 @@
  * disclosed and quieter than the prose.
  */
 import { memo, useEffect, useState } from "react";
-import { StyleSheet, View } from "react-native";
+import { Alert, StyleSheet, View, useWindowDimensions } from "react-native";
 import { router } from "expo-router";
 import { Image } from "expo-image";
 import Animated, {
@@ -16,13 +16,41 @@ import Animated, {
 } from "react-native-reanimated";
 
 import { useTheme } from "../../theme/ThemeProvider";
-import { motion, radius, space } from "../../theme/tokens";
+import { motion, radius, space, type as typeScale } from "../../theme/tokens";
 import { Text } from "../ui/Text";
 import { Touchable } from "../ui/Touchable";
-import { Markdown, useCopyFeedback } from "./Markdown";
+import { Markdown, markdownToPlainText, useCopyFeedback } from "./Markdown";
 import type { AssistantItem, ErrorItem, ReasoningItem, ToolItem, UserItem } from "../../lib/letta/model";
 import type { ToolGroupItem } from "../../lib/letta/grouping";
 import { setViewerPayload } from "../../lib/viewerPayload";
+
+
+function formatTimestamp(value?: number): string | null {
+  if (!value) return null;
+  return new Date(value).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function Timestamp({ value, align = "left" }: { value?: number; align?: "left" | "right" }) {
+  const label = formatTimestamp(value);
+  if (!label) return null;
+  return (
+    <Text role="sub" ink={3} style={[styles.timestamp, align === "right" ? styles.timestampRight : null]}>
+      {label}
+    </Text>
+  );
+}
+
+function showCopyMenu(markdown: string, copyText: (text: string) => void) {
+  Alert.alert("Copy message", undefined, [
+    { text: "Copy as plain text", onPress: () => copyText(markdownToPlainText(markdown)) },
+    { text: "Copy as Markdown", onPress: () => copyText(markdown) },
+    { text: "Cancel", style: "cancel" },
+  ]);
+}
 
 // ── User ────────────────────────────────────────────────────────────────────
 
@@ -31,15 +59,15 @@ import { setViewerPayload } from "../../lib/viewerPayload";
 // row skips its render on reference equality alone.
 export const UserBubble = memo(function UserBubble({ item, onRetry }: { item: UserItem; onRetry?: () => void }) {
   const { colors } = useTheme();
-  const { copied, copy } = useCopyFeedback(item.text);
+  const { copied, copyText } = useCopyFeedback(item.text);
   return (
     <View style={styles.userRow}>
       <Touchable
         accessibilityRole={item.failed ? "button" : "none"}
         accessibilityLabel={item.failed ? "Message not sent. Retry" : item.text}
-        accessibilityHint="Long press to copy"
+        accessibilityHint="Long press for copy options"
         onPress={item.failed ? onRetry : undefined}
-        onLongPress={copy}
+        onLongPress={() => showCopyMenu(item.text, copyText)}
         scaleOnPress={item.failed}
         style={styles.userTouch}
       >
@@ -70,6 +98,7 @@ export const UserBubble = memo(function UserBubble({ item, onRetry }: { item: Us
           ) : null}
           {item.text ? <Text style={styles.userText}>{item.text}</Text> : null}
         </View>
+        <Timestamp value={item.occurredAt} align="right" />
         {item.failed ? (
           <Text role="sub" tone="danger" style={styles.userMeta}>
             Not sent · Tap to retry
@@ -106,6 +135,7 @@ export function ThinkingRow() {
 /** Pulsing block caret appended while streaming. */
 function Caret() {
   const { colors } = useTheme();
+  const { fontScale } = useWindowDimensions();
   const opacity = useSharedValue(1);
   useEffect(() => {
     opacity.set(withRepeat(
@@ -115,19 +145,32 @@ function Caret() {
     ));
   }, [opacity]);
   const style = useAnimatedStyle(() => ({ opacity: opacity.get() }));
+  const caretHeight = typeScale.body.fontSize * fontScale * 0.94;
+  const caretWidth = Math.max(6, typeScale.body.fontSize * fontScale * 0.42);
   return (
-    <Animated.View style={[styles.caret, { backgroundColor: colors.ink2 }, style]} />
+    <Animated.View
+      style={[
+        styles.caret,
+        {
+          backgroundColor: colors.ink2,
+          width: caretWidth,
+          height: caretHeight,
+          transform: [{ translateY: Math.max(1, 2 * fontScale) }],
+        },
+        style,
+      ]}
+    />
   );
 }
 
 export const AssistantBlock = memo(function AssistantBlock({ item }: { item: AssistantItem }) {
-  const { copied, copy } = useCopyFeedback(item.text);
+  const { copied, copyText } = useCopyFeedback(item.text);
   return (
     <Touchable
       accessibilityRole="none"
-      accessibilityHint="Long press to copy"
+      accessibilityHint="Long press for copy options"
       // Copy only once the text is final — mid-stream it would be a torn read.
-      onLongPress={item.streaming ? undefined : copy}
+      onLongPress={item.streaming ? undefined : () => showCopyMenu(item.text, copyText)}
       scaleOnPress={false}
       style={styles.assistant}
     >
@@ -143,6 +186,7 @@ export const AssistantBlock = memo(function AssistantBlock({ item }: { item: Ass
           Copied
         </Text>
       ) : null}
+      {!item.streaming ? <Timestamp value={item.occurredAt} /> : null}
     </Touchable>
   );
 });
@@ -223,6 +267,7 @@ export const ReasoningRow = memo(function ReasoningRow({ item }: { item: Reasoni
               {preview}
             </Text>
           ) : null}
+          {!item.streaming ? <Timestamp value={item.occurredAt} /> : null}
           <Text role="sub" ink={3}>
             {expanded ? "▾" : "›"}
           </Text>
@@ -296,6 +341,14 @@ export const ToolGroupRow = memo(function ToolGroupRow({
             {group.failed} failed
           </Text>
         ) : null}
+        {group.tools[0]?.occurredAt ? (
+          <Text role="sub" ink={3}>
+            · {formatTimestamp(group.tools[0].occurredAt)}
+            {group.tools.at(-1)?.completedAt && group.tools.at(-1)?.completedAt !== group.tools[0].occurredAt
+              ? `–${formatTimestamp(group.tools.at(-1)?.completedAt)}`
+              : ""}
+          </Text>
+        ) : null}
         <Text role="sub" ink={3} numberOfLines={1} style={styles.reasoningPreview} mono>
           {names.slice(0, 3).join(", ")}
           {names.length > 3 ? "…" : ""}
@@ -336,6 +389,12 @@ export const ToolCard = memo(function ToolCard({ item, onPress }: { item: ToolIt
         <Text role="sub" ink={2} mono>
           {item.name}
         </Text>
+        {item.occurredAt ? (
+          <Text role="sub" ink={3}>
+            · {formatTimestamp(item.occurredAt)}
+            {item.completedAt && item.completedAt !== item.occurredAt ? `–${formatTimestamp(item.completedAt)}` : ""}
+          </Text>
+        ) : null}
         {item.durationMs !== undefined ? (
           <Text role="sub" ink={3}>
             · {(item.durationMs / 1000).toFixed(1)}s
@@ -369,9 +428,12 @@ export const ToolCard = memo(function ToolCard({ item, onPress }: { item: ToolIt
 export const ErrorRow = memo(function ErrorRow({ item, onRetry }: { item: ErrorItem; onRetry?: () => void }) {
   return (
     <View style={styles.errorRow}>
-      <Text role="sub" tone="danger">
-        {item.message}
-      </Text>
+      <View style={styles.errorBody}>
+        <Text role="sub" tone="danger">
+          {item.message}
+        </Text>
+        <Timestamp value={item.occurredAt} />
+      </View>
       {item.retryable ? (
         <Touchable accessibilityRole="button" accessibilityLabel="Retry" onPress={onRetry} style={styles.retry}>
           <Text role="sub" tone="accent">
@@ -398,8 +460,10 @@ const styles = StyleSheet.create({
   },
   userText: { fontSize: 15, lineHeight: 21 },
   userMeta: { paddingRight: space.xs },
+  timestamp: { opacity: 0.78 },
+  timestampRight: { textAlign: "right", paddingRight: space.xs },
   assistant: { gap: 4 },
-  caret: { width: 7, height: 15, borderRadius: 1.5, marginLeft: 2, transform: [{ translateY: 2 }] },
+  caret: { borderRadius: 1.5, marginLeft: 2 },
   interrupted: { marginTop: 2 },
   reasoning: { minHeight: 28 },
   reasoningInner: { flexDirection: "row", alignItems: "center", gap: space.sm },
@@ -418,5 +482,6 @@ const styles = StyleSheet.create({
   shimmerClip: { position: "absolute", top: 0, bottom: 0, left: 0, right: 0, overflow: "hidden" },
   shimmer: { position: "absolute", top: 0, bottom: 0, width: 90, transform: [{ skewX: "-18deg" }] },
   errorRow: { flexDirection: "row", alignItems: "center", gap: space.md },
+  errorBody: { flex: 1, gap: 2 },
   retry: { minHeight: 32 },
 });

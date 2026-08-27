@@ -2,14 +2,15 @@
  * Chat — the product (docs/design-doc.md §4.4). A ChatSession bridges the
  * Agent SDK stream into the snapshot the transcript renders. The composer
  * stays enabled during a run (sends become queued follow-ups, server-
- * confirmed); the send button morphs into stop.
+ * confirmed); the send button switches into stop.
  */
-import type { BottomSheetModal } from "@gorhom/bottom-sheet";
+import { BottomSheetTextInput as NativeBottomSheetTextInput, type BottomSheetModal } from "@gorhom/bottom-sheet";
 import { router, useLocalSearchParams } from "expo-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   ActivityIndicator,
+  Alert,
   AppState,
   FlatList,
   Keyboard,
@@ -19,6 +20,8 @@ import {
   TextInput,
   View,
 } from "react-native";
+
+const SheetTextInput = Platform.OS === "web" ? TextInput : NativeBottomSheetTextInput;
 import { Image } from "expo-image";
 import {
   RecordingPresets,
@@ -29,8 +32,9 @@ import {
   useAudioRecorderState,
   type AudioPlayer,
 } from "expo-audio";
-import Animated, { FadeIn, FadeOut, useAnimatedStyle, useSharedValue, withSpring } from "react-native-reanimated";
+import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import Svg, { Path } from "react-native-svg";
 
 import { ApprovalCard } from "../components/chat/ApprovalCard";
@@ -63,7 +67,9 @@ import {
   getConversationModel,
   isAuthError,
   listModels,
+  renameConversation,
   updateConversationModel,
+  type ConversationDiagnostics,
   type ModelOption,
   type ReasoningEffort,
 } from "../lib/letta/api";
@@ -84,12 +90,45 @@ import {
   speechSource,
   transcribeVoice,
   KOKORO_PLAYBACK_RATE,
+  prepareSpeechText,
   voiceModeLabel,
   type VoiceMode,
 } from "../lib/voice";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
 import { motion, radius, space } from "../theme/tokens";
+
+const RUNTIME_PERMISSION_KEY_PREFIX = "milo.runtime.permission.v1:";
+const RUNTIME_EFFORT_KEY_PREFIX = "milo.runtime.reasoning.v1:";
+const VOICE_AUTO_SEND_KEY = "milo.voice.autoSend.v1";
+const REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+const VOICE_RECORDING_LIMIT_SECONDS = 10 * 60;
+
+function permissionStorageKey(profileId: string): string {
+  return `${RUNTIME_PERMISSION_KEY_PREFIX}${profileId}`;
+}
+
+function effortStorageKey(profileId: string, conversationId: string): string {
+  return `${RUNTIME_EFFORT_KEY_PREFIX}${profileId}:${conversationId}`;
+}
+
+function dismissChatKeyboard(): void {
+  if (Platform.OS === "web") {
+    const active = globalThis.document?.activeElement as HTMLElement | null | undefined;
+    active?.blur?.();
+    return;
+  }
+  Keyboard.dismiss();
+}
+
+function savedReasoningEffort(value: string | null): ReasoningEffort | null {
+  return REASONING_EFFORTS.includes(value as ReasoningEffort) ? (value as ReasoningEffort) : null;
+}
+
+function formatTokens(value: number | null | undefined): string {
+  if (value == null) return "—";
+  return new Intl.NumberFormat("en-US").format(Math.round(value));
+}
 
 function MicrophoneIcon({ color, size = 21 }: { color: string; size?: number }) {
   return (
@@ -125,6 +164,14 @@ function CheckIcon({ color, size = 21 }: { color: string; size?: number }) {
   return (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path d="m5 12.5 4.2 4.2L19 7" stroke={color} strokeWidth={2.1} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+function SendIcon({ color = "#FFFFFF", size = 20 }: { color?: string; size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d="M12 19V5M6.5 10.5 12 5l5.5 5.5" stroke={color} strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round" />
     </Svg>
   );
 }
@@ -195,6 +242,8 @@ export default function ChatScreen() {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [voiceMode, setVoiceModeState] = useState<VoiceMode>("tap");
   const [voiceModeLoaded, setVoiceModeLoaded] = useState(false);
+  const [voiceAutoSend, setVoiceAutoSend] = useState(false);
+  const [voiceAutoSendLoaded, setVoiceAutoSendLoaded] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [transcribingVoice, setTranscribingVoice] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
@@ -215,11 +264,32 @@ export default function ChatScreen() {
       setVoiceModeState(mode);
       setVoiceModeLoaded(true);
     });
+    void AsyncStorage.getItem(VOICE_AUTO_SEND_KEY).then((value) => {
+      setVoiceAutoSend(value === "true");
+      setVoiceAutoSendLoaded(true);
+    }).catch(() => setVoiceAutoSendLoaded(true));
     return () => {
       voicePlayRequestRef.current += 1;
       voicePlayerSubRef.current?.remove();
-      voicePlayerRef.current?.remove();
+      try { voicePlayerRef.current?.pause(); } catch { /* already released */ }
+      try { voicePlayerRef.current?.remove(); } catch { /* already released */ }
     };
+  }, []);
+
+  const retireVoicePlayer = useCallback((invalidatePendingStart = true) => {
+    if (invalidatePendingStart) voicePlayRequestRef.current += 1;
+    const player = voicePlayerRef.current;
+    voicePlayerRef.current = null;
+    voicePlayerSubRef.current?.remove();
+    voicePlayerSubRef.current = null;
+    // Native audio can outlive JS object disposal briefly. Pause first, then
+    // remove, so dismiss/replacement is audible immediately and deterministic.
+    if (player) {
+      try { player.pause(); } catch { /* already released */ }
+      try { player.remove(); } catch { /* already released */ }
+    }
+    setVoicePlaying(false);
+    setVoiceProgress({ current: 0, duration: 0 });
   }, []);
 
   const cycleVoiceMode = useCallback(() => {
@@ -227,12 +297,18 @@ export default function ChatScreen() {
     setVoiceModeState(next);
     void persistVoiceMode(next);
     if (next === "off") {
-      voicePlayRequestRef.current += 1;
-      voicePlayerRef.current?.pause();
-      setVoicePlaying(false);
+      retireVoicePlayer();
+      setVoiceReply(null);
     }
     haptic.tap();
-  }, [voiceMode]);
+  }, [voiceMode, retireVoicePlayer]);
+
+  const toggleVoiceAutoSend = useCallback(() => {
+    const next = !voiceAutoSend;
+    setVoiceAutoSend(next);
+    void AsyncStorage.setItem(VOICE_AUTO_SEND_KEY, String(next));
+    haptic.tap();
+  }, [voiceAutoSend]);
 
   const startVoiceRecording = useCallback(async () => {
     if (!activeProfile || voiceRecording || transcribingVoice) return;
@@ -244,7 +320,7 @@ export default function ChatScreen() {
     }
     await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
     await recorder.prepareToRecordAsync();
-    recorder.record();
+    recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
     setVoiceRecording(true);
     haptic.tap();
   }, [activeProfile, voiceRecording, transcribingVoice, recorder]);
@@ -268,17 +344,35 @@ export default function ChatScreen() {
       setTranscribingVoice(true);
       const uri = recorder.uri;
       if (!uri) throw new Error("The recording could not be saved.");
-      const token = (await getSecret(activeProfile.id)) ?? "";
+      const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
       const text = await transcribeVoice(uri, token);
-      setDraft(text);
+      if (voiceAutoSend) {
+        const session = sessionRef.current;
+        if (!session) throw new Error("Milo's chat session is not ready yet.");
+        followLiveRef.current = true;
+        nearBottomRef.current = true;
+        setNearBottom(true);
+        await session.send(text);
+        requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: false }));
+      } else {
+        setDraft(text);
+      }
     } catch (error) {
       setVoiceError(error instanceof Error ? error.message : "Voice transcription failed.");
     } finally {
       setTranscribingVoice(false);
       await setAudioModeAsync({ allowsRecording: false });
     }
-  }, [activeProfile, recorder, recorderState.isRecording]);
+  }, [activeProfile, recorder, recorderState.isRecording, voiceAutoSend]);
+
+  // `forDuration` enforces the ten-minute ceiling in native audio code. Once
+  // that automatic stop is reflected back into recorder state, finalize it just
+  // like the user tapped the check button so the recording is not stranded.
+  useEffect(() => {
+    if (!voiceRecording || recorderState.isRecording || recorderState.durationMillis < (VOICE_RECORDING_LIMIT_SECONDS * 1000 - 1000)) return;
+    void finishVoiceRecording();
+  }, [voiceRecording, recorderState.isRecording, recorderState.durationMillis, finishVoiceRecording]);
 
   const playVoiceText = useCallback(async (text: string) => {
     if (!activeProfile || !text.trim()) return;
@@ -287,19 +381,22 @@ export default function ChatScreen() {
     // the current player immediately and invalidate any older start still in
     // flight so two clips can never survive that setup window together.
     const requestId = ++voicePlayRequestRef.current;
-    voicePlayerSubRef.current?.remove();
-    voicePlayerSubRef.current = null;
-    voicePlayerRef.current?.remove();
-    voicePlayerRef.current = null;
-    setVoicePlaying(false);
-    setVoiceProgress({ current: 0, duration: 0 });
+    const interruptedExistingClip = voicePlayerRef.current !== null;
+    retireVoicePlayer(false);
 
     try {
+      // A tiny gap makes an interruption perceptible instead of sounding like
+      // two clips were spliced together, while the request id keeps old async
+      // starts from surviving the pause.
+      if (interruptedExistingClip) {
+        await new Promise((resolve) => setTimeout(resolve, 90));
+        if (requestId !== voicePlayRequestRef.current) return;
+      }
       setVoiceError(null);
       // Playback should be reliable regardless of whether the microphone was
       // used first, and should remain audible with the iPhone silent switch on.
       await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
-      const token = (await getSecret(activeProfile.id)) ?? "";
+      const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (requestId !== voicePlayRequestRef.current) return;
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
       const player = createAudioPlayer(speechSource(text, token), { updateInterval: 150 });
@@ -322,7 +419,7 @@ export default function ChatScreen() {
       setVoicePlaying(false);
       setVoiceError(error instanceof Error ? error.message : "Voice playback failed.");
     }
-  }, [activeProfile]);
+  }, [activeProfile, retireVoicePlayer]);
 
   const toggleVoicePlayback = useCallback(() => {
     const player = voicePlayerRef.current;
@@ -381,27 +478,37 @@ export default function ChatScreen() {
   }, [voiceProgress.duration]);
 
   const dismissVoiceReply = useCallback(() => {
-    voicePlayRequestRef.current += 1;
-    voicePlayerSubRef.current?.remove();
-    voicePlayerSubRef.current = null;
-    voicePlayerRef.current?.remove();
-    voicePlayerRef.current = null;
-    setVoicePlaying(false);
-    setVoiceProgress({ current: 0, duration: 0 });
+    retireVoicePlayer();
     setVoiceReply(null);
-  }, []);
+  }, [retireVoicePlayer]);
   const attach = useCallback(async () => {
     haptic.tap();
     const picked = await pickImages();
     if (picked.length > 0) setAttachments((current) => [...current, ...picked].slice(0, 4));
   }, []);
   const nearBottomRef = useRef(true);
+  // Live-follow is explicit user intent, not inferred from layout-generated
+  // scroll events. Incoming tokens can move an inverted FlatList's offset even
+  // when the reader never touched it; treating those events as a manual scroll
+  // is what caused follow mode to switch itself off.
+  const followLiveRef = useRef(true);
+  const userScrollingRef = useRef(false);
+  // Ignore scroll events briefly after our own jump-to-latest calls. Without
+  // this, the browser/iOS can report an intermediate non-zero offset and make
+  // a programmatic pin look like reader intent.
+  const programmaticScrollUntilRef = useRef(0);
+  const scrollToLatest = useCallback((animated: boolean) => {
+    programmaticScrollUntilRef.current = Date.now() + 180;
+    listRef.current?.scrollToOffset({ offset: 0, animated });
+  }, []);
   // Inverted list: the newest content lives at offset 0.
   const pinToLatest = useCallback(() => {
+    userScrollingRef.current = false;
+    followLiveRef.current = true;
     nearBottomRef.current = true;
     setNearBottom(true);
-    listRef.current?.scrollToOffset({ offset: 0, animated: true });
-  }, []);
+    scrollToLatest(true);
+  }, [scrollToLatest]);
 
   // Dev-only: fire one real send after hydration, so live e2e flows can be
   // driven headlessly (deep link ?autosend=...). No-op in production builds.
@@ -432,14 +539,15 @@ export default function ChatScreen() {
     const sub = AppState.addEventListener("change", (state) => {
       if (state === "active") {
         const away = backgroundedAt.current ? Date.now() - backgroundedAt.current : 0;
-        const replaceTransport = wasBackgrounded.current;
+        const shouldResync = wasBackgrounded.current || away > 30_000;
         backgroundedAt.current = null;
         wasBackgrounded.current = false;
-        if (replaceTransport) {
-          void sessionRef.current?.reconnect({ forceNewTransport: true });
-        } else if (away > 30_000) {
-          void sessionRef.current?.reconnect();
-        }
+        // Ask the existing SDK session to prove it is healthy first. reconnect()
+        // replaces it only when the transport is already known dead or the
+        // resync fails. Forcing a fresh socket on every iOS foreground caused
+        // needless connection churn and duplicated the transport's own liveness
+        // detection without adding correctness.
+        if (shouldResync) void sessionRef.current?.reconnect();
         return;
       }
       backgroundedAt.current ??= Date.now();
@@ -503,15 +611,104 @@ export default function ChatScreen() {
   const queueSheetRef = useRef<BottomSheetModal>(null);
   const controlsSheetRef = useRef<BottomSheetModal>(null);
   const secretSheetRef = useRef<BottomSheetModal>(null);
+  const conversationStatusSheetRef = useRef<BottomSheetModal>(null);
+  const renameSheetRef = useRef<BottomSheetModal>(null);
+  const [conversationDiagnostics, setConversationDiagnostics] = useState<ConversationDiagnostics | null>(null);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [compactingConversation, setCompactingConversation] = useState(false);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renamingConversation, setRenamingConversation] = useState(false);
   const [secretNames, setSecretNames] = useState<string[]>([]);
   const [secretLoading, setSecretLoading] = useState(false);
   const [secretError, setSecretError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
+  // Prevent an async model refresh that started before a user selection from
+  // overwriting the newer choice when its stale response arrives later.
+  const modelSettingRevisionRef = useRef(0);
   const [modelSaving, setModelSaving] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
   const [approvalSubmitting, setApprovalSubmitting] = useState<"allow" | "deny" | undefined>();
+
+  const refreshConversationDiagnostics = useCallback(async () => {
+    if (!activeProfile || !params.conversationId) return;
+    setDiagnosticsLoading(true);
+    setDiagnosticsError(null);
+    try {
+      const session = sessionRef.current;
+      if (!session) throw new Error("Milo session is not ready yet.");
+      setConversationDiagnostics(await session.getConversationDiagnostics());
+    } catch (error) {
+      setDiagnosticsError(error instanceof Error ? error.message : "Couldn't load conversation status.");
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  }, [activeProfile, params.conversationId]);
+
+  const openConversationStatus = useCallback(() => {
+    dismissChatKeyboard();
+    conversationStatusSheetRef.current?.present();
+    void refreshConversationDiagnostics();
+  }, [refreshConversationDiagnostics]);
+
+  const openRenameConversation = useCallback(() => {
+    setRenameDraft(serverTitle ?? params.title ?? "");
+    conversationStatusSheetRef.current?.dismiss();
+    setTimeout(() => renameSheetRef.current?.present(), 180);
+  }, [serverTitle, params.title]);
+
+  const submitConversationRename = useCallback(async () => {
+    const nextTitle = renameDraft.trim();
+    if (!activeProfile || !params.conversationId || !nextTitle || renamingConversation) return;
+    setRenamingConversation(true);
+    try {
+      const secret = (await getSecret(activeProfile.id)) ?? "";
+      await renameConversation({ profile: activeProfile, secret }, params.conversationId, nextTitle);
+      setServerTitle(nextTitle);
+      renameSheetRef.current?.dismiss();
+    } catch (error) {
+      Alert.alert("Couldn't rename", error instanceof Error ? error.message : undefined);
+    } finally {
+      setRenamingConversation(false);
+    }
+  }, [activeProfile, params.conversationId, renameDraft, renamingConversation]);
+
+  const requestConversationCompaction = useCallback(() => {
+    if (!activeProfile || !params.conversationId || compactingConversation) return;
+    if (snapshot.run === "running" || snapshot.run === "awaiting_approval" || snapshot.run === "aborting") {
+      setDiagnosticsError("Finish the current Milo run before compacting this conversation.");
+      return;
+    }
+    Alert.alert(
+      "Compact conversation?",
+      "Milo will summarize the current in-context message history to free context-window space. The chat transcript remains available.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Compact",
+          onPress: () => {
+            void (async () => {
+              setCompactingConversation(true);
+              setDiagnosticsError(null);
+              try {
+                const session = sessionRef.current;
+                if (!session) throw new Error("Milo session is not ready yet.");
+                await session.compactConversation();
+                await session.reconnect();
+                await refreshConversationDiagnostics();
+              } catch (error) {
+                setDiagnosticsError(error instanceof Error ? error.message : "Couldn't compact the conversation.");
+              } finally {
+                setCompactingConversation(false);
+              }
+            })();
+          },
+        },
+      ],
+    );
+  }, [activeProfile, params.conversationId, compactingConversation, snapshot.run, refreshConversationDiagnostics]);
 
   // Tool detail sheet: track the id, not the item — the open sheet keeps
   // receiving live status/result updates from the snapshot.
@@ -524,7 +721,7 @@ export default function ChatScreen() {
   );
   const onToolPress = useCallback((id: string) => {
     setDetailToolId(id);
-    Keyboard.dismiss();
+    dismissChatKeyboard();
     toolSheetRef.current?.present();
   }, []);
 
@@ -547,20 +744,33 @@ export default function ChatScreen() {
     if (!activeProfile || !params.conversationId) return;
     let cancelled = false;
     let opened: ChatSession | null = null;
+    let unsubscribe: (() => void) | null = null;
     void (async () => {
       try {
-        const secret = (await getSecret(activeProfile.id)) ?? "";
-        const session = ChatSession.open({ profile: activeProfile, secret }, params.conversationId);
+        const [secretValue, savedPermission] = await Promise.all([
+          getSecret(activeProfile.id),
+          AsyncStorage.getItem(permissionStorageKey(activeProfile.id)),
+        ]);
+        const secret = secretValue ?? "";
+        const initialPermissionMode =
+          savedPermission && ["strict", "standard", "acceptEdits", "unrestricted"].includes(savedPermission)
+            ? (savedPermission as PermissionMode)
+            : undefined;
+        const session = ChatSession.open(
+          { profile: activeProfile, secret },
+          params.conversationId,
+          initialPermissionMode,
+        );
+        opened = session;
         if (cancelled) {
-          session.close();
+          session.releaseView();
           return;
         }
-        opened = session;
         sessionRef.current = session;
         // Scrolling belongs to the list's onContentSizeChange, not here: a
         // snapshot-time scroll races layout, since the hydration batch measures
         // after the scroll fires.
-        session.subscribe(setSnapshot);
+        unsubscribe = session.subscribe(setSnapshot);
       } catch (error) {
         if (!cancelled) {
           setSnapshot({
@@ -573,10 +783,15 @@ export default function ChatScreen() {
     })();
     return () => {
       cancelled = true;
-      opened?.close();
-      sessionRef.current = null;
+      unsubscribe?.();
+      opened?.releaseView();
+      if (sessionRef.current === opened) sessionRef.current = null;
     };
   }, [activeProfile, params.conversationId]);
+
+  // The saved permission mode is loaded before ChatSession.open(), so it is
+  // part of runtime_start and pending approval recovery on a cold open. Explicit
+  // user changes still flow through setPermissionMode() below.
 
   // Load the current conversation model once hydration settles — on remote,
   // concurrent control-channel connections collide (single-slot app-server).
@@ -586,6 +801,7 @@ export default function ChatScreen() {
     // accepts one control client); wait briefly for the session ref, which is
     // set by the sibling effect. Cloud reads are plain REST.
     const timer = setTimeout(async () => {
+      const readRevision = modelSettingRevisionRef.current;
       try {
         let current: { model: string | null; reasoningEffort: string | null; title: string | null };
         if (activeProfile.type === "remote") {
@@ -600,40 +816,88 @@ export default function ChatScreen() {
             params.conversationId,
           );
         }
+        if (readRevision !== modelSettingRevisionRef.current) return;
         setModel(current.model);
-        setEffort(current.reasoningEffort);
+        const serverEffort = savedReasoningEffort(current.reasoningEffort);
+        const persistedEffort = savedReasoningEffort(
+          await AsyncStorage.getItem(effortStorageKey(activeProfile.id, params.conversationId)),
+        );
+        // Server/conversation state is authoritative. Local storage is only a
+        // fallback for backends that genuinely do not report an effort tier.
+        const effectiveEffort = serverEffort ?? persistedEffort;
+        setEffort(effectiveEffort);
+        if (serverEffort) {
+          void AsyncStorage.setItem(
+            effortStorageKey(activeProfile.id, params.conversationId),
+            serverEffort,
+          );
+        }
         if (current.title) setServerTitle(current.title);
       } catch {
         // Chip falls back to "model" affordance; sheet still works.
       }
     }, 0);
     return () => clearTimeout(timer);
-  }, [activeProfile, params.conversationId, snapshot.hydrating]);
+  }, [activeProfile, params.conversationId, snapshot.hydrating, snapshot.connection]);
 
   const openModelSheet = useCallback(async () => {
-    if (!activeProfile) return;
+    if (!activeProfile || !params.conversationId) return;
     setModelError(null);
     modelSheetRef.current?.present();
-    if (models.length === 0) {
+    const readRevision = modelSettingRevisionRef.current;
+
+    try {
       const secret = (await getSecret(activeProfile.id)) ?? "";
-      try {
-        setModels(await listModels({ profile: activeProfile, secret }));
-      } catch {
-        setModelError("Couldn't load models.");
+      const [freshModels, current] = await Promise.all([
+        models.length === 0
+          ? listModels({ profile: activeProfile, secret })
+          : Promise.resolve(models),
+        activeProfile.type === "remote" && sessionRef.current
+          ? sessionRef.current.getModelInfo()
+          : getConversationModel(
+              { profile: activeProfile, secret },
+              params.conversationId,
+            ),
+      ]);
+
+      if (models.length === 0) setModels(freshModels);
+      if (readRevision !== modelSettingRevisionRef.current) return;
+      setModel(current.model);
+      const serverEffort = savedReasoningEffort(current.reasoningEffort);
+      const persistedEffort = savedReasoningEffort(
+        await AsyncStorage.getItem(effortStorageKey(activeProfile.id, params.conversationId)),
+      );
+      const effectiveEffort = serverEffort ?? persistedEffort;
+      setEffort(effectiveEffort);
+      if (serverEffort) {
+        void AsyncStorage.setItem(
+          effortStorageKey(activeProfile.id, params.conversationId),
+          serverEffort,
+        );
       }
+    } catch (error) {
+      setModelError(error instanceof Error ? error.message : "Couldn't refresh model settings.");
     }
-  }, [activeProfile, models.length]);
+  }, [activeProfile, params.conversationId, models]);
 
   const selectModel = useCallback(
     async (handle: string, nextEffort?: ReasoningEffort) => {
       if (!activeProfile || !params.conversationId) return;
+      modelSettingRevisionRef.current += 1;
       modelSheetRef.current?.dismiss();
       const previous = { model, effort };
       setModel(handle);
-      if (nextEffort) setEffort(nextEffort);
+      if (nextEffort) {
+        setEffort(nextEffort);
+        void AsyncStorage.setItem(effortStorageKey(activeProfile.id, params.conversationId), nextEffort);
+      }
       setModelSaving(true);
       try {
-        if (activeProfile.type === "remote" && sessionRef.current) {
+        if (activeProfile.type === "remote") {
+          for (let attempt = 0; !sessionRef.current && attempt < 20; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          if (!sessionRef.current) throw new Error("Milo's model session is still reconnecting.");
           await sessionRef.current.setModel(handle, nextEffort);
         } else {
           const secret = (await getSecret(activeProfile.id)) ?? "";
@@ -654,8 +918,87 @@ export default function ChatScreen() {
     [activeProfile, params.conversationId, model, effort],
   );
 
+  const selectEffort = useCallback(
+    async (nextEffort: ReasoningEffort) => {
+      if (!activeProfile || !params.conversationId) return;
+      modelSettingRevisionRef.current += 1;
+      const previous = effort;
+      setEffort(nextEffort);
+      // Persist the user's choice even if model metadata is still loading. The
+      // old handler returned early when `model` was null, so the sheet painted a
+      // local selection that vanished the next time it opened.
+      await AsyncStorage.setItem(effortStorageKey(activeProfile.id, params.conversationId), nextEffort);
+      setModelSaving(true);
+      setModelError(null);
+      try {
+        let targetModel = model;
+        if (!targetModel) {
+          const secret = (await getSecret(activeProfile.id)) ?? "";
+          const current =
+            activeProfile.type === "remote" && sessionRef.current
+              ? await sessionRef.current.getModelInfo()
+              : await getConversationModel(
+                  { profile: activeProfile, secret },
+                  params.conversationId,
+                );
+          targetModel = current.model;
+          if (targetModel) setModel(targetModel);
+        }
+        if (!targetModel) throw new Error("The current model is still unavailable.");
+
+        if (activeProfile.type === "remote") {
+          // Local/App-Server models can have provider mods (for Milo, `vllm`)
+          // whose reasoning settings cannot be safely synthesized by the generic
+          // REST updater. Wait for the real session and let the App Server apply
+          // the catalog-backed reasoning tier.
+          for (let attempt = 0; !sessionRef.current && attempt < 20; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          if (!sessionRef.current) throw new Error("Milo's model session is still reconnecting.");
+          await sessionRef.current.setModel(targetModel, nextEffort);
+        } else {
+          const secret = (await getSecret(activeProfile.id)) ?? "";
+          await updateConversationModel({ profile: activeProfile, secret }, params.conversationId, {
+            model: targetModel,
+            reasoningEffort: nextEffort,
+          });
+        }
+      } catch (e) {
+        setEffort(previous);
+        setModelError(e instanceof Error ? e.message : "Couldn't change reasoning effort.");
+      } finally {
+        setModelSaving(false);
+      }
+    },
+    [activeProfile, params.conversationId, model, effort],
+  );
+
   const running = snapshot.run === "running" || snapshot.run === "awaiting_approval";
   const aborting = snapshot.run === "aborting";
+  useEffect(() => {
+    if (!(running || aborting || voiceRecording || transcribingVoice)) return;
+
+    const tag = "local-milo-active-run";
+    let disposed = false;
+    let activated = false;
+
+    // Expo rejects deactivation for a tag that never successfully activated.
+    // Keep activation ownership inside this effect instance so a fast state
+    // transition cannot race activateKeepAwakeAsync() and produce an unhandled
+    // wake-lock error during chat startup/recovery.
+    void activateKeepAwakeAsync(tag)
+      .then(() => {
+        activated = true;
+        if (disposed) void deactivateKeepAwake(tag).catch(() => {});
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (activated) void deactivateKeepAwake(tag).catch(() => {});
+    };
+  }, [running, aborting, voiceRecording, transcribingVoice]);
+
   const previousRunRef = useRef(snapshot.run);
   const voiceRunPendingRef = useRef(false);
   const voiceBaselineAssistantIdRef = useRef<string | null>(null);
@@ -699,19 +1042,20 @@ export default function ChatScreen() {
     // Clear the pending flag only after the new row actually arrives so a small
     // protocol/transcript timing skew cannot make auto voice silently miss it.
     voiceRunPendingRef.current = false;
-    setVoiceReply({ id: latestCompletedAssistant.id, text: latestCompletedAssistant.text });
-    setVoiceProgress({ current: 0, duration: 0 });
-    voicePlayerSubRef.current?.remove();
-    voicePlayerRef.current?.remove();
-    voicePlayerRef.current = null;
-    setVoicePlaying(false);
+    const speakableText = prepareSpeechText(latestCompletedAssistant.text);
+    retireVoicePlayer();
+    if (!speakableText) {
+      setVoiceReply(null);
+      return;
+    }
+    setVoiceReply({ id: latestCompletedAssistant.id, text: speakableText });
     if (voiceMode === "auto" && !autoPlayedVoiceIdsRef.current.has(latestCompletedAssistant.id)) {
       // The run/transcript protocol can briefly revisit the same completed row.
       // Auto voice is a side effect, so make it idempotent by the row's stable ID.
       autoPlayedVoiceIdsRef.current.add(latestCompletedAssistant.id);
-      void playVoiceText(latestCompletedAssistant.text);
+      void playVoiceText(speakableText);
     }
-  }, [snapshot.run, snapshot.transcript, voiceMode, voiceModeLoaded, playVoiceText]);
+  }, [snapshot.run, snapshot.transcript, voiceMode, voiceModeLoaded, playVoiceText, retireVoicePlayer]);
 
   const refreshAgentSecrets = useCallback(async () => {
     const session = sessionRef.current;
@@ -757,15 +1101,6 @@ export default function ChatScreen() {
     [clearDraft, openSecretManager],
   );
 
-  // Send ↔ stop morph.
-  const morph = useSharedValue(0);
-  useEffect(() => {
-    morph.set(withSpring(running || aborting ? 1 : 0, motion.move));
-  }, [running, aborting, morph]);
-  const morphStyle = useAnimatedStyle(() => ({
-    borderRadius: 22 - morph.get() * 14,
-  }));
-
   const onPrimaryAction = useCallback(async () => {
     const session = sessionRef.current;
     if (!session) return;
@@ -777,7 +1112,7 @@ export default function ChatScreen() {
     const text = draft.trim();
     if (!text && attachments.length === 0) return;
     if (text && interceptSecretCommand(text)) return;
-    Keyboard.dismiss();
+    dismissChatKeyboard();
     haptic.send();
     const images = attachments;
     setAttachments([]);
@@ -792,7 +1127,7 @@ export default function ChatScreen() {
     const text = draft.trim();
     if (!session || (!text && attachments.length === 0)) return;
     if (text && interceptSecretCommand(text)) return;
-    Keyboard.dismiss();
+    dismissChatKeyboard();
     haptic.queue();
     const images = attachments;
     setAttachments([]);
@@ -802,16 +1137,50 @@ export default function ChatScreen() {
   }, [draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const canSend = draft.trim().length > 0 || attachments.length > 0;
+  const onComposerKeyPress = useCallback((event: any) => {
+    if (Platform.OS !== "web" || event?.nativeEvent?.key !== "Enter") return;
+    const native = event.nativeEvent ?? {};
+    const shift = Boolean(native.shiftKey ?? event.shiftKey);
+    const composing = Boolean(native.isComposing ?? event.isComposing);
+    if (shift || composing) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    if (!canSend || snapshot.hydrating || aborting) return;
+    if (running) {
+      void sendWhileRunning();
+    } else {
+      void onPrimaryAction();
+    }
+  }, [canSend, snapshot.hydrating, aborting, running, sendWhileRunning, onPrimaryAction]);
   const agentName = params.agentName ?? "Agent";
   const title = serverTitle ?? params.title ?? "Conversation";
 
   // Inverted-list data (references do chat this way — e.g. paseo's native
   // strategy): the visual bottom is offset 0, so new content pins natively
   // and keyboard/layout changes can't break "near bottom" tracking.
-  const listData = useMemo(
-    () => groupToolRuns(snapshot.transcript, expandedGroups).reverse(),
-    [snapshot.transcript, expandedGroups],
-  );
+  const listData = useMemo(() => {
+    // Keep the active turn structurally stable while it streams. Collapsing a
+    // growing run of settled tool cards into a ToolGroup changes several row
+    // keys/heights at once and can move a reader who is inspecting older text.
+    // Historical turns remain grouped; only the latest in-progress turn stays
+    // expanded until it settles.
+    if (running) {
+      let latestUser = -1;
+      for (let i = snapshot.transcript.length - 1; i >= 0; i--) {
+        if (snapshot.transcript[i]?.kind === "user") {
+          latestUser = i;
+          break;
+        }
+      }
+      if (latestUser >= 0) {
+        return [
+          ...groupToolRuns(snapshot.transcript.slice(0, latestUser), expandedGroups),
+          ...snapshot.transcript.slice(latestUser),
+        ].reverse();
+      }
+    }
+    return groupToolRuns(snapshot.transcript, expandedGroups).reverse();
+  }, [snapshot.transcript, expandedGroups, running]);
   const onToggleGroup = useCallback((id: string) => {
     haptic.tap();
     setExpandedGroups((open) => {
@@ -872,6 +1241,8 @@ export default function ChatScreen() {
             <StatusDot tone={status.tone} />
           </View>
         }
+        onTitlePress={openConversationStatus}
+        titleAccessibilityLabel="Conversation status and context usage"
         trailing={
           <Touchable
             accessibilityRole="button"
@@ -915,13 +1286,20 @@ export default function ChatScreen() {
             // (maintainVisibleContentPosition); Android ignores it under the
             // inversion transform, so iOS-only — same trade the references make.
             maintainVisibleContentPosition={
-              Platform.OS === "ios" ? { minIndexForVisible: 0, autoscrollToTopThreshold: 40 } : undefined
+              // Keep this configuration stable. Toggling the prop itself while
+              // rows are measuring can cause an inverted FlatList to jump.
+              // While following live, onContentSizeChange explicitly pins offset 0.
+              Platform.OS === "ios" ? { minIndexForVisible: 0 } : undefined
             }
             // maintainVisibleContentPosition keeps a scrolled-up reader in place
             // but does not guarantee the live edge stays pinned once a hydration
             // batch measures, so re-pin explicitly for a reader who is following.
             onContentSizeChange={() => {
-              if (nearBottomRef.current) listRef.current?.scrollToOffset({ offset: 0, animated: false });
+              if (!userScrollingRef.current && followLiveRef.current) {
+                // While following, growth belongs below the reader. Keep the
+                // visual live edge pinned instead of preserving the old cell.
+                scrollToLatest(false);
+              }
             }}
             // Visual bottom, above the composer — shows while the model has
             // accepted the send but nothing has streamed back yet.
@@ -945,13 +1323,62 @@ export default function ChatScreen() {
             // Dragging the transcript pulls the keyboard down with the gesture.
             keyboardDismissMode="interactive"
             keyboardShouldPersistTaps="handled"
-            onScrollBeginDrag={() => Keyboard.dismiss()}
-            onScroll={(e) => {
-              const offset = e.nativeEvent.contentOffset.y;
-              nearBottomRef.current = offset < 80;
-              setNearBottom(offset < 80);
+            onScrollBeginDrag={() => {
+              // Manual interaction freezes live-follow immediately. Layout and
+              // programmatic scroll events never enter this path.
+              userScrollingRef.current = true;
+              followLiveRef.current = false;
+              dismissChatKeyboard();
             }}
-              scrollEventThrottle={16}
+            onMomentumScrollBegin={() => {
+              userScrollingRef.current = true;
+            }}
+            onScrollEndDrag={(e) => {
+              const offset = Math.max(0, e.nativeEvent.contentOffset.y);
+              const nearBottom = offset < 80;
+              const atLiveEdge = offset <= 2;
+              nearBottomRef.current = nearBottom;
+              setNearBottom(nearBottom);
+              // A manual drag disables follow immediately. Do not silently turn
+              // it back on merely because the reader stopped *near* the bottom;
+              // only returning to the actual live edge opts back into follow.
+              followLiveRef.current = atLiveEdge;
+              userScrollingRef.current = false;
+            }}
+            onMomentumScrollEnd={(e) => {
+              const offset = Math.max(0, e.nativeEvent.contentOffset.y);
+              const nearBottom = offset < 80;
+              const atLiveEdge = offset <= 2;
+              nearBottomRef.current = nearBottom;
+              setNearBottom(nearBottom);
+              followLiveRef.current = atLiveEdge;
+              userScrollingRef.current = false;
+              if (atLiveEdge) scrollToLatest(false);
+            }}
+            onScroll={(e) => {
+              const offset = Math.max(0, e.nativeEvent.contentOffset.y);
+              const nearBottom = offset < 80;
+              nearBottomRef.current = nearBottom;
+              setNearBottom(nearBottom);
+
+              // Browser wheel/trackpad scrolling does not reliably fire
+              // onScrollBeginDrag, and iOS can finish the drag callback before
+              // all movement settles. Treat moving materially away from offset 0
+              // as reader intent unless it immediately follows one of our own
+              // programmatic pins. This makes manual scroll position authoritative
+              // while content continues streaming.
+              if (Date.now() < programmaticScrollUntilRef.current) return;
+              if (offset > 6) {
+                followLiveRef.current = false;
+                return;
+              }
+              // Only an active reader gesture can opt back into live-follow;
+              // layout/content changes reaching zero must not silently do it.
+              if (userScrollingRef.current && offset <= 2) {
+                followLiveRef.current = true;
+              }
+            }}
+            scrollEventThrottle={16}
             />
           )}
           {/* Anchored to the list's own bottom edge, so it clears the composer
@@ -994,7 +1421,7 @@ export default function ChatScreen() {
           <QueueCapsule
             queue={snapshot.queue}
             onPress={() => {
-              Keyboard.dismiss();
+              dismissChatKeyboard();
               queueSheetRef.current?.present();
             }}
           />
@@ -1037,6 +1464,23 @@ export default function ChatScreen() {
             <View style={[styles.voiceRecorderPanel, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}>
               <Text role="bodyEm" tone="accent">{transcribingVoice ? "Transcribing…" : "Listening…"}</Text>
               <Text role="title">{Math.floor(recorderState.durationMillis / 60000).toString().padStart(2, "0")}:{Math.floor((recorderState.durationMillis % 60000) / 1000).toString().padStart(2, "0")}</Text>
+              <Touchable
+                accessibilityRole="button"
+                accessibilityLabel={`Auto-send voice transcription ${voiceAutoSend ? "on" : "off"}`}
+                onPress={toggleVoiceAutoSend}
+                disabled={!voiceAutoSendLoaded || transcribingVoice}
+                style={[
+                  styles.voiceAutoSendPill,
+                  {
+                    backgroundColor: voiceAutoSend ? colors.bubble : colors.surface,
+                    borderColor: voiceAutoSend ? colors.accent : colors.surfaceEdge,
+                    opacity: voiceAutoSendLoaded ? 1 : 0.5,
+                  },
+                ]}
+              >
+                <StatusDot tone={voiceAutoSend ? "run" : "idle"} />
+                <Text role="sub" tone={voiceAutoSend ? "accent" : undefined}>Auto-send</Text>
+              </Touchable>
               <View style={styles.waveform}>
                 {Array.from({ length: 24 }, (_, index) => {
                   const level = Math.max(0.15, Math.min(1, ((recorderState.metering ?? -52) + 60) / 42));
@@ -1161,6 +1605,7 @@ export default function ChatScreen() {
               multiline
               scrollEnabled
               editable={!snapshot.hydrating}
+              onKeyPress={onComposerKeyPress}
             />
             <Touchable
               accessibilityRole="button"
@@ -1181,14 +1626,13 @@ export default function ChatScreen() {
               <Animated.View
                 style={[
                   styles.send,
-                  morphStyle,
                   { backgroundColor: running || aborting ? colors.danger : colors.accent, opacity: !running && !canSend ? 0.4 : 1 },
                 ]}
               >
                 {running || aborting ? (
                   <View style={styles.stopGlyph} />
                 ) : (
-                  <Text role="bodyEm" style={styles.sendGlyph}>↑</Text>
+                  <SendIcon />
                 )}
               </Animated.View>
             </Touchable>
@@ -1210,7 +1654,7 @@ export default function ChatScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={`Permission mode: ${snapshot.device.permissionMode}. Change controls`}
                 onPress={() => {
-                  Keyboard.dismiss();
+                  dismissChatKeyboard();
                   controlsSheetRef.current?.present();
                 }}
                 style={styles.modelChip}
@@ -1262,6 +1706,7 @@ export default function ChatScreen() {
               accessibilityRole="button"
               accessibilityLabel={`${label}. ${detail}${selected ? ". Selected" : ""}`}
               onPress={() => {
+                if (activeProfile) void AsyncStorage.setItem(permissionStorageKey(activeProfile.id), mode);
                 void sessionRef.current?.setPermissionMode(mode);
                 controlsSheetRef.current?.dismiss();
               }}
@@ -1296,6 +1741,171 @@ export default function ChatScreen() {
           </Text>
         ) : null}
       </Sheet>
+      <Sheet ref={conversationStatusSheetRef} title="Conversation status" scroll>
+        <Touchable
+          accessibilityRole="button"
+          accessibilityLabel="Rename conversation"
+          onPress={openRenameConversation}
+          style={[styles.diagnosticsRename, { borderColor: colors.surfaceEdge }]}
+        >
+          <Text role="bodyEm">Rename conversation</Text>
+        </Touchable>
+        {diagnosticsLoading && !conversationDiagnostics ? (
+          <View style={styles.diagnosticsLoading}>
+            <ActivityIndicator size="small" color={colors.ink3} />
+            <Text role="sub" ink={3}>Reading Milo's current context…</Text>
+          </View>
+        ) : null}
+        {conversationDiagnostics ? (() => {
+          const used = conversationDiagnostics.contextTokens;
+          const limit = conversationDiagnostics.contextWindow;
+          const ratio = used != null && limit != null && limit > 0 ? Math.min(1, used / limit) : null;
+          const pct = ratio == null ? null : Math.round(ratio * 100);
+          const lastCompact = conversationDiagnostics.lastCompaction;
+          return (
+            <>
+              <View style={styles.diagnosticsHero}>
+                <View style={styles.diagnosticsHeroTop}>
+                  <Text role="bodyEm">Context window</Text>
+                  <Text role="bodyEm" mono>{pct == null ? "—" : `${pct}%`}</Text>
+                </View>
+                <Text role="sub" ink={2} mono>
+                  {formatTokens(used)} / {formatTokens(limit)} tokens
+                </Text>
+                <View style={[styles.contextTrack, { backgroundColor: colors.surfaceEdge }]}>
+                  <View
+                    style={[
+                      styles.contextFill,
+                      { backgroundColor: colors.accent, width: ratio == null ? "0%" : `${Math.max(2, ratio * 100)}%` },
+                    ]}
+                  />
+                </View>
+                <Text role="sub" ink={3}>
+                  {conversationDiagnostics.pendingCompaction ? "Compaction pending" : "Latest completed model step"}
+                </Text>
+              </View>
+
+              <View style={styles.diagnosticsGrid}>
+                <View style={styles.diagnosticCell}>
+                  <Text role="sub" ink={3}>Model</Text>
+                  <Text role="bodyEm" numberOfLines={2}>{conversationDiagnostics.model?.split("/").pop() ?? "—"}</Text>
+                </View>
+                <View style={styles.diagnosticCell}>
+                  <Text role="sub" ink={3}>Context change</Text>
+                  <Text role="bodyEm" mono>
+                    {conversationDiagnostics.contextHistory.length >= 2
+                      ? (() => {
+                          const history = conversationDiagnostics.contextHistory;
+                          const delta = history[history.length - 1]!.tokens - history[history.length - 2]!.tokens;
+                          return `${delta >= 0 ? "+" : ""}${formatTokens(delta)} tokens`;
+                        })()
+                      : "—"}
+                  </Text>
+                </View>
+                <View style={styles.diagnosticCell}>
+                  <Text role="sub" ink={3}>Core memory share</Text>
+                  <Text role="bodyEm" mono>
+                    {conversationDiagnostics.contextWindow && conversationDiagnostics.contextWindow > 0
+                      ? `≈ ${Math.round((conversationDiagnostics.coreMemoryEstimatedTokens / conversationDiagnostics.contextWindow) * 100)}%`
+                      : "—"}
+                  </Text>
+                </View>
+                <View style={styles.diagnosticCell}>
+                  <Text role="sub" ink={3}>Recent samples</Text>
+                  <Text role="bodyEm" mono>{conversationDiagnostics.contextHistory.length}</Text>
+                </View>
+              </View>
+
+              <View style={[styles.diagnosticsSection, { borderColor: colors.surfaceEdge }]}>
+                <Text role="bodyEm">Core memory</Text>
+                <Text role="sub" ink={2}>
+                  ≈ {formatTokens(conversationDiagnostics.coreMemoryEstimatedTokens)} tokens across {conversationDiagnostics.coreMemoryBlocks} visible blocks
+                </Text>
+                <Text role="sub" ink={3}>
+                  Estimated from {formatTokens(conversationDiagnostics.coreMemoryCharacters)} characters; exact tokenizer cost varies by model.
+                </Text>
+              </View>
+
+              <View style={[styles.diagnosticsSection, { borderColor: colors.surfaceEdge }]}>
+                <Text role="bodyEm">Last compaction</Text>
+                {lastCompact ? (
+                  <>
+                    <Text role="sub" ink={2} mono>
+                      {formatTokens(lastCompact.contextTokensBefore)} → {formatTokens(lastCompact.contextTokensAfter)} tokens
+                    </Text>
+                    <Text role="sub" ink={3}>
+                      {lastCompact.messagesBefore != null && lastCompact.messagesAfter != null
+                        ? `${lastCompact.messagesBefore} → ${lastCompact.messagesAfter} in-context messages`
+                        : "Compaction recorded"}
+                      {lastCompact.trigger ? ` · ${lastCompact.trigger.replaceAll("_", " ")}` : ""}
+                    </Text>
+                  </>
+                ) : (
+                  <Text role="sub" ink={3}>No compaction statistics reported in recent history.</Text>
+                )}
+              </View>
+            </>
+          );
+        })() : null}
+
+        {diagnosticsError ? <Text role="sub" tone="danger">{diagnosticsError}</Text> : null}
+        <View style={styles.diagnosticsActions}>
+          <Touchable
+            accessibilityRole="button"
+            accessibilityLabel="Refresh conversation status"
+            onPress={() => void refreshConversationDiagnostics()}
+            style={[styles.diagnosticsSecondary, { borderColor: colors.surfaceEdge }]}
+          >
+            <Text role="bodyEm">Refresh</Text>
+          </Touchable>
+          <Touchable
+            accessibilityRole="button"
+            accessibilityLabel="Compact conversation"
+            disabled={compactingConversation || snapshot.run === "running" || snapshot.run === "awaiting_approval" || snapshot.run === "aborting"}
+            onPress={requestConversationCompaction}
+            style={[
+              styles.diagnosticsPrimary,
+              { backgroundColor: colors.accent, opacity: compactingConversation || snapshot.run === "running" || snapshot.run === "awaiting_approval" || snapshot.run === "aborting" ? 0.45 : 1 },
+            ]}
+          >
+            {compactingConversation ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text role="bodyEm" style={styles.diagnosticsPrimaryText}>Compact</Text>}
+          </Touchable>
+        </View>
+        {snapshot.run === "running" || snapshot.run === "awaiting_approval" || snapshot.run === "aborting" ? (
+          <Text role="sub" ink={3}>Compaction is available when the current run finishes.</Text>
+        ) : null}
+      </Sheet>
+      <Sheet ref={renameSheetRef} title="Rename conversation">
+        <SheetTextInput
+          value={renameDraft}
+          onChangeText={setRenameDraft}
+          placeholder="Conversation title"
+          placeholderTextColor={colors.ink3}
+          autoFocus
+          returnKeyType="done"
+          onSubmitEditing={() => void submitConversationRename()}
+          style={[styles.renameInput, { borderColor: colors.surfaceEdge, color: colors.ink }]}
+        />
+        <Touchable
+          accessibilityRole="button"
+          accessibilityLabel="Save conversation title"
+          onPress={() => void submitConversationRename()}
+          disabled={renameDraft.trim().length === 0 || renamingConversation}
+          style={[
+            styles.renameSave,
+            {
+              backgroundColor: colors.accent,
+              opacity: renameDraft.trim().length === 0 || renamingConversation ? 0.45 : 1,
+            },
+          ]}
+        >
+          {renamingConversation ? (
+            <ActivityIndicator size="small" color="#FFFFFF" />
+          ) : (
+            <Text role="bodyEm" style={styles.diagnosticsPrimaryText}>Save</Text>
+          )}
+        </Touchable>
+      </Sheet>
       <SecretSheet
         ref={secretSheetRef}
         names={secretNames}
@@ -1311,6 +1921,7 @@ export default function ChatScreen() {
         currentModel={model}
         currentEffort={effort}
         onSelect={(handle, nextEffort) => void selectModel(handle, nextEffort)}
+        onSelectEffort={(nextEffort) => void selectEffort(nextEffort)}
         error={modelError}
       />
     </Screen>
@@ -1374,6 +1985,7 @@ const styles = StyleSheet.create({
   waveBar: { width: 3, borderRadius: 2 },
   voiceRecorderActions: { flexDirection: "row", gap: space.md, justifyContent: "center", paddingTop: 2 },
   voiceActionIcon: { width: 44, height: 44, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center" },
+  voiceAutoSendPill: { alignSelf: "center", minHeight: 32, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.chip, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: space.md },
   voiceActionPrimary: { color: "#FFFFFF" },
   voiceReplyCard: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, padding: space.md, gap: space.sm },
   voiceReplyTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
@@ -1388,6 +2000,21 @@ const styles = StyleSheet.create({
   spacer: { flex: 1 },
   queueSend: { paddingHorizontal: space.sm },
   modelChip: { maxWidth: 220, paddingVertical: 4 },
+  diagnosticsLoading: { minHeight: 90, alignItems: "center", justifyContent: "center", gap: space.sm },
+  diagnosticsHero: { gap: space.sm },
+  diagnosticsHeroTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  contextTrack: { height: 7, borderRadius: 4, overflow: "hidden" },
+  contextFill: { height: 7, borderRadius: 4 },
+  diagnosticsGrid: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
+  diagnosticCell: { width: "47%", minWidth: 120, gap: 2, paddingVertical: space.xs },
+  diagnosticsSection: { borderTopWidth: StyleSheet.hairlineWidth, paddingTop: space.md, gap: 4 },
+  diagnosticsRename: { minHeight: 44, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, alignItems: "center", justifyContent: "center", paddingHorizontal: space.md, marginTop: space.xs },
+  diagnosticsActions: { flexDirection: "row", gap: space.sm, paddingTop: space.xs },
+  diagnosticsSecondary: { flex: 1, minHeight: 44, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, alignItems: "center", justifyContent: "center", paddingHorizontal: space.md },
+  diagnosticsPrimary: { flex: 1, minHeight: 44, borderRadius: radius.row, alignItems: "center", justifyContent: "center", paddingHorizontal: space.md },
+  diagnosticsPrimaryText: { color: "#FFFFFF" },
+  renameInput: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, paddingHorizontal: space.md, paddingVertical: 11, fontSize: 16 },
+  renameSave: { minHeight: 46, borderRadius: radius.row, alignItems: "center", justifyContent: "center" },
   permissionRow: { minHeight: 52 },
   permissionRowInner: { flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: 6 },
   permissionText: { flex: 1, gap: 1 },

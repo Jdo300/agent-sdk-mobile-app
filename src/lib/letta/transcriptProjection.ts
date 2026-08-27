@@ -22,6 +22,8 @@ export interface ProjectionState {
   thinkStartedAt: ReadonlyMap<string, number>;
   thinkSeconds: ReadonlyMap<string, number>;
   toolDurationMs: ReadonlyMap<string, number>;
+  rowOccurredAt: ReadonlyMap<string, number>;
+  toolCompletedAt: ReadonlyMap<string, number>;
 }
 
 export function projectRow(row: TranscriptRow, state: ProjectionState): TranscriptItem {
@@ -43,6 +45,8 @@ export function projectRow(row: TranscriptRow, state: ProjectionState): Transcri
       status: override ?? (settled ? (row.result?.isError ? "error" : "success") : "running"),
       ...(row.result ? { result: row.result.content } : {}),
       ...(duration !== undefined ? { durationMs: duration } : {}),
+      ...(state.rowOccurredAt.has(row.key) ? { occurredAt: state.rowOccurredAt.get(row.key)! } : {}),
+      ...(state.toolCompletedAt.has(row.toolCallId) ? { completedAt: state.toolCompletedAt.get(row.toolCallId)! } : {}),
     };
   }
 
@@ -55,6 +59,7 @@ export function projectRow(row: TranscriptRow, state: ProjectionState): Transcri
       seconds: state.thinkSeconds.get(row.key) ?? 0,
       ...(startedAt !== undefined ? { startedAt } : {}),
       ...(live ? { streaming: true } : {}),
+      ...(state.rowOccurredAt.has(row.key) ? { occurredAt: state.rowOccurredAt.get(row.key)! } : {}),
     };
   }
 
@@ -65,12 +70,18 @@ export function projectRow(row: TranscriptRow, state: ProjectionState): Transcri
       text: row.text,
       ...(live ? { streaming: true } : {}),
       ...(state.interruptedKey === row.key ? { interrupted: true } : {}),
+      ...(state.rowOccurredAt.has(row.key) ? { occurredAt: state.rowOccurredAt.get(row.key)! } : {}),
     };
   }
 
   // User rows arrive from history and from the stream's own echo; strip the
   // system-reminder wrappers the wire carries either way.
-  return { kind: "user", id: row.key, text: cleanUserText(row.text) };
+  return {
+    kind: "user",
+    id: row.key,
+    text: cleanUserText(row.text),
+    ...(state.rowOccurredAt.has(row.key) ? { occurredAt: state.rowOccurredAt.get(row.key)! } : {}),
+  };
 }
 
 export function projectRows(
@@ -81,6 +92,16 @@ export function projectRows(
 }
 
 /** Newest text row — the one an abrupt end leaves unfinished. */
+/** OTIDs that belong to actual user rows, not other rows in the same turn. */
+export function userRowOtids(rows: readonly TranscriptRow[]): Set<string> {
+  return new Set(
+    rows
+      .filter((row) => row.kind === "user")
+      .map((row) => row.otid)
+      .filter(Boolean) as string[],
+  );
+}
+
 export function newestTextKey(rows: readonly TranscriptRow[]): string | null {
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i]!;

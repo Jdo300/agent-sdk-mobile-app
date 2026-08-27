@@ -9,6 +9,7 @@
  * see letta-cloud#13382).
  */
 import { LettaAgentClient, createReactNativeWebSocketConstructor } from "@letta-ai/letta-agent-sdk/client";
+import { createAppServerClient } from "@letta-ai/letta-code/app-server-client";
 import type {
   UpdateConversationOptions,
   LettaAgent,
@@ -79,34 +80,53 @@ export function isAuthError(e: unknown): boolean {
   return /\b401\b|\b403\b|unauthori[sz]ed|forbidden|invalid (api key|token|credential)|invalid_grant|credentials/i.test(message);
 }
 
-/** The portable SDK client for the active connection. Used for createAgent and sessions. */
+/**
+ * One portable SDK client per profile/credential.
+ *
+ * Remote management transports keep a lazy pooled WebSocket inside the client.
+ * Constructing a fresh LettaAgentClient for every read (model, title, history,
+ * rename, etc.) strands that pooled socket until the App Server heartbeat kills
+ * it. Apart from wasting connections, those zombie clients make reconnects race
+ * a flock of old sockets. Reuse the owner instead; sessions created from it still
+ * own/close their independent runtime sockets normally.
+ */
+const sdkClients = new Map<string, { signature: string; client: LettaAgentClient }>();
+
 export function sdkClient(conn: Connection): LettaAgentClient {
-  if (conn.profile.type === "cloud") {
-    return new LettaAgentClient({
-      backend: "cloud",
-      apiKey: conn.secret,
-      apiBaseUrl: CLOUD_DEFAULT_URL,
-      // Browser/RN WebSockets can't set upgrade headers.
-      webSocketAuth: "query",
-    });
-  }
-  return new LettaAgentClient({
-    backend: "remote",
-    url: conn.profile.url,
-    // Tokenless is only for non-RN loopback dev; the SDK rejects an empty
-    // string, and RN clients REQUIRE a token (see WebSocket note below).
-    ...(conn.secret ? { authToken: conn.secret } : {}),
-    // React Native's WebSocket sends an Origin header, which app-servers
-    // only accept on token-authenticated upgrades (letta-code#3511, 0.29.4+),
-    // and it takes request headers via a third constructor argument — the
-    // SDK's adapter bridges that. Run your server with
-    // `--ws-auth capability-token` for simulator/device connections.
-    ...(isReactNative()
-      ? { WebSocket: createReactNativeWebSocketConstructor(globalThis.WebSocket as never) }
-      : isBrowserRuntime()
-        ? { WebSocket: createBrowserBridgeWebSocketConstructor(globalThis.WebSocket) as never }
-        : {}),
-  });
+  // The signature intentionally stays in-memory only. Including the credential
+  // means a token/API-key rotation cannot accidentally keep using a stale client.
+  const signature = `${conn.profile.type}\0${conn.profile.url}\0${conn.secret}`;
+  const cached = sdkClients.get(conn.profile.id);
+  if (cached?.signature === signature) return cached.client;
+
+  const client = conn.profile.type === "cloud"
+    ? new LettaAgentClient({
+        backend: "cloud",
+        apiKey: conn.secret,
+        apiBaseUrl: CLOUD_DEFAULT_URL,
+        // Browser/RN WebSockets can't set upgrade headers.
+        webSocketAuth: "query",
+      })
+    : new LettaAgentClient({
+        backend: "remote",
+        url: conn.profile.url,
+        // Tokenless is only for non-RN loopback dev; the SDK rejects an empty
+        // string, and RN clients REQUIRE a token (see WebSocket note below).
+        ...(conn.secret ? { authToken: conn.secret } : {}),
+        // React Native's WebSocket sends an Origin header, which app-servers
+        // only accept on token-authenticated upgrades (letta-code#3511, 0.29.4+),
+        // and it takes request headers via a third constructor argument — the
+        // SDK's adapter bridges that. Run your server with
+        // `--ws-auth capability-token` for simulator/device connections.
+        ...(isReactNative()
+          ? { WebSocket: createReactNativeWebSocketConstructor(globalThis.WebSocket as never) }
+          : isBrowserRuntime()
+            ? { WebSocket: createBrowserBridgeWebSocketConstructor(globalThis.WebSocket) as never }
+            : {}),
+      });
+
+  sdkClients.set(conn.profile.id, { signature, client });
+  return client;
 }
 
 function isReactNative(): boolean {
@@ -241,20 +261,63 @@ export async function renameConversation(conn: Connection, conversationId: strin
   await sdkClient(conn).conversations.update(conversationId, { summary: title });
 }
 
-/**
- * Deleting a conversation is cloud-only: the REST surface has
- * DELETE /v1/conversations/{id}, but the app-server protocol has no
- * conversation_delete command, so remote profiles must not offer the action.
- */
-export function canDeleteConversations(conn: Connection): boolean {
-  return conn.profile.type === "cloud";
+/** Conversation deletion is supported by Cloud REST and our App Server control protocol. */
+export function canDeleteConversations(_conn: Connection): boolean {
+  return true;
+}
+
+type ConversationDeleteResponse = {
+  type: "conversation_delete_response";
+  request_id: string;
+  success: boolean;
+  conversation_id?: string;
+  error?: string;
+};
+
+async function deleteRemoteConversation(conn: Connection, conversationId: string): Promise<void> {
+  const WebSocketCtor = isReactNative()
+    ? createReactNativeWebSocketConstructor(globalThis.WebSocket as never)
+    : isBrowserRuntime()
+      ? createBrowserBridgeWebSocketConstructor(globalThis.WebSocket)
+      : undefined;
+  const client = createAppServerClient({
+    url: conn.profile.url,
+    ...(conn.secret ? { authToken: conn.secret } : {}),
+    ...(WebSocketCtor ? { WebSocket: WebSocketCtor as never } : {}),
+    requestTimeoutMs: 8_000,
+  });
+  try {
+    await client.connect();
+    const response = await client.requestRaw<ConversationDeleteResponse>(
+      {
+        type: "conversation_delete",
+        request_id: client.nextRequestId("conversation_delete"),
+        conversation_id: conversationId,
+      } as never,
+      {
+        predicate: (message): message is ConversationDeleteResponse =>
+          Boolean(
+            message &&
+              typeof message === "object" &&
+              "type" in message &&
+              message.type === "conversation_delete_response",
+          ),
+      },
+    );
+    if (!response.success) {
+      throw new Error(response.error ?? `Failed to delete conversation ${conversationId}.`);
+    }
+  } finally {
+    client.close();
+  }
 }
 
 export async function deleteConversation(conn: Connection, conversationId: string): Promise<void> {
-  if (!canDeleteConversations(conn)) {
-    throw new Error("This server doesn't support deleting conversations.");
+  if (conn.profile.type === "cloud") {
+    await cloudFetch(conn, `/v1/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+    return;
   }
-  await cloudFetch(conn, `/v1/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+  await deleteRemoteConversation(conn, conversationId);
 }
 
 /** One page of conversation history plus the cursor to the next older page. */
@@ -297,27 +360,44 @@ export async function listConversationMessages(
   };
 }
 
-/** Current model + effort for one conversation (falls back to the agent's). */
+/** Read the reasoning tier from provider-specific model settings. */
+function reasoningEffortFromSettings(settings: unknown): string | null {
+  if (!settings || typeof settings !== "object") return null;
+  const s = settings as {
+    reasoning_effort?: unknown;
+    effort?: unknown;
+    reasoning?: { reasoning_effort?: unknown } | null;
+    thinking?: { type?: unknown } | null;
+  };
+  const candidate = s.reasoning_effort ?? s.effort ?? s.reasoning?.reasoning_effort;
+  if (typeof candidate === "string" && candidate.length > 0) return candidate;
+  return s.thinking?.type === "enabled" ? "thinking" : null;
+}
+
+/** Current model + effort for one conversation, falling back to the agent. */
 export async function getConversationModel(
   conn: Connection,
   conversationId: string,
 ): Promise<{ model: string | null; reasoningEffort: string | null; title: string | null }> {
-  const body: LettaConversation = await sdkClient(conn).conversations.retrieve(conversationId);
-  // model_settings is an open record on the SDK type; narrow the fields we read.
-  const s = body.model_settings as {
-    reasoning_effort?: string | null;
-    effort?: string | null;
-    thinking?: { type?: string } | null;
-  } | null;
-  // Providers normalize effort differently: OpenAI keeps reasoning_effort/
-  // effort; Anthropic converts it into a thinking budget.
-  const effort =
-    s?.reasoning_effort ?? s?.effort ?? (s?.thinking?.type === "enabled" ? "thinking" : null);
+  const client = sdkClient(conn);
+  const body: LettaConversation = await client.conversations.retrieve(conversationId);
+
+  // A conversation may intentionally omit model/model_settings and inherit both
+  // from its agent. Older/existing conversations commonly do exactly that, so
+  // null here does NOT mean the runtime has no model.
+  let model = body.model ?? null;
+  let settings: unknown = body.model_settings ?? null;
+  if ((!model || !settings) && body.agent_id) {
+    const agent = await client.agents.retrieve(body.agent_id);
+    model ??= agent.model ?? null;
+    settings ??= agent.model_settings ?? null;
+  }
+
   return {
-    model: body.model ?? null,
-    reasoningEffort: effort,
+    model,
+    reasoningEffort: reasoningEffortFromSettings(settings),
     // `summary` IS the user-facing title on the wire; the generated client type
-    // (SDK 0.5.2 routes through @letta-ai/letta-client) has no `title` field.
+    // has no separate `title` field.
     title: body.summary ?? null,
   };
 }
@@ -363,6 +443,80 @@ function modelSettingsFor(model: string, effort?: ReasoningEffort): ModelSetting
     return { provider_type: "openai", reasoning: { reasoning_effort: effort } };
   }
   return undefined;
+}
+
+
+// ── Conversation diagnostics ─────────────────────────────────────────────────
+
+export interface ConversationDiagnostics {
+  model: string | null;
+  contextTokens: number | null;
+  contextWindow: number | null;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  reasoningTokens: number | null;
+  cachedInputTokens: number | null;
+  coreMemoryEstimatedTokens: number;
+  coreMemoryCharacters: number;
+  coreMemoryBlocks: number;
+  latestStepId: string | null;
+  pendingCompaction: boolean;
+  contextHistory: Array<{ timestamp: number; tokens: number; turnId?: number; compacted?: boolean }>;
+  lastCompaction: {
+    date: string | null;
+    trigger: string | null;
+    contextTokensBefore: number | null;
+    contextTokensAfter: number | null;
+    messagesBefore: number | null;
+    messagesAfter: number | null;
+  } | null;
+}
+
+export interface ConversationStaticDiagnostics {
+  agentId: string;
+  model: string | null;
+  contextWindow: number | null;
+  coreMemoryEstimatedTokens: number;
+  coreMemoryCharacters: number;
+  coreMemoryBlocks: number;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Static conversation/agent diagnostics available over the SDK management channel. */
+export async function getConversationStaticDiagnostics(
+  conn: Connection,
+  conversationId: string,
+): Promise<ConversationStaticDiagnostics> {
+  const client = sdkClient(conn);
+  const conversation = await client.conversations.retrieve(conversationId);
+  const agent = await client.agents.retrieve(conversation.agent_id);
+  const model = conversation.model ?? agent.model ?? null;
+  let catalogContextWindow: number | null = null;
+  if (model) {
+    try {
+      const catalog = await client.models.list();
+      const entry = catalog.entries.find((candidate) => candidate.handle === model);
+      catalogContextWindow = finiteNumber(entry?.updateArgs?.context_window);
+    } catch {
+      // Conversation override remains useful even if catalog discovery fails.
+    }
+  }
+  const blockText = (agent.blocks ?? [])
+    .filter((block) => !block.hidden)
+    .map((block) => block.value ?? "")
+    .join("\n");
+  const coreMemoryCharacters = blockText.length;
+  return {
+    agentId: conversation.agent_id,
+    model,
+    contextWindow: finiteNumber(conversation.context_window_limit) ?? catalogContextWindow,
+    coreMemoryEstimatedTokens: Math.round(coreMemoryCharacters / 4),
+    coreMemoryCharacters,
+    coreMemoryBlocks: (agent.blocks ?? []).filter((block) => !block.hidden).length,
+  };
 }
 
 // ── Models ──────────────────────────────────────────────────────────────────

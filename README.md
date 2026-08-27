@@ -83,8 +83,11 @@ means those two move together.
 - **Permission modes** — strict, standard, accept-edits, unrestricted, switchable mid-conversation.
 - **Interrupt and queue** — stop a running turn, or send follow-ups that queue behind it.
 - **Attachments** — send screenshots and photos, downscaled on device.
-- **Reconnect** — background the app and come back mid-turn; state reconciles against
-  the server rather than guessing.
+- **Reconnect** — background the app and come back mid-turn; active sessions survive view
+  unmounts, and state reconciles against the server rather than guessing or duplicating rows.
+- **Voice and conversation controls** — up to 10-minute voice capture with optional auto-send,
+  transcript timestamps/copy options, conversation status/context usage, rename, compaction,
+  and Local Milo conversation deletion.
 
 ## How it's built
 
@@ -117,7 +120,9 @@ the press screenshots.
 
 Deeper detail lives in [`docs/design-doc.md`](docs/design-doc.md) (visual system,
 screen map, and the screen→SDK operation map) and
-[`docs/architecture.md`](docs/architecture.md).
+[`docs/architecture.md`](docs/architecture.md). Local Milo-specific client behavior,
+recovery rules, deletion support, and the live reliability test are documented in
+[`docs/local-milo-operations.md`](docs/local-milo-operations.md).
 
 ## Making it yours
 
