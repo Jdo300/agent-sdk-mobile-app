@@ -9,6 +9,7 @@ import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 import { ProfilesProvider } from "../lib/profiles/ProfilesContext";
+import { ChatLifecycleCoordinator } from "../lib/letta/ChatLifecycleCoordinator";
 import { ThemeProvider, useTheme } from "../theme/ThemeProvider";
 
 function ThemedStack() {
@@ -32,9 +33,11 @@ export default function RootLayout() {
     <GestureHandlerRootView style={{ flex: 1 }}>
       <ThemeProvider>
         <ProfilesProvider>
-          <BottomSheetModalProvider>
-            <ThemedStack />
-          </BottomSheetModalProvider>
+          <ChatLifecycleCoordinator>
+            <BottomSheetModalProvider>
+              <ThemedStack />
+            </BottomSheetModalProvider>
+          </ChatLifecycleCoordinator>
         </ProfilesProvider>
       </ThemeProvider>
     </GestureHandlerRootView>

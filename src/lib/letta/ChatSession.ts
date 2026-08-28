@@ -28,6 +28,16 @@ import { contentToText, formatToolInput } from "./toolText";
 import { newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import { authoritativeRowsCoverCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
 import { isAuthoritativeCatchUpCurrent } from "./authoritativeCatchUp";
+import {
+  loadDurableConversation,
+  putDurableOutbox,
+  removeDurableOutbox,
+  retirePersistedOutboxEchoes,
+  saveDurableCanonicalWindow,
+  updateDurableOutboxState,
+  type DurableOutboxItem,
+} from "./durableChatStore";
+import { mergeForwardMessages, newestDurableMessageId } from "./durableSyncCore";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -60,6 +70,7 @@ const ABORT_CONFIRM_INTERVAL_MS = 250;
 const RECONNECT_CATCHUP_FINAL_DELAY_MS = 250;
 const AUTHORITATIVE_PAGE_SIZE = 50;
 const AUTHORITATIVE_MAX_PAGES = 8;
+const FORWARD_SYNC_MAX_PAGES = 100;
 const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
 const AUTHORITATIVE_CATCHUP_MAX_MS = 30000;
@@ -89,6 +100,13 @@ const activityListeners = new Set<() => void>();
  * simply reattaches a view to the existing stream/snapshot.
  */
 const retainedChatSessions = new Map<string, ChatSession>();
+
+/** App-level lifecycle hook: one foreground event repairs every retained chat. */
+export async function reconnectRetainedChatSessions(): Promise<void> {
+  await Promise.allSettled(
+    [...retainedChatSessions.values()].map((session) => session.reconnect()),
+  );
+}
 
 function retainedSessionKey(profileId: string, conversationId: string): string {
   return `${profileId}:${conversationId}`;
@@ -165,6 +183,9 @@ export class ChatSession {
   private nextBefore: string | null = null;
   /** Raw persisted history currently loaded in the transcript, oldest first. */
   private loadedHistoryMessages: unknown[] = [];
+  /** Durable forward cursor: newest server UUID already committed locally. */
+  private forwardAfter: string | null = null;
+  private durableHydrated = false;
   private pendingStream: SDKMessage[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   /** Foreground, stream-failure and Retry triggers all join one recovery. */
@@ -343,44 +364,63 @@ export class ChatSession {
   }
 
   async send(text: string, attachments: Attachment[] = []): Promise<void> {
-    // A newly submitted turn owns the transcript immediately. Invalidate any
-    // idle reconnect repair before it can observe or publish optimistic state.
-    this.cancelAuthoritativeCatchUp();
-    // Stamp the echo with the otid we hand to send() (SDK 0.7.0,
-    // letta-agent-sdk#273): the persisted user message comes back under the same
-    // otid, so the accumulator keys it to this row and the echo retires by
-    // identity instead of being guessed at.
     const otid = `echo-${this.conversationId}-${Date.now()}-${this.counter++}`;
-    this.echoOtids.add(otid);
-    this.commit(
-      this.appendLocal(this.snapshot, {
-        kind: "user",
-        id: otid,
-        text,
-        pending: true,
-        occurredAt: Date.now(),
-        ...(attachments.length > 0 ? { images: attachments.map((a) => a.uri) } : {}),
-      }),
-    );
-    if (attachments.length > 0) this.pendingAttachments.set(otid, attachments);
-    // The turn starts when the user sends; loop_status and the device's own
-    // status stay authoritative from here.
-    if (this.snapshot.run === "idle") this.commit(patch(this.snapshot, { run: "running" }));
+    await this.submitDurableTurn({
+      profileId: this.conn.profile.id,
+      conversationId: this.conversationId,
+      otid,
+      text,
+      attachments,
+      state: "queued",
+      error: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+
+  /** Persist first, then submit the exact same OTID on every retry. */
+  private async submitDurableTurn(item: DurableOutboxItem): Promise<void> {
+    this.cancelAuthoritativeCatchUp();
     try {
-      // The SDK takes either a string or a multimodal content array; images
-      // lead so the model reads them as context for the instruction.
+      await putDurableOutbox(item);
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : "Could not journal message locally.";
+      this.commit(this.appendError(this.snapshot, detail));
+      return;
+    }
+
+    const { otid, text, attachments } = item;
+    this.echoOtids.add(otid);
+    if (!this.localRows.some((row) => row.item.kind === "user" && row.item.id === otid)) {
+      this.commit(
+        this.appendLocal(this.snapshot, {
+          kind: "user",
+          id: otid,
+          text,
+          pending: true,
+          occurredAt: item.createdAt,
+          ...(attachments.length > 0 ? { images: attachments.map((a) => a.uri) } : {}),
+        }),
+      );
+    } else {
+      this.markEcho(otid, { pending: true, failed: false });
+      this.commit(this.project(this.snapshot));
+    }
+    if (attachments.length > 0) this.pendingAttachments.set(otid, attachments);
+    if (this.snapshot.run === "idle") this.commit(patch(this.snapshot, { run: "running" }));
+
+    try {
+      await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "sending");
       await this.ensureSession().send(
         attachments.length > 0
           ? [...toImageContent(attachments), ...(text ? [{ type: "text" as const, text }] : [])]
           : text,
         { otid },
       );
+      await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "awaiting_echo");
     } catch (e) {
-      // send() returns immediately after the SDK writes the turn to the socket,
-      // so an exception here means the message was not submitted. Keep the failed
-      // bubble as the durable user-visible signal, but transport failures belong
-      // in connection UI rather than as permanent transcript error rows.
       const detail = e instanceof Error ? e.message : "Send failed.";
+      await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "failed", detail).catch(() => {});
       const transportFailure = isTransportError(detail);
       this.markEcho(otid, { pending: false, failed: true });
       const next = patch(this.project(this.snapshot), {
@@ -423,9 +463,23 @@ export class ChatSession {
       ...this.snapshot,
       transcript: items.filter((_t, i) => i !== index && !(dropError && i === index + 1)),
     });
-    const images = this.pendingAttachments.get(itemId) ?? [];
+    const durable = await loadDurableConversation(this.conn.profile.id, this.conversationId).catch(() => null);
+    const saved = durable?.outbox.find((entry) => entry.otid === itemId);
+    const images = saved?.attachments ?? this.pendingAttachments.get(itemId) ?? [];
     this.pendingAttachments.delete(itemId);
-    await this.send(item.text, images);
+    await this.submitDurableTurn(saved
+      ? { ...saved, state: "queued", error: null, updatedAt: Date.now() }
+      : {
+          profileId: this.conn.profile.id,
+          conversationId: this.conversationId,
+          otid: itemId,
+          text: item.text,
+          attachments: images,
+          state: "queued",
+          error: null,
+          createdAt: item.occurredAt ?? Date.now(),
+          updatedAt: Date.now(),
+        });
   }
 
   /** Called by the SDK when a tool needs permission; resolved by the UI. */
@@ -1074,6 +1128,73 @@ export class ChatSession {
     return `${prefix}-${this.counter++}`;
   }
 
+  private async hydrateDurableCache(): Promise<void> {
+    if (this.durableHydrated) return;
+    this.durableHydrated = true;
+    try {
+      const cached = await loadDurableConversation(this.conn.profile.id, this.conversationId);
+      this.nextBefore = cached.nextBefore;
+      this.forwardAfter = cached.forwardAfter;
+      if (cached.messages.length > 0) {
+        this.loadedHistoryMessages = cached.messages;
+        this.accumulator = rebuildAuthoritativeTranscript(cached.messages);
+        this.captureHistoryTimestamps(cached.messages);
+      }
+      const persistedOtids = new Set(userRowOtids(this.accumulator.rows()));
+      for (const item of cached.outbox) {
+        if (persistedOtids.has(item.otid)) {
+          void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
+          continue;
+        }
+        this.echoOtids.add(item.otid);
+        if (item.attachments.length > 0) this.pendingAttachments.set(item.otid, item.attachments);
+        if (item.state === "queued" || item.state === "sending") {
+          void updateDurableOutboxState(
+            this.conn.profile.id,
+            this.conversationId,
+            item.otid,
+            "failed",
+            "Delivery was interrupted before confirmation.",
+          ).catch(() => {});
+        }
+        this.localRows.push({
+          anchor: this.accumulator.rows().length,
+          item: {
+            kind: "user",
+            id: item.otid,
+            text: item.text,
+            occurredAt: item.createdAt,
+            ...(item.attachments.length > 0 ? { images: item.attachments.map((attachment) => attachment.uri) } : {}),
+            ...(item.state === "failed" || item.state === "queued" || item.state === "sending"
+              ? { failed: true }
+              : {}),
+          },
+        });
+      }
+      if (cached.messages.length > 0 || cached.outbox.length > 0) {
+        this.commit(this.project(this.snapshot));
+      }
+    } catch {
+      // Cache failure must not block server hydration; the network path repairs it.
+    }
+  }
+
+  private async persistCanonicalWindow(): Promise<void> {
+    this.forwardAfter = newestDurableMessageId(this.loadedHistoryMessages);
+    await saveDurableCanonicalWindow(
+      this.conn.profile.id,
+      this.conversationId,
+      this.loadedHistoryMessages,
+      { nextBefore: this.nextBefore, forwardAfter: this.forwardAfter },
+    );
+    const retired = await retirePersistedOutboxEchoes(
+      this.conn.profile.id,
+      this.conversationId,
+      this.loadedHistoryMessages,
+    );
+    for (const otid of retired) this.pendingAttachments.delete(otid);
+  }
+
   /**
    * Load existing history before any turn runs.
    *
@@ -1086,6 +1207,7 @@ export class ChatSession {
    */
   private async hydrate(options?: { reconcileDevice?: boolean; applyHistory?: boolean }): Promise<boolean> {
     try {
+      await this.hydrateDurableCache();
       if (this.conn.profile.type === "remote") {
         // Survive React dev double-mounting: the first, immediately-closed
         // instance must not open sockets, or its teardown races the second
@@ -1093,9 +1215,13 @@ export class ChatSession {
         await new Promise((resolve) => setTimeout(resolve, 400));
         if (this.closed) return false;
       }
+      const hadDurableHistory = this.loadedHistoryMessages.length > 0;
+      const durableBefore = this.nextBefore;
+      if (hadDurableHistory && this.forwardAfter) await this.syncForwardHistory();
       const page = await this.fetchInitialHistory();
-      this.nextBefore = page.nextBefore;
+      this.nextBefore = hadDurableHistory ? durableBefore : page.nextBefore;
       this.mergeLatestHistory(page.messages);
+      await this.persistCanonicalWindow();
       // Initial hydration has no live row. Reconnect hydration deliberately
       // defers this until device status says idle (see performReconnect()).
       if (options?.applyHistory !== false) {
@@ -1147,6 +1273,7 @@ export class ChatSession {
       const page = await this.fetchHistoryPage(this.nextBefore);
       this.nextBefore = page.nextBefore;
       this.mergeOlderHistory(page.messages);
+      await this.persistCanonicalWindow();
       // Rebase the complete loaded history window so later authoritative newest-
       // turn repairs cannot reorder an older page behind the live edge.
       this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
@@ -1158,6 +1285,34 @@ export class ChatSession {
       // A failed page is now assumed transient (the cursor itself works), so
       // hasMore stays set and scrolling back to the top retries.
       this.commit(patch(this.snapshot, { loadingOlder: false }));
+    }
+  }
+
+  private async fetchForwardPage(
+    after: string,
+    limit = AUTHORITATIVE_PAGE_SIZE,
+  ): Promise<{ messages: unknown[]; hasMore: boolean }> {
+    if (this.conn.profile.type === "remote") {
+      const result = await this.ensureSession().listMessages({ after, order: "asc", limit });
+      return { messages: result.messages, hasMore: result.hasMore ?? result.messages.length >= limit };
+    }
+    const result = await listConversationMessages(this.conn, this.conversationId, { after, order: "asc", limit });
+    return { messages: result.messages, hasMore: result.hasMore };
+  }
+
+  /** Fill only the missing newer suffix; never reuse the backward paging cursor. */
+  private async syncForwardHistory(): Promise<void> {
+    let cursor = this.forwardAfter ?? newestDurableMessageId(this.loadedHistoryMessages);
+    if (!cursor) return;
+    for (let count = 0; count < FORWARD_SYNC_MAX_PAGES; count += 1) {
+      const page = await this.fetchForwardPage(cursor);
+      if (page.messages.length === 0) break;
+      this.loadedHistoryMessages = mergeForwardMessages(this.loadedHistoryMessages, page.messages);
+      const next = newestDurableMessageId(page.messages);
+      if (!next || next === cursor) break;
+      cursor = next;
+      this.forwardAfter = next;
+      if (!page.hasMore) break;
     }
   }
 
@@ -1280,6 +1435,7 @@ export class ChatSession {
     this.accumulator = authoritative;
     this.captureHistoryTimestamps(this.loadedHistoryMessages);
     this.commit(this.project(this.snapshot));
+    void this.persistCanonicalWindow().catch(() => {});
     return true;
   }
 

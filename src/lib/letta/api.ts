@@ -336,7 +336,7 @@ export interface ConversationMessagesPage {
 export async function listConversationMessages(
   conn: Connection,
   conversationId: string,
-  opts: { limit?: number; before?: string } = {},
+  opts: { limit?: number; before?: string; after?: string; order?: "asc" | "desc" } = {},
 ): Promise<ConversationMessagesPage> {
   const limit = opts.limit ?? 50;
   const result = await sdkClient(conn).conversations.listMessages(conversationId, {
@@ -345,9 +345,11 @@ export async function listConversationMessages(
     // normalizes the cloud REST API's order-relative cursors), so the
     // per-backend branch this used to need is gone.
     ...(opts.before ? { before: opts.before } : {}),
+    ...(opts.after ? { after: opts.after } : {}),
+    ...(opts.order ? { order: opts.order } : {}),
   });
-  // Newest-first from the API; the transcript renders oldest-first.
-  const messages = [...result.messages].reverse();
+  // Default API order is newest-first; explicit asc is already transcript order.
+  const messages = opts.order === "asc" ? [...result.messages] : [...result.messages].reverse();
   // App-servers answer without nextBefore/hasMore, so page from the oldest id
   // we hold — the same cursor style listConversations() uses. A short page
   // means we reached the beginning.

@@ -35,7 +35,15 @@
       "edgeToEdgeEnabled": true
     },
     "plugins": [
-      "expo-router",
+      [
+        "expo-router",
+        {
+          "headers": {
+            "Cross-Origin-Embedder-Policy": "credentialless",
+            "Cross-Origin-Opener-Policy": "same-origin"
+          }
+        }
+      ],
       "expo-secure-store",
       [
         "expo-image-picker",
@@ -62,7 +70,8 @@
           "microphonePermission": "Allow Local Milo to record voice messages."
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true

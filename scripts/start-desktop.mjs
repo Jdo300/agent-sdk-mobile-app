@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import http from "node:http";
 import process from "node:process";
+import httpProxy from "http-proxy";
 import { WebSocket, WebSocketServer } from "ws";
 
 const BRIDGE_HOST = "127.0.0.1";
-const BRIDGE_PORT = 4612;
+const BRIDGE_PORT = Number(process.env.BLOOP_BRIDGE_PORT ?? 4612);
+const WEB_HOST = "127.0.0.1";
+const WEB_PORT = Number(process.env.BLOOP_WEB_PORT ?? 8082);
+const EXPO_PORT = Number(process.env.BLOOP_EXPO_PORT ?? 8083);
 const TOKEN_PROTOCOL_PREFIX = "letta-bearer.";
 const NO_AUTH_PROTOCOL = "letta-noauth";
 
@@ -88,8 +93,28 @@ bridge.on("listening", () => {
   console.log(`Bloop desktop WebSocket bridge listening on ws://${BRIDGE_HOST}:${BRIDGE_PORT}`);
 });
 
+const proxy = httpProxy.createProxyServer({
+  target: `http://${WEB_HOST}:${EXPO_PORT}`,
+  ws: true,
+});
+proxy.on("proxyRes", (proxyResponse) => {
+  proxyResponse.headers["cross-origin-embedder-policy"] = "credentialless";
+  proxyResponse.headers["cross-origin-opener-policy"] = "same-origin";
+});
+proxy.on("error", (_error, _req, response) => {
+  if (response && "writeHead" in response && !response.headersSent) {
+    response.writeHead(502, { "Content-Type": "text/plain" });
+    response.end("Bloop web server is starting");
+  }
+});
+const web = http.createServer((request, response) => proxy.web(request, response));
+web.on("upgrade", (request, socket, head) => proxy.ws(request, socket, head));
+web.listen(WEB_PORT, WEB_HOST, () => {
+  console.log(`Bloop desktop web proxy listening on http://${WEB_HOST}:${WEB_PORT}`);
+});
+
 const bunx = `${process.env.HOME}/.bun/bin/bunx`;
-const expo = spawn(bunx, ["expo", "start", "--web", "--localhost", "--port", "8082"], {
+const expo = spawn(bunx, ["expo", "start", "--web", "--localhost", "--port", String(EXPO_PORT)], {
   cwd: process.cwd(),
   stdio: "inherit",
   env: { ...process.env, BROWSER: "none" },
@@ -97,6 +122,8 @@ const expo = spawn(bunx, ["expo", "start", "--web", "--localhost", "--port", "80
 
 function shutdown(signal = "SIGTERM") {
   expo.kill(signal);
+  proxy.close();
+  web.close();
   bridge.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1500).unref();
 }

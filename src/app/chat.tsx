@@ -11,7 +11,6 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   ActivityIndicator,
   Alert,
-  AppState,
   FlatList,
   Keyboard,
   KeyboardAvoidingView,
@@ -526,35 +525,6 @@ export default function ChatScreen() {
     }, 1200);
     return () => clearTimeout(timer);
   }, [params.autosend, snapshot.hydrating]);
-
-  // Foreground resume: iOS can suspend JS while backgrounded, so the App
-  // Server may expire the WebSocket heartbeat while React Native still retains
-  // a stale socket object. A real background -> active transition therefore
-  // replaces the transport proactively and rehydrates authoritative state.
-  // Brief `inactive` transitions (notification shade, system UI) keep the
-  // existing transport unless they last long enough to merit a normal resync.
-  const backgroundedAt = useRef<number | null>(null);
-  const wasBackgrounded = useRef(false);
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (state) => {
-      if (state === "active") {
-        const away = backgroundedAt.current ? Date.now() - backgroundedAt.current : 0;
-        const shouldResync = wasBackgrounded.current || away > 30_000;
-        backgroundedAt.current = null;
-        wasBackgrounded.current = false;
-        // Ask the existing SDK session to prove it is healthy first. reconnect()
-        // replaces it only when the transport is already known dead or the
-        // resync fails. Forcing a fresh socket on every iOS foreground caused
-        // needless connection churn and duplicated the transport's own liveness
-        // detection without adding correctness.
-        if (shouldResync) void sessionRef.current?.reconnect();
-        return;
-      }
-      backgroundedAt.current ??= Date.now();
-      if (state === "background") wasBackgrounded.current = true;
-    });
-    return () => sub.remove();
-  }, []);
 
   // Drafts survive navigation and app restarts (per-conversation key).
   const draftKey = `letta.draft.${params.conversationId}`;
