@@ -26,6 +26,8 @@ import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
 import { newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
+import { authoritativeRowsCoverCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
+import { isAuthoritativeCatchUpCurrent } from "./authoritativeCatchUp";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -55,13 +57,14 @@ const RECONNECT_BANNER_DELAY_MS = 400;
 const ABORT_ACK_TIMEOUT_MS = 2000;
 const ABORT_CONFIRM_TIMEOUT_MS = 5000;
 const ABORT_CONFIRM_INTERVAL_MS = 250;
-const RECONNECT_CATCHUP_INTERVAL_MS = 1500;
 const RECONNECT_CATCHUP_FINAL_DELAY_MS = 250;
 const AUTHORITATIVE_PAGE_SIZE = 50;
 const AUTHORITATIVE_MAX_PAGES = 8;
-const RECONNECT_CATCHUP_SECOND_PASS_MS = 900;
 const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
+const AUTHORITATIVE_CATCHUP_MAX_MS = 30000;
+const AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS = 250;
+const AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS = 4000;
 
 /** A transport loss does not imply the server-side run stopped. */
 function preserveRunAcrossTransportLoss(run: ChatSnapshot["run"]): ChatSnapshot["run"] {
@@ -169,6 +172,10 @@ export class ChatSession {
   /** Quiet background retry after a transient socket-open failure. */
   private reconnectRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectRetryAttempt = 0;
+  /** Cancellation gate for persistence-lag retries after an idle reconnect. */
+  private authoritativeCatchUpGeneration = 0;
+  private authoritativeCatchUpTimer: ReturnType<typeof setTimeout> | null = null;
+  private authoritativeCatchUpWake: (() => void) | null = null;
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
@@ -336,6 +343,9 @@ export class ChatSession {
   }
 
   async send(text: string, attachments: Attachment[] = []): Promise<void> {
+    // A newly submitted turn owns the transcript immediately. Invalidate any
+    // idle reconnect repair before it can observe or publish optimistic state.
+    this.cancelAuthoritativeCatchUp();
     // Stamp the echo with the otid we hand to send() (SDK 0.7.0,
     // letta-agent-sdk#273): the persisted user message comes back under the same
     // otid, so the accumulator keys it to this row and the echo retires by
@@ -834,13 +844,17 @@ export class ChatSession {
     // hydrate(): remote history hydration itself uses ensureSession(), so
     // hydrating first would route recovery through the stale socket.
     if (this.sessionDead || options?.forceNewTransport) {
+      this.cancelAuthoritativeCatchUp();
       const stale = this.session;
       this.session = null;
       this.sessionDead = false;
       stale?.close();
     }
 
-    const ok = await this.hydrate({ reconcileDevice: false });
+    // Keep the live accumulator intact until device status proves the turn is
+    // idle. SDK rebase merges anonymous content-block deltas with persisted
+    // UUID rows rather than replacing the former.
+    const ok = await this.hydrate({ reconcileDevice: false, applyHistory: false });
     if (!ok || this.closed) {
       if (pending) clearTimeout(pending);
       if (!this.closed && this.snapshot.connection !== "auth_failed") this.scheduleReconnectRetry();
@@ -865,10 +879,7 @@ export class ChatSession {
       // history in one pass.
       if (!status.isProcessing) {
         const latest = await this.fetchAuthoritativeTail();
-        this.mergeLatestHistory(latest);
-        this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
-        this.captureHistoryTimestamps(latest);
-        this.commit(this.project(this.snapshot));
+        await this.reconcileAuthoritativeHistoryIfStillIdle(session, latest);
       }
 
       await session.recoverPendingApprovals().catch(() => {});
@@ -878,7 +889,7 @@ export class ChatSession {
       if (pending) clearTimeout(pending);
       this.clearReconnectRetry();
       this.commit(patch(this.project(this.snapshot), { connection: "connected" }));
-      void this.catchUpAfterReconnect(session);
+      this.startAuthoritativeCatchUp(session);
     } catch (e) {
       if (pending) clearTimeout(pending);
       if (this.closed) return;
@@ -894,40 +905,73 @@ export class ChatSession {
     }
   }
 
-  private async catchUpAfterReconnect(session: LettaCodeSession): Promise<void> {
-    const refreshLatest = async (): Promise<void> => {
-      if (this.closed || this.session !== session) return;
-      const latest = await this.fetchAuthoritativeTail();
-      if (this.closed || this.session !== session) return;
-      this.mergeLatestHistory(latest);
-      this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
-      this.captureHistoryTimestamps(latest);
-      this.commit(this.project(this.snapshot));
-    };
+  private startAuthoritativeCatchUp(session: LettaCodeSession): void {
+    this.cancelAuthoritativeCatchUp();
+    const generation = this.authoritativeCatchUpGeneration;
+    void this.catchUpAfterReconnect(session, generation);
+  }
 
+  private cancelAuthoritativeCatchUp(): void {
+    this.authoritativeCatchUpGeneration += 1;
+    if (this.authoritativeCatchUpTimer) clearTimeout(this.authoritativeCatchUpTimer);
+    this.authoritativeCatchUpTimer = null;
+    this.authoritativeCatchUpWake?.();
+    this.authoritativeCatchUpWake = null;
+  }
+
+  private waitForAuthoritativeCatchUp(delay: number, generation: number): Promise<void> {
+    return new Promise((resolve) => {
+      const wake = () => {
+        if (this.authoritativeCatchUpTimer) clearTimeout(this.authoritativeCatchUpTimer);
+        this.authoritativeCatchUpTimer = null;
+        if (this.authoritativeCatchUpWake === wake) this.authoritativeCatchUpWake = null;
+        resolve();
+      };
+      if (this.closed || generation !== this.authoritativeCatchUpGeneration) return wake();
+      this.authoritativeCatchUpWake = wake;
+      this.authoritativeCatchUpTimer = setTimeout(wake, delay);
+    });
+  }
+
+  private async catchUpAfterReconnect(session: LettaCodeSession, generation: number): Promise<void> {
+    const deadline = Date.now() + AUTHORITATIVE_CATCHUP_MAX_MS;
+    let attempt = 0;
     try {
-      while (!this.closed && this.session === session) {
+      while (this.isAuthoritativeCatchUpCurrent(session, generation)) {
         const status = await session.getDeviceStatus();
-        if (this.closed || this.session !== session) return;
+        if (!this.isAuthoritativeCatchUpCurrent(session, generation)) return;
         this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
-        if (!status.isProcessing) {
-          // Do not rebase persisted history while the replacement session is
-          // actively streaming. Anonymous live deltas and their later persisted
-          // messages cannot always be identity-matched, which is what produced
-          // duplicate/out-of-order bubbles during long responses.
-          await new Promise((resolve) => setTimeout(resolve, RECONNECT_CATCHUP_FINAL_DELAY_MS));
-          await refreshLatest();
-          // Device idle can precede durable message persistence very slightly.
-          // A second bounded pass closes that race without leaving a poller alive.
-          await new Promise((resolve) => setTimeout(resolve, RECONNECT_CATCHUP_SECOND_PASS_MS));
-          await refreshLatest();
-          return;
-        }
-        await new Promise((resolve) => setTimeout(resolve, RECONNECT_CATCHUP_INTERVAL_MS));
+        // A new turn owns the accumulator. Never let a retry from the prior
+        // idle turn repair/rebase it.
+        if (status.isProcessing || this.snapshot.run !== "idle") return;
+        await this.waitForAuthoritativeCatchUp(
+          attempt === 0
+            ? RECONNECT_CATCHUP_FINAL_DELAY_MS
+            : Math.min(AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS, AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** (attempt - 1)),
+          generation,
+        );
+        if (!this.isAuthoritativeCatchUpCurrent(session, generation)) return;
+        const latest = await this.fetchAuthoritativeTail();
+        // fetchAuthoritativeTail() is asynchronous: send() can invalidate this
+        // pass while it is in flight. Do not let its stale idle state reconcile.
+        if (!this.isAuthoritativeCatchUpCurrent(session, generation)) return;
+        const reconciled = await this.reconcileAuthoritativeHistoryIfStillIdle(session, latest);
+        if (reconciled || Date.now() >= deadline) return;
+        attempt += 1;
       }
     } catch {
       // consume() owns transport recovery; a later reconnect starts a fresh pass.
     }
+  }
+
+  private isAuthoritativeCatchUpCurrent(session: LettaCodeSession, generation: number): boolean {
+    return isAuthoritativeCatchUpCurrent(
+      this.closed,
+      this.session,
+      session,
+      generation,
+      this.authoritativeCatchUpGeneration,
+    );
   }
 
   /**
@@ -990,6 +1034,7 @@ export class ChatSession {
     if (this.closed) return;
     this.closed = true;
     this.clearReconnectRetry();
+    this.cancelAuthoritativeCatchUp();
     if (retainedChatSessions.get(this.retainedKey) === this) {
       retainedChatSessions.delete(this.retainedKey);
     }
@@ -1039,7 +1084,7 @@ export class ChatSession {
    * the SDK's management transport here would hold the slot and deadlock the
    * session's own connect (SDK-FEEDBACK.md "Still open" #4).
    */
-  private async hydrate(options?: { reconcileDevice?: boolean }): Promise<boolean> {
+  private async hydrate(options?: { reconcileDevice?: boolean; applyHistory?: boolean }): Promise<boolean> {
     try {
       if (this.conn.profile.type === "remote") {
         // Survive React dev double-mounting: the first, immediately-closed
@@ -1051,11 +1096,11 @@ export class ChatSession {
       const page = await this.fetchInitialHistory();
       this.nextBefore = page.nextBefore;
       this.mergeLatestHistory(page.messages);
-      // rebase() merges history with replace semantics and is safe mid-run: it
-      // lands rows on their existing keys instead of duplicating, and raises the
-      // replay thresholds the page proves. Appending would double the transcript
-      // on every foreground resume, which is exactly what it used to do.
-      this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
+      // Initial hydration has no live row. Reconnect hydration deliberately
+      // defers this until device status says idle (see performReconnect()).
+      if (options?.applyHistory !== false) {
+        this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
+      }
       this.captureHistoryTimestamps(page.messages);
 
       let next = this.project(patch(this.snapshot, { hasMore: page.hasMore }));
@@ -1222,12 +1267,47 @@ export class ChatSession {
     this.loadedHistoryMessages = [...additions, ...this.loadedHistoryMessages];
   }
 
-  // A healthy live turn is intentionally NOT rebased from persisted history on
-  // completion. Some App Server text deltas are anonymous; the SDK cannot prove
-  // an anonymous live row and its later persisted message are the same identity,
-  // so rebasing a healthy turn can temporarily duplicate/reorder visible text.
-  // Persisted history is used when opening, paging, or recovering a transport
-  // gap — the cases where authoritative repair is actually required.
+  /**
+   * Reconnect/catch-up only: replace ephemeral stream state with the server's
+   * canonical history after device status has reported idle. Local optimistic
+   * rows are deliberately outside the accumulator, so project() retains them
+   * and retires echoed users by OTID.
+   */
+  private reconcileAuthoritativeHistory(messages: readonly unknown[]): boolean {
+    this.mergeLatestHistory(messages);
+    const authoritative = rebuildAuthoritativeTranscript(this.loadedHistoryMessages);
+    if (!authoritativeRowsCoverCurrent(this.accumulator.rows(), authoritative.rows())) return false;
+    this.accumulator = authoritative;
+    this.captureHistoryTimestamps(this.loadedHistoryMessages);
+    this.commit(this.project(this.snapshot));
+    return true;
+  }
+
+  /**
+   * A turn can start while the REST history tail is in flight. Recheck the
+   * same live session immediately before replacing the accumulator, or that
+   * fresh queued/live state could be erased by an already-stale idle snapshot.
+   */
+  private async reconcileAuthoritativeHistoryIfStillIdle(
+    session: LettaCodeSession,
+    messages: readonly unknown[],
+  ): Promise<boolean> {
+    if (this.closed || this.session !== session) return false;
+    const status = await session.getDeviceStatus();
+    if (this.closed || this.session !== session) return false;
+
+    const next = this.applyDeviceStatus(this.project(this.snapshot), status);
+    this.commit(next);
+    const hasPendingApprovals = (status.pendingControlRequests?.length ?? 0) > 0 || next.approvals.length > 0;
+    if (status.isProcessing || hasPendingApprovals || next.run !== "idle") return false;
+
+    return this.reconcileAuthoritativeHistory(messages);
+  }
+
+  // A healthy live turn is never rebuilt or merge-rebased from persisted
+  // history. Fresh-accumulator replacement is contained to reconnect catch-up,
+  // after the executing device reports idle; bounded retries cover persistence
+  // lag without perturbing a healthy live result.
 
   private async consume(): Promise<void> {
     const session = this.session;
@@ -1614,4 +1694,3 @@ function containsUserMessage(messages: readonly unknown[]): boolean {
 function isTransportError(message: string): boolean {
   return /network|socket|connect|timed?\s?out|closed|unavailable|offline|interrupt|stream ended/i.test(message);
 }
-
