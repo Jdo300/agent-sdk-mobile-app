@@ -206,14 +206,20 @@ export async function saveDurableCanonicalWindow(
   conversationId: string,
   messages: readonly unknown[],
   cursors: { nextBefore: string | null; forwardAfter?: string | null },
+  isCurrent?: () => boolean,
 ): Promise<void> {
   return serializeWrite(async () => {
+    if (isCurrent && !isCurrent()) return;
     const db = await database();
+    if (isCurrent && !isCurrent()) return;
     const forwardAfter = cursors.forwardAfter === undefined
       ? newestDurableMessageId(messages)
       : cursors.forwardAfter;
-    await db.withTransactionAsync(async () => {
-      await db.runAsync(
+    const stale = Symbol("stale-durable-write");
+    try {
+      await db.withTransactionAsync(async () => {
+        if (isCurrent && !isCurrent()) throw stale;
+        await db.runAsync(
         `INSERT INTO durable_conversations(profile_id, conversation_id, next_before, forward_after, updated_at)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(profile_id, conversation_id) DO UPDATE SET
@@ -226,14 +232,16 @@ export async function saveDurableCanonicalWindow(
         forwardAfter,
         Date.now(),
       );
-      await db.runAsync(
+        if (isCurrent && !isCurrent()) throw stale;
+        await db.runAsync(
         "DELETE FROM durable_messages WHERE profile_id = ? AND conversation_id = ?",
         profileId,
         conversationId,
       );
-      for (let sequence = 0; sequence < messages.length; sequence += 1) {
-        const message = messages[sequence];
-        await db.runAsync(
+        for (let sequence = 0; sequence < messages.length; sequence += 1) {
+          if (isCurrent && !isCurrent()) throw stale;
+          const message = messages[sequence];
+          await db.runAsync(
           `INSERT INTO durable_messages(profile_id, conversation_id, message_id, sequence, otid, raw_json)
            VALUES (?, ?, ?, ?, ?, ?)`,
           profileId,
@@ -242,9 +250,12 @@ export async function saveDurableCanonicalWindow(
           sequence,
           durableMessageOtid(message),
           JSON.stringify(message),
-        );
-      }
-    });
+          );
+        }
+      });
+    } catch (error) {
+      if (error !== stale) throw error;
+    }
   });
 }
 

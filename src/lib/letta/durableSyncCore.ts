@@ -59,14 +59,23 @@ export function mergeBackwardMessages(
   return [...older, ...current];
 }
 
-export function persistedUserOtids(messages: readonly unknown[]): string[] {
-  const otids = new Set<string>();
+export function persistedUserAcknowledgements(messages: readonly unknown[]): Map<string, string> {
+  const acknowledgements = new Map<string, string>();
   for (const message of messages) {
     if (!message || typeof message !== "object") continue;
-    const record = message as { message_type?: unknown; otid?: unknown };
-    if (record.message_type === "user_message" && typeof record.otid === "string" && record.otid.length > 0) {
-      otids.add(record.otid);
+    const record = message as { id?: unknown; message_type?: unknown; otid?: unknown };
+    if (
+      record.message_type === "user_message" &&
+      typeof record.id === "string" && record.id.length > 0 &&
+      typeof record.otid === "string" && record.otid.length > 0
+    ) {
+      acknowledgements.set(record.otid, record.id);
     }
   }
-  return [...otids];
+  return acknowledgements;
+}
+
+/** Only a persisted user UUID explicitly acknowledges an OTID. */
+export function persistedUserOtids(messages: readonly unknown[]): string[] {
+  return [...persistedUserAcknowledgements(messages).keys()];
 }

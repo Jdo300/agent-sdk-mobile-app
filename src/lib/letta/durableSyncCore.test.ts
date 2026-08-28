@@ -3,6 +3,7 @@ import {
   deriveDurableCursors,
   mergeBackwardMessages,
   mergeForwardMessages,
+  persistedUserAcknowledgements,
   persistedUserOtids,
 } from "./durableSyncCore";
 
@@ -27,11 +28,30 @@ describe("durable sync core", () => {
     ]);
   });
 
+  test("concurrent older-page and forward catch-up converge to the same canonical window", () => {
+    const base = [{ id: "m3" }, { id: "m4" }];
+    const older = [{ id: "m1" }, { id: "m2" }, { id: "m3" }];
+    const newer = [{ id: "m4" }, { id: "m5" }, { id: "m6" }];
+    const olderThenForward = mergeForwardMessages(mergeBackwardMessages(base, older), newer);
+    const forwardThenOlder = mergeBackwardMessages(mergeForwardMessages(base, newer), older);
+    expect(olderThenForward).toEqual(forwardThenOlder);
+    expect(olderThenForward.map((message: any) => message.id)).toEqual(["m1", "m2", "m3", "m4", "m5", "m6"]);
+  });
+
   test("extracts only persisted user OTIDs", () => {
     expect(persistedUserOtids([
-      { message_type: "user_message", otid: "turn-1" },
+      { id: "m1", message_type: "user_message", otid: "turn-1" },
       { message_type: "assistant_message", otid: "turn-2" },
-      { message_type: "user_message", otid: "turn-1" },
+      { id: "m1", message_type: "user_message", otid: "turn-1" },
     ])).toEqual(["turn-1"]);
   });
+  test("requires persisted UUID before an OTID counts as acknowledged", () => {
+    const messages = [
+      { message_type: "user_message", otid: "turn-unpersisted" },
+      { id: "msg-persisted", message_type: "user_message", otid: "turn-persisted" },
+    ];
+    expect(persistedUserOtids(messages)).toEqual(["turn-persisted"]);
+    expect(persistedUserAcknowledgements(messages).get("turn-persisted")).toBe("msg-persisted");
+  });
+
 });

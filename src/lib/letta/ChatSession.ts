@@ -29,6 +29,14 @@ import { newestTextKey, projectRows, userRowOtids, type ProjectionState } from "
 import { authoritativeRowsCoverCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
 import { isAuthoritativeCatchUpCurrent } from "./authoritativeCatchUp";
 import {
+  emitSyncTelemetry,
+  inspectPersistedHistory,
+  isGenerationCurrent,
+  outboxRecoveryAction,
+  ProtocolObserver,
+  syncConvergenceState,
+} from "./protocolHardening";
+import {
   loadDurableConversation,
   putDurableOutbox,
   removeDurableOutbox,
@@ -67,7 +75,6 @@ const RECONNECT_BANNER_DELAY_MS = 400;
 const ABORT_ACK_TIMEOUT_MS = 2000;
 const ABORT_CONFIRM_TIMEOUT_MS = 5000;
 const ABORT_CONFIRM_INTERVAL_MS = 250;
-const RECONNECT_CATCHUP_FINAL_DELAY_MS = 250;
 const AUTHORITATIVE_PAGE_SIZE = 50;
 const AUTHORITATIVE_MAX_PAGES = 8;
 const FORWARD_SYNC_MAX_PAGES = 100;
@@ -156,8 +163,10 @@ export class ChatSession {
    * once the reply streams in.
    */
   private localRows: { anchor: number; item: TranscriptItem }[] = [];
-  /** otids of echoes still awaiting their persisted counterpart. */
+  /** OTIDs used only to project/retire optimistic user bubbles. */
   private echoOtids = new Set<string>();
+  /** OTIDs that still lack a persisted user-message UUID acknowledgement. */
+  private unacknowledgedOtids = new Set<string>();
   /** Reasoning think time, keyed by accumulator row key. */
   private thinkStartedAt = new Map<string, number>();
   private thinkSeconds = new Map<string, number>();
@@ -195,11 +204,17 @@ export class ChatSession {
   private reconnectRetryAttempt = 0;
   /** Cancellation gate for persistence-lag retries after an idle reconnect. */
   private authoritativeCatchUpGeneration = 0;
+  /** Lifecycle epoch for every async hydration/paging/reconciliation callback. */
+  private reconciliationGeneration = 0;
+  private readonly protocolObserver = new ProtocolObserver();
+  private streamGeneration = 0;
   private authoritativeCatchUpTimer: ReturnType<typeof setTimeout> | null = null;
   private authoritativeCatchUpWake: (() => void) | null = null;
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
+  /** Definitely-unsent journal rows recovered after a process restart. */
+  private queuedRecoveryTurns: DurableOutboxItem[] = [];
   private approvalResolvers = new Map<
     string,
     (response: { behavior: "allow" } | { behavior: "deny"; message: string }) => void
@@ -297,7 +312,8 @@ export class ChatSession {
     // Safe alongside the other first calls: initialize is single-flight since
     // SDK 0.3.2 (#214), and since 0.5.0 (#218) the app-server serves
     // concurrent clients, so nothing here contends for a socket.
-    void this.consume();
+    const streamGeneration = ++this.streamGeneration;
+    void this.consume(this.session, streamGeneration);
     this.watchDeviceStatus(this.session);
     return this.session;
   }
@@ -380,7 +396,9 @@ export class ChatSession {
 
   /** Persist first, then submit the exact same OTID on every retry. */
   private async submitDurableTurn(item: DurableOutboxItem): Promise<void> {
+    this.advanceReconciliationGeneration();
     this.cancelAuthoritativeCatchUp();
+    if (this.snapshot.loadingOlder) this.commit(patch(this.snapshot, { loadingOlder: false }));
     try {
       await putDurableOutbox(item);
     } catch (e) {
@@ -391,6 +409,7 @@ export class ChatSession {
 
     const { otid, text, attachments } = item;
     this.echoOtids.add(otid);
+    this.unacknowledgedOtids.add(otid);
     if (!this.localRows.some((row) => row.item.kind === "user" && row.item.id === otid)) {
       this.commit(
         this.appendLocal(this.snapshot, {
@@ -876,6 +895,8 @@ export class ChatSession {
   }
 
   private async performReconnect(options?: { forceNewTransport?: boolean }): Promise<void> {
+    const generation = this.advanceReconciliationGeneration();
+    if (this.snapshot.loadingOlder) this.commit(patch(this.snapshot, { loadingOlder: false }));
     // Transport failures never belong in chat history. Scrub any legacy/local
     // transport rows before recovery so reconnect is visually transparent.
     this.commit(this.scrubTransportErrors(this.snapshot));
@@ -890,7 +911,9 @@ export class ChatSession {
     } else {
       pending = setTimeout(() => {
         pending = null;
-        this.commit(patch(this.snapshot, { connection: "reconnecting" }));
+        if (this.reconciliationIsCurrent(generation, "reconnect_banner")) {
+          this.commit(patch(this.snapshot, { connection: "reconnecting" }));
+        }
       }, RECONNECT_BANNER_DELAY_MS);
     }
 
@@ -901,6 +924,7 @@ export class ChatSession {
       this.cancelAuthoritativeCatchUp();
       const stale = this.session;
       this.session = null;
+      this.streamGeneration += 1;
       this.sessionDead = false;
       stale?.close();
     }
@@ -908,8 +932,8 @@ export class ChatSession {
     // Keep the live accumulator intact until device status proves the turn is
     // idle. SDK rebase merges anonymous content-block deltas with persisted
     // UUID rows rather than replacing the former.
-    const ok = await this.hydrate({ reconcileDevice: false, applyHistory: false });
-    if (!ok || this.closed) {
+    const ok = await this.hydrate({ reconcileDevice: false, applyHistory: false, generation });
+    if (!ok || !this.reconciliationIsCurrent(generation, "reconnect_hydrate")) {
       if (pending) clearTimeout(pending);
       if (!this.closed && this.snapshot.connection !== "auth_failed") this.scheduleReconnectRetry();
       return;
@@ -921,32 +945,22 @@ export class ChatSession {
     try {
       const session = this.ensureSession();
       const status = await session.getDeviceStatus();
-      if (this.closed) return;
+      if (!this.reconciliationIsCurrent(generation, "reconnect_device_status") || this.session !== session) return;
       this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
 
-      // Close the acceptance/persistence race around a dropped send once the
-      // server is idle. While a run is still streaming, persisted assistant
-      // messages may not carry the same identity as anonymous live deltas. A
-      // mid-run rebase can therefore materialize an older persisted copy beside
-      // the live row and reorder both. Keep the live accumulator untouched until
-      // catchUpAfterReconnect() observes idle, then repair from authoritative
-      // history in one pass.
-      if (!status.isProcessing) {
-        const latest = await this.fetchAuthoritativeTail();
-        await this.reconcileAuthoritativeHistoryIfStillIdle(session, latest);
-      }
-
       await session.recoverPendingApprovals().catch(() => {});
+      if (!this.reconciliationIsCurrent(generation, "reconnect_approvals") || this.session !== session) return;
       if (this.preferredPermissionMode) {
         await session.changeDeviceState({ permissionMode: this.preferredPermissionMode }).catch(() => {});
+        if (!this.reconciliationIsCurrent(generation, "reconnect_permission") || this.session !== session) return;
       }
       if (pending) clearTimeout(pending);
       this.clearReconnectRetry();
       this.commit(patch(this.project(this.snapshot), { connection: "connected" }));
-      this.startAuthoritativeCatchUp(session);
+      this.startAuthoritativeCatchUp(session, generation);
     } catch (e) {
       if (pending) clearTimeout(pending);
-      if (this.closed) return;
+      if (!this.reconciliationIsCurrent(generation, "reconnect_error")) return;
       this.sessionDead = true;
       const authFailure = isAuthError(e);
       this.commit(
@@ -959,10 +973,10 @@ export class ChatSession {
     }
   }
 
-  private startAuthoritativeCatchUp(session: LettaCodeSession): void {
+  private startAuthoritativeCatchUp(session: LettaCodeSession, reconciliationGeneration: number): void {
     this.cancelAuthoritativeCatchUp();
-    const generation = this.authoritativeCatchUpGeneration;
-    void this.catchUpAfterReconnect(session, generation);
+    const catchUpGeneration = this.authoritativeCatchUpGeneration;
+    void this.catchUpAfterReconnect(session, catchUpGeneration, reconciliationGeneration);
   }
 
   private cancelAuthoritativeCatchUp(): void {
@@ -973,7 +987,7 @@ export class ChatSession {
     this.authoritativeCatchUpWake = null;
   }
 
-  private waitForAuthoritativeCatchUp(delay: number, generation: number): Promise<void> {
+  private waitForAuthoritativeCatchUp(delay: number, catchUpGeneration: number): Promise<void> {
     return new Promise((resolve) => {
       const wake = () => {
         if (this.authoritativeCatchUpTimer) clearTimeout(this.authoritativeCatchUpTimer);
@@ -981,50 +995,140 @@ export class ChatSession {
         if (this.authoritativeCatchUpWake === wake) this.authoritativeCatchUpWake = null;
         resolve();
       };
-      if (this.closed || generation !== this.authoritativeCatchUpGeneration) return wake();
+      if (this.closed || catchUpGeneration !== this.authoritativeCatchUpGeneration) return wake();
       this.authoritativeCatchUpWake = wake;
       this.authoritativeCatchUpTimer = setTimeout(wake, delay);
     });
   }
 
-  private async catchUpAfterReconnect(session: LettaCodeSession, generation: number): Promise<void> {
+  private hasUnacknowledgedLocalEcho(): boolean {
+    return this.unacknowledgedOtids.size > 0;
+  }
+
+  private async markAmbiguousOutboxFailed(generation: number): Promise<void> {
+    if (!this.reconciliationIsCurrent(generation, "outbox_unknown_before")) return;
+    const durable = await loadDurableConversation(this.conn.profile.id, this.conversationId).catch(() => null);
+    if (!durable || !this.reconciliationIsCurrent(generation, "outbox_unknown_load")) return;
+    const ambiguous = durable.outbox.filter((item) => outboxRecoveryAction(item.state) === "converge");
+    for (const item of ambiguous) {
+      if (!this.reconciliationIsCurrent(generation, "outbox_unknown_update")) return;
+      await updateDurableOutboxState(
+        this.conn.profile.id,
+        this.conversationId,
+        item.otid,
+        "failed",
+        "Server became idle without a persisted acknowledgement for this OTID.",
+      ).catch(() => {});
+      this.unacknowledgedOtids.delete(item.otid);
+      this.markEcho(item.otid, { pending: false, failed: true });
+    }
+    if (ambiguous.length > 0 && this.reconciliationIsCurrent(generation, "outbox_unknown_commit")) {
+      this.commit(this.project(this.snapshot));
+    }
+  }
+
+  /**
+   * Reconnect persistence convergence is evidence-based: first exhaust the
+   * forward `after` cursor immediately, then require canonical history to cover
+   * the live accumulator and every submitted OTID to have a persisted user UUID.
+   * Backoff controls polling load only; elapsed time is never treated as proof.
+   */
+  private async catchUpAfterReconnect(
+    session: LettaCodeSession,
+    catchUpGeneration: number,
+    reconciliationGeneration: number,
+  ): Promise<void> {
     const deadline = Date.now() + AUTHORITATIVE_CATCHUP_MAX_MS;
     let attempt = 0;
     try {
-      while (this.isAuthoritativeCatchUpCurrent(session, generation)) {
+      while (this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) {
         const status = await session.getDeviceStatus();
-        if (!this.isAuthoritativeCatchUpCurrent(session, generation)) return;
+        if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
         this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
-        // A new turn owns the accumulator. Never let a retry from the prior
-        // idle turn repair/rebase it.
         if (status.isProcessing || this.snapshot.run !== "idle") return;
-        await this.waitForAuthoritativeCatchUp(
-          attempt === 0
-            ? RECONNECT_CATCHUP_FINAL_DELAY_MS
-            : Math.min(AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS, AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** (attempt - 1)),
-          generation,
+
+        if (!(await this.syncForwardHistory(reconciliationGeneration))) return;
+        if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
+
+        let reconciled = await this.reconcileAuthoritativeHistoryIfStillIdle(
+          session,
+          this.loadedHistoryMessages,
+          reconciliationGeneration,
         );
-        if (!this.isAuthoritativeCatchUpCurrent(session, generation)) return;
-        const latest = await this.fetchAuthoritativeTail();
-        // fetchAuthoritativeTail() is asynchronous: send() can invalidate this
-        // pass while it is in flight. Do not let its stale idle state reconcile.
-        if (!this.isAuthoritativeCatchUpCurrent(session, generation)) return;
-        const reconciled = await this.reconcileAuthoritativeHistoryIfStillIdle(session, latest);
-        if (reconciled || Date.now() >= deadline) return;
+        if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
+
+        // Some backends may finalize the newest persisted object in place rather
+        // than append a new UUID. The forward cursor remains primary; this tail
+        // refresh is only a verification fallback when coverage has not converged.
+        if (!reconciled) {
+          const latest = await this.fetchAuthoritativeTail();
+          if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
+          this.observePersistedHistory(latest, reconciliationGeneration, "catchup_tail");
+          reconciled = await this.reconcileAuthoritativeHistoryIfStillIdle(
+            session,
+            latest,
+            reconciliationGeneration,
+          );
+        }
+
+        if (this.snapshot.run !== "idle") return;
+        const convergence = syncConvergenceState(reconciled, this.hasUnacknowledgedLocalEcho());
+        if (convergence.converged) {
+          emitSyncTelemetry({
+            kind: "sync_converged",
+            conversationId: this.conversationId,
+            generation: reconciliationGeneration,
+            attempt,
+          });
+          return;
+        }
+        if (Date.now() >= deadline) {
+          if (convergence.reason === "awaiting_otid_ack") {
+            await this.markAmbiguousOutboxFailed(reconciliationGeneration);
+          }
+          emitSyncTelemetry({
+            kind: "sync_retry",
+            conversationId: this.conversationId,
+            generation: reconciliationGeneration,
+            attempt,
+            reason: convergence.reason === "awaiting_otid_ack" ? "otid_ack_timeout" : "persistence_timeout",
+          });
+          return;
+        }
+
+        emitSyncTelemetry({
+          kind: "sync_retry",
+          conversationId: this.conversationId,
+          generation: reconciliationGeneration,
+          attempt,
+          reason: convergence.reason,
+        });
+        const delay = Math.min(
+          AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS,
+          AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** attempt,
+        );
         attempt += 1;
+        await this.waitForAuthoritativeCatchUp(delay, catchUpGeneration);
       }
     } catch {
       // consume() owns transport recovery; a later reconnect starts a fresh pass.
     }
   }
 
-  private isAuthoritativeCatchUpCurrent(session: LettaCodeSession, generation: number): boolean {
-    return isAuthoritativeCatchUpCurrent(
-      this.closed,
-      this.session,
-      session,
-      generation,
-      this.authoritativeCatchUpGeneration,
+  private isAuthoritativeCatchUpCurrent(
+    session: LettaCodeSession,
+    catchUpGeneration: number,
+    reconciliationGeneration: number,
+  ): boolean {
+    return (
+      isAuthoritativeCatchUpCurrent(
+        this.closed,
+        this.session,
+        session,
+        catchUpGeneration,
+        this.authoritativeCatchUpGeneration,
+      ) &&
+      isGenerationCurrent(reconciliationGeneration, this.reconciliationGeneration)
     );
   }
 
@@ -1087,6 +1191,8 @@ export class ChatSession {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.reconciliationGeneration += 1;
+    this.streamGeneration += 1;
     this.clearReconnectRetry();
     this.cancelAuthoritativeCatchUp();
     if (retainedChatSessions.get(this.retainedKey) === this) {
@@ -1095,6 +1201,7 @@ export class ChatSession {
     this.accumulator.reset();
     this.localRows = [];
     this.echoOtids.clear();
+    this.unacknowledgedOtids.clear();
     publishActivity(this.conversationId, null);
     this.settleActivityWaiters(new Error("Session closed"));
     if (this.flushTimer) {
@@ -1124,15 +1231,56 @@ export class ChatSession {
     this.maybeDisposeWhenUnobserved();
   }
 
+  private advanceReconciliationGeneration(): number {
+    this.reconciliationGeneration += 1;
+    return this.reconciliationGeneration;
+  }
+
+  private reconciliationIsCurrent(generation: number, reason: string): boolean {
+    const current = !this.closed && isGenerationCurrent(generation, this.reconciliationGeneration);
+    if (!current && !this.closed) {
+      emitSyncTelemetry({
+        kind: "sync_stale_discard",
+        conversationId: this.conversationId,
+        generation,
+        reason,
+      });
+    }
+    return current;
+  }
+
+  private observePersistedHistory(messages: readonly unknown[], generation: number, source: string): void {
+    const observation = inspectPersistedHistory(messages);
+    if (observation.missingIdCount > 0) {
+      emitSyncTelemetry({
+        kind: "protocol_identity_missing",
+        conversationId: this.conversationId,
+        generation,
+        count: observation.missingIdCount,
+        reason: `${source}:persisted_id`,
+      });
+    }
+    if (observation.duplicateIdCount > 0) {
+      emitSyncTelemetry({
+        kind: "protocol_replay",
+        conversationId: this.conversationId,
+        generation,
+        count: observation.duplicateIdCount,
+        reason: `${source}:duplicate_persisted_id`,
+      });
+    }
+  }
+
   private id(prefix: string): string {
     return `${prefix}-${this.counter++}`;
   }
 
-  private async hydrateDurableCache(): Promise<void> {
-    if (this.durableHydrated) return;
-    this.durableHydrated = true;
+  private async hydrateDurableCache(generation: number): Promise<boolean> {
+    if (this.durableHydrated) return this.reconciliationIsCurrent(generation, "durable_cache_existing");
     try {
       const cached = await loadDurableConversation(this.conn.profile.id, this.conversationId);
+      if (!this.reconciliationIsCurrent(generation, "durable_cache_load")) return false;
+      this.durableHydrated = true;
       this.nextBefore = cached.nextBefore;
       this.forwardAfter = cached.forwardAfter;
       if (cached.messages.length > 0) {
@@ -1141,11 +1289,14 @@ export class ChatSession {
         this.captureHistoryTimestamps(cached.messages);
       }
       const persistedOtids = new Set(userRowOtids(this.accumulator.rows()));
+      this.queuedRecoveryTurns = cached.outbox.filter((item) => outboxRecoveryAction(item.state) === "replay");
       for (const item of cached.outbox) {
         if (persistedOtids.has(item.otid)) {
+          this.unacknowledgedOtids.delete(item.otid);
           void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
           continue;
         }
+        if (item.state !== "failed") this.unacknowledgedOtids.add(item.otid);
         this.echoOtids.add(item.otid);
         if (item.attachments.length > 0) this.pendingAttachments.set(item.otid, item.attachments);
         if (item.state === "queued" || item.state === "sending") {
@@ -1174,25 +1325,36 @@ export class ChatSession {
       if (cached.messages.length > 0 || cached.outbox.length > 0) {
         this.commit(this.project(this.snapshot));
       }
+      return true;
     } catch {
       // Cache failure must not block server hydration; the network path repairs it.
+      return this.reconciliationIsCurrent(generation, "durable_cache_error");
     }
   }
 
-  private async persistCanonicalWindow(): Promise<void> {
-    this.forwardAfter = newestDurableMessageId(this.loadedHistoryMessages);
+  private async persistCanonicalWindow(generation: number): Promise<boolean> {
+    if (!this.reconciliationIsCurrent(generation, "persist_before")) return false;
+    const forwardAfter = newestDurableMessageId(this.loadedHistoryMessages);
     await saveDurableCanonicalWindow(
       this.conn.profile.id,
       this.conversationId,
       this.loadedHistoryMessages,
-      { nextBefore: this.nextBefore, forwardAfter: this.forwardAfter },
+      { nextBefore: this.nextBefore, forwardAfter },
+      () => !this.closed && isGenerationCurrent(generation, this.reconciliationGeneration),
     );
+    if (!this.reconciliationIsCurrent(generation, "persist_after")) return false;
+    this.forwardAfter = forwardAfter;
     const retired = await retirePersistedOutboxEchoes(
       this.conn.profile.id,
       this.conversationId,
       this.loadedHistoryMessages,
     );
-    for (const otid of retired) this.pendingAttachments.delete(otid);
+    if (!this.reconciliationIsCurrent(generation, "persist_retire")) return false;
+    for (const otid of retired) {
+      this.pendingAttachments.delete(otid);
+      this.unacknowledgedOtids.delete(otid);
+    }
+    return true;
   }
 
   /**
@@ -1205,23 +1367,28 @@ export class ChatSession {
    * the SDK's management transport here would hold the slot and deadlock the
    * session's own connect (SDK-FEEDBACK.md "Still open" #4).
    */
-  private async hydrate(options?: { reconcileDevice?: boolean; applyHistory?: boolean }): Promise<boolean> {
+  private async hydrate(options?: { reconcileDevice?: boolean; applyHistory?: boolean; generation?: number }): Promise<boolean> {
+    const generation = options?.generation ?? this.reconciliationGeneration;
     try {
-      await this.hydrateDurableCache();
+      if (!(await this.hydrateDurableCache(generation))) return false;
       if (this.conn.profile.type === "remote") {
         // Survive React dev double-mounting: the first, immediately-closed
         // instance must not open sockets, or its teardown races the second
         // instance for the app-server's single control slot.
         await new Promise((resolve) => setTimeout(resolve, 400));
-        if (this.closed) return false;
+        if (!this.reconciliationIsCurrent(generation, "hydrate_remote_delay")) return false;
       }
       const hadDurableHistory = this.loadedHistoryMessages.length > 0;
       const durableBefore = this.nextBefore;
-      if (hadDurableHistory && this.forwardAfter) await this.syncForwardHistory();
+      if (hadDurableHistory && this.forwardAfter) {
+        if (!(await this.syncForwardHistory(generation))) return false;
+      }
       const page = await this.fetchInitialHistory();
+      if (!this.reconciliationIsCurrent(generation, "hydrate_initial_history")) return false;
+      this.observePersistedHistory(page.messages, generation, "hydrate");
       this.nextBefore = hadDurableHistory ? durableBefore : page.nextBefore;
       this.mergeLatestHistory(page.messages);
-      await this.persistCanonicalWindow();
+      if (!(await this.persistCanonicalWindow(generation))) return false;
       // Initial hydration has no live row. Reconnect hydration deliberately
       // defers this until device status says idle (see performReconnect()).
       if (options?.applyHistory !== false) {
@@ -1237,14 +1404,33 @@ export class ChatSession {
         // A stranded unrestricted tool therefore resumes here instead of being
         // rendered as an idle-looking forever-running card.
         await this.session.recoverPendingApprovals().catch(() => {});
+        if (!this.reconciliationIsCurrent(generation, "hydrate_approvals")) return false;
         const status = await this.session.getDeviceStatus().catch(() => null);
+        if (!this.reconciliationIsCurrent(generation, "hydrate_device_status")) return false;
         if (status) next = this.applyDeviceStatus(next, status);
       }
-      if (this.closed) return false;
+      if (!this.reconciliationIsCurrent(generation, "hydrate_commit")) return false;
       this.commit(patch(next, { hydrating: false }));
+
+      const queued = this.queuedRecoveryTurns.filter((item) =>
+        this.localRows.some((row) => row.item.kind === "user" && row.item.id === item.otid),
+      );
+      this.queuedRecoveryTurns = [];
+      if (queued.length > 0) {
+        queueMicrotask(() => {
+          void (async () => {
+            for (const item of queued) {
+              if (this.closed) return;
+              await this.submitDurableTurn({ ...item, updatedAt: Date.now() });
+            }
+          })();
+        });
+      } else if (this.session && this.hasUnacknowledgedLocalEcho()) {
+        this.startAuthoritativeCatchUp(this.session, generation);
+      }
       return true;
     } catch (e) {
-      if (this.closed) return false;
+      if (!this.reconciliationIsCurrent(generation, "hydrate_error")) return false;
       const detail = e instanceof Error ? e.message : "Couldn't load history.";
       const transportFailure = isTransportError(detail);
       // Connection failures are UI transport state, never transcript content.
@@ -1268,12 +1454,16 @@ export class ChatSession {
   async loadOlder(): Promise<void> {
     if (this.snapshot.hydrating || this.snapshot.loadingOlder) return;
     if (!this.snapshot.hasMore || !this.nextBefore) return;
+    const generation = this.reconciliationGeneration;
+    const before = this.nextBefore;
     this.commit(patch(this.snapshot, { loadingOlder: true }));
     try {
-      const page = await this.fetchHistoryPage(this.nextBefore);
+      const page = await this.fetchHistoryPage(before);
+      if (!this.reconciliationIsCurrent(generation, "load_older_fetch")) return;
+      this.observePersistedHistory(page.messages, generation, "older");
       this.nextBefore = page.nextBefore;
       this.mergeOlderHistory(page.messages);
-      await this.persistCanonicalWindow();
+      if (!(await this.persistCanonicalWindow(generation))) return;
       // Rebase the complete loaded history window so later authoritative newest-
       // turn repairs cannot reorder an older page behind the live edge.
       this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
@@ -1284,7 +1474,9 @@ export class ChatSession {
     } catch {
       // A failed page is now assumed transient (the cursor itself works), so
       // hasMore stays set and scrolling back to the top retries.
-      this.commit(patch(this.snapshot, { loadingOlder: false }));
+      if (this.reconciliationIsCurrent(generation, "load_older_error")) {
+        this.commit(patch(this.snapshot, { loadingOlder: false }));
+      }
     }
   }
 
@@ -1301,19 +1493,32 @@ export class ChatSession {
   }
 
   /** Fill only the missing newer suffix; never reuse the backward paging cursor. */
-  private async syncForwardHistory(): Promise<void> {
+  private async syncForwardHistory(generation: number): Promise<boolean> {
     let cursor = this.forwardAfter ?? newestDurableMessageId(this.loadedHistoryMessages);
-    if (!cursor) return;
+    if (!cursor) return this.reconciliationIsCurrent(generation, "forward_no_cursor");
     for (let count = 0; count < FORWARD_SYNC_MAX_PAGES; count += 1) {
       const page = await this.fetchForwardPage(cursor);
+      if (!this.reconciliationIsCurrent(generation, "forward_fetch")) return false;
+      this.observePersistedHistory(page.messages, generation, "forward");
       if (page.messages.length === 0) break;
-      this.loadedHistoryMessages = mergeForwardMessages(this.loadedHistoryMessages, page.messages);
       const next = newestDurableMessageId(page.messages);
-      if (!next || next === cursor) break;
+      if (!next || next === cursor) {
+        if (page.hasMore) {
+          emitSyncTelemetry({
+            kind: "protocol_gap",
+            conversationId: this.conversationId,
+            generation,
+            reason: "forward_cursor_no_progress",
+          });
+        }
+        break;
+      }
+      this.loadedHistoryMessages = mergeForwardMessages(this.loadedHistoryMessages, page.messages);
       cursor = next;
       this.forwardAfter = next;
       if (!page.hasMore) break;
     }
+    return this.reconciliationIsCurrent(generation, "forward_complete");
   }
 
   /** One page of history, oldest-first, with the cursor to the next older page. */
@@ -1428,14 +1633,15 @@ export class ChatSession {
    * rows are deliberately outside the accumulator, so project() retains them
    * and retires echoed users by OTID.
    */
-  private reconcileAuthoritativeHistory(messages: readonly unknown[]): boolean {
+  private reconcileAuthoritativeHistory(messages: readonly unknown[], generation: number): boolean {
+    if (!this.reconciliationIsCurrent(generation, "authoritative_reconcile_before")) return false;
     this.mergeLatestHistory(messages);
     const authoritative = rebuildAuthoritativeTranscript(this.loadedHistoryMessages);
     if (!authoritativeRowsCoverCurrent(this.accumulator.rows(), authoritative.rows())) return false;
+    if (!this.reconciliationIsCurrent(generation, "authoritative_reconcile_apply")) return false;
     this.accumulator = authoritative;
     this.captureHistoryTimestamps(this.loadedHistoryMessages);
     this.commit(this.project(this.snapshot));
-    void this.persistCanonicalWindow().catch(() => {});
     return true;
   }
 
@@ -1447,17 +1653,19 @@ export class ChatSession {
   private async reconcileAuthoritativeHistoryIfStillIdle(
     session: LettaCodeSession,
     messages: readonly unknown[],
+    generation: number,
   ): Promise<boolean> {
-    if (this.closed || this.session !== session) return false;
+    if (!this.reconciliationIsCurrent(generation, "authoritative_status_before") || this.session !== session) return false;
     const status = await session.getDeviceStatus();
-    if (this.closed || this.session !== session) return false;
+    if (!this.reconciliationIsCurrent(generation, "authoritative_status_after") || this.session !== session) return false;
 
     const next = this.applyDeviceStatus(this.project(this.snapshot), status);
     this.commit(next);
     const hasPendingApprovals = (status.pendingControlRequests?.length ?? 0) > 0 || next.approvals.length > 0;
     if (status.isProcessing || hasPendingApprovals || next.run !== "idle") return false;
 
-    return this.reconcileAuthoritativeHistory(messages);
+    if (!this.reconcileAuthoritativeHistory(messages, generation)) return false;
+    return this.persistCanonicalWindow(generation);
   }
 
   // A healthy live turn is never rebuilt or merge-rebased from persisted
@@ -1465,16 +1673,14 @@ export class ChatSession {
   // after the executing device reports idle; bounded retries cover persistence
   // lag without perturbing a healthy live result.
 
-  private async consume(): Promise<void> {
-    const session = this.session;
-    if (!session) return;
+  private async consume(session: LettaCodeSession, streamGeneration: number): Promise<void> {
     try {
       // The SDK stream covers one turn and returns after its result. Open the
       // next stream immediately so later sends use the same live session.
-      while (!this.closed && this.session === session) {
+      while (!this.closed && this.session === session && streamGeneration === this.streamGeneration) {
         let received = false;
         for await (const message of session.stream()) {
-          if (this.closed) break;
+          if (this.closed || this.session !== session || streamGeneration !== this.streamGeneration) break;
           received = true;
           this.ingest(message as SDKMessage);
         }
@@ -1486,7 +1692,7 @@ export class ChatSession {
     } catch (e) {
       // A deliberately replaced transport can finish/error after its successor
       // is already live. Never let that stale callback poison the new session.
-      if (this.closed || this.session !== session) return;
+      if (this.closed || this.session !== session || streamGeneration !== this.streamGeneration) return;
       this.sessionDead = true;
       const detail = e instanceof Error && e.message ? e.message : "Stream ended unexpectedly.";
       this.settleActivityWaiters(e instanceof Error ? e : new Error(detail));
@@ -1520,6 +1726,11 @@ export class ChatSession {
    */
   private ingest(message: SDKMessage): void {
     this.settleActivityWaiters();
+    const observation = this.protocolObserver.observe(message);
+    for (const event of observation.events) {
+      emitSyncTelemetry({ ...event, conversationId: this.conversationId });
+    }
+    // The observer never replaces SDK replay/accumulation behavior.
     if (message.type === "stream_event") {
       this.pendingStream.push(message);
       if (this.flushTimer) return;
@@ -1528,7 +1739,19 @@ export class ChatSession {
       this.armFlushTimer();
       return;
     }
-    this.commit(this.reduce(this.drainStreamBuffer(this.snapshot), message));
+    const next = this.reduce(this.drainStreamBuffer(this.snapshot), message);
+    this.commit(next);
+    // A terminal run result is the protocol-level signal to converge persisted
+    // history. Do not wait for a reconnect or a guessed persistence delay.
+    if (
+      message.type === "result" &&
+      !this.closed &&
+      this.session &&
+      next.run === "idle" &&
+      next.connection !== "reconnecting"
+    ) {
+      this.startAuthoritativeCatchUp(this.session, this.reconciliationGeneration);
+    }
   }
 
   private armFlushTimer(): void {
@@ -1585,9 +1808,13 @@ export class ChatSession {
     // has an actual USER row with that OTID; assistant/reasoning/tool activity
     // must never make the user's just-sent message disappear.
     const seenOtids = userRowOtids(rows);
-    this.localRows = this.localRows.filter(
-      ({ item }) => !(item.kind === "user" && this.echoOtids.has(item.id) && seenOtids.has(item.id)),
-    );
+    const acknowledgedEchoes = new Set<string>();
+    this.localRows = this.localRows.filter(({ item }) => {
+      const acknowledged = item.kind === "user" && this.echoOtids.has(item.id) && seenOtids.has(item.id);
+      if (acknowledged) acknowledgedEchoes.add(item.id);
+      return !acknowledged;
+    });
+    for (const otid of acknowledgedEchoes) this.echoOtids.delete(otid);
 
     const transcript: TranscriptItem[] = [];
     let placed = 0;
