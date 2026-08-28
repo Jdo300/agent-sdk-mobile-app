@@ -345,7 +345,7 @@ export default function ChatScreen() {
       if (!uri) throw new Error("The recording could not be saved.");
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
-      const text = await transcribeVoice(uri, token);
+      const text = await transcribeVoice(uri, token, activeProfile.url);
       if (voiceAutoSend) {
         const session = sessionRef.current;
         if (!session) throw new Error("Milo's chat session is not ready yet.");
@@ -398,7 +398,7 @@ export default function ChatScreen() {
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (requestId !== voicePlayRequestRef.current) return;
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
-      const player = createAudioPlayer(speechSource(text, token), { updateInterval: 150 });
+      const player = createAudioPlayer(speechSource(text, token, activeProfile.url), { updateInterval: 150 });
       if (requestId !== voicePlayRequestRef.current) {
         player.remove();
         return;

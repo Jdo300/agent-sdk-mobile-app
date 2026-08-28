@@ -22,7 +22,7 @@ import { SyntaxCode } from "./SyntaxCode";
 import { setViewerPayload } from "../../lib/viewerPayload";
 import { getSecret } from "../../lib/profiles/profiles";
 import { useProfiles } from "../../lib/profiles/ProfilesContext";
-import { VOICE_BASE_URL } from "../../lib/voice";
+import { voiceHttpBaseUrl } from "../../lib/voiceTransport";
 
 // ── Fence-aware block splitting (paseo packages/app/src/utils) ──────────────
 
@@ -208,8 +208,9 @@ function MarkdownImage({ uri, alt, style }: { uri: string; alt?: string; style: 
     return () => { live = false; };
   }, [activeProfile, localPath]);
 
-  const resolvedUri = localPath
-    ? `${VOICE_BASE_URL}/voice/image?path=${encodeURIComponent(localPath)}`
+  const voiceBaseUrl = activeProfile ? voiceHttpBaseUrl(activeProfile.url) : null;
+  const resolvedUri = localPath && voiceBaseUrl
+    ? `${voiceBaseUrl}/voice/image?path=${encodeURIComponent(localPath)}`
     : uri;
   const headers = localPath && token ? { Authorization: `Bearer ${token}` } : undefined;
   if (localPath && !token) return null;

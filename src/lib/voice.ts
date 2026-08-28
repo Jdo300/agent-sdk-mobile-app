@@ -1,9 +1,10 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+import { voiceHttpBaseUrl } from "./voiceTransport";
+
 export type VoiceMode = "off" | "tap" | "auto";
 
 const MODE_KEY = "milo.voice.mode.v1";
-export const VOICE_BASE_URL = "http://10.0.0.128:4611";
 export const WHISPER_MODEL = "Systran/faster-whisper-medium.en";
 export const KOKORO_VOICE = "bm_george";
 export const KOKORO_PLAYBACK_RATE = 1.1;
@@ -64,12 +65,13 @@ async function transcriptionText(response: Response): Promise<string> {
   return text.trim();
 }
 
-export async function transcribeVoice(uri: string, token: string): Promise<string> {
+export async function transcribeVoice(uri: string, token: string, serverUrl: string): Promise<string> {
+  const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
   const body = new FormData();
   body.append("model", WHISPER_MODEL);
   body.append("file", { uri, name: "milo-voice.m4a", type: "audio/mp4" } as never);
   const headers = { Authorization: `Bearer ${token}` };
-  const response = await fetch(`${VOICE_BASE_URL}/voice/transcribe`, {
+  const response = await fetch(`${voiceBaseUrl}/voice/transcribe`, {
     method: "POST",
     headers,
     body,
@@ -85,18 +87,19 @@ export async function transcribeVoice(uri: string, token: string): Promise<strin
   const deadline = Date.now() + 15 * 60 * 1000;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 1200));
-    const poll = await fetch(`${VOICE_BASE_URL}/voice/transcribe/${encodeURIComponent(accepted.job_id)}`, { headers });
+    const poll = await fetch(`${voiceBaseUrl}/voice/transcribe/${encodeURIComponent(accepted.job_id)}`, { headers });
     if (poll.status === 202) continue;
     return transcriptionText(poll);
   }
   throw new Error("Voice transcription timed out after 15 minutes.");
 }
 
-export function speechSource(text: string, token: string) {
+export function speechSource(text: string, token: string, serverUrl: string) {
+  const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
   const clipped = text.slice(0, 12000);
   const query = new URLSearchParams({ text: clipped, voice: KOKORO_VOICE });
   return {
-    uri: `${VOICE_BASE_URL}/voice/speech?${query.toString()}`,
+    uri: `${voiceBaseUrl}/voice/speech?${query.toString()}`,
     headers: { Authorization: `Bearer ${token}` },
   };
 }
