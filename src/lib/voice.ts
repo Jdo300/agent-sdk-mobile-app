@@ -107,16 +107,40 @@ export async function transcribeVoice(
     estimate?: boolean;
   };
   if (!accepted.job_id) throw new Error("Voice transcription job was not created.");
-  options?.onProgress?.({
+  let progressAnchor: TranscriptionProgress = {
     progress: accepted.progress ?? 0,
     etaSeconds: accepted.eta_seconds ?? null,
     elapsedSeconds: 0,
     audioDurationSeconds: accepted.audio_duration_seconds ?? options?.durationSeconds ?? null,
     estimated: accepted.estimate ?? true,
-  });
+  };
+  let progressAnchorAt = Date.now();
+  options?.onProgress?.(progressAnchor);
+
+  // Server polling stays deliberately modest, but the UI should feel live.
+  // Between authoritative estimates, advance the same elapsed/ETA model locally
+  // at 10 Hz. Each server poll re-anchors this interpolation so it cannot drift.
+  const progressTicker = options?.onProgress
+    ? setInterval(() => {
+        if (!progressAnchor.estimated || progressAnchor.progress >= 0.95) return;
+        const sinceAnchor = Math.max(0, (Date.now() - progressAnchorAt) / 1000);
+        const anchorElapsed = progressAnchor.elapsedSeconds ?? 0;
+        const anchorEta = progressAnchor.etaSeconds;
+        if (anchorEta === null || anchorEta <= 0) return;
+        const estimatedTotal = Math.max(0.1, anchorElapsed + anchorEta);
+        const elapsed = anchorElapsed + sinceAnchor;
+        options.onProgress?.({
+          ...progressAnchor,
+          progress: Math.min(0.95, Math.max(progressAnchor.progress, (elapsed / estimatedTotal) * 0.95)),
+          etaSeconds: Math.max(0, estimatedTotal - elapsed),
+          elapsedSeconds: elapsed,
+        });
+      }, 100)
+    : null;
 
   const deadline = Date.now() + 15 * 60 * 1000;
-  while (Date.now() < deadline) {
+  try {
+    while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 700));
     const poll = await fetch(`${voiceBaseUrl}/voice/transcribe/${encodeURIComponent(accepted.job_id)}`, { headers });
     if (poll.status === 202) {
@@ -127,13 +151,15 @@ export async function transcribeVoice(
         audio_duration_seconds?: number | null;
         estimate?: boolean;
       };
-      options?.onProgress?.({
+      progressAnchor = {
         progress: status.progress ?? 0,
         etaSeconds: status.eta_seconds ?? null,
         elapsedSeconds: status.elapsed_seconds ?? null,
         audioDurationSeconds: status.audio_duration_seconds ?? options?.durationSeconds ?? null,
         estimated: status.estimate ?? true,
-      });
+      };
+      progressAnchorAt = Date.now();
+      options?.onProgress?.(progressAnchor);
       continue;
     }
     const text = await transcriptionText(poll);
@@ -148,8 +174,11 @@ export async function transcribeVoice(
     // replaces the progress panel with the transcript.
     await new Promise((resolve) => setTimeout(resolve, 180));
     return text;
+    }
+    throw new Error("Voice transcription timed out after 15 minutes.");
+  } finally {
+    if (progressTicker) clearInterval(progressTicker);
   }
-  throw new Error("Voice transcription timed out after 15 minutes.");
 }
 
 export function speechSource(text: string, token: string, serverUrl: string) {
