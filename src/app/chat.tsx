@@ -81,6 +81,7 @@ import {
 } from "../lib/letta/model";
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
 import { pickImages, type Attachment } from "../lib/letta/attachments";
+import { completedAssistantReplies, newCompletedAssistantReplies } from "../lib/voiceEligibility";
 import { getSecret } from "../lib/profiles/profiles";
 import {
   getVoiceMode,
@@ -256,7 +257,7 @@ export default function ChatScreen() {
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
   const voicePlayRequestRef = useRef(0);
-  const autoPlayedVoiceIdsRef = useRef(new Set<string>());
+  const voiceHandledAssistantIdsRef = useRef(new Set<string>());
   const voiceHistorySeededRef = useRef(false);
   const voiceTrackWidthRef = useRef(0);
   const voiceDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -444,7 +445,7 @@ export default function ChatScreen() {
         }
         if (status.didJustFinish) {
           setVoicePlaying(false);
-          scheduleVoiceReplyCollapse(4000);
+          scheduleVoiceReplyCollapse(0);
         }
       });
       player.play();
@@ -1004,64 +1005,63 @@ export default function ChatScreen() {
     };
   }, [running, aborting, voiceRecording, transcribingVoice]);
 
-  const previousRunRef = useRef(snapshot.run);
-  const voiceRunPendingRef = useRef(false);
-  const voiceBaselineAssistantIdRef = useRef<string | null>(null);
   useEffect(() => {
-    const completedAssistants = snapshot.transcript.filter(
-      (item) => item.kind === "assistant" && !item.streaming && !item.interrupted && item.text.trim().length > 0,
-    );
-    const latestCompletedAssistant = completedAssistants[completedAssistants.length - 1];
-    const previous = previousRunRef.current;
-    previousRunRef.current = snapshot.run;
+    const completedAssistants = completedAssistantReplies(snapshot.transcript);
 
-    // Hydration replays historical transcript rows into a fresh screen. They are
-    // display state, not new replies, so they must never trigger auto voice. Seed
-    // the idempotency set from that history before observing live run changes.
+    // Hydration/catch-up replays historical transcript rows into a fresh screen.
+    // Seed those stable ids before observing live completions so opening or
+    // reconnecting a conversation can never make old replies speak again.
     if (snapshot.hydrating) {
-      for (const item of completedAssistants) autoPlayedVoiceIdsRef.current.add(item.id);
+      for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
       return;
     }
     if (!voiceHistorySeededRef.current) {
-      for (const item of completedAssistants) autoPlayedVoiceIdsRef.current.add(item.id);
+      for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
       voiceHistorySeededRef.current = true;
-    }
-
-    // Mark the beginning of a new run and remember the last completed reply that
-    // existed before it. The app-server can report idle a moment before the final
-    // assistant transcript row is marked complete, so do not require both events
-    // to land in the same render.
-    if (previous === "idle" && snapshot.run !== "idle") {
-      voiceRunPendingRef.current = true;
-      voiceBaselineAssistantIdRef.current =
-        latestCompletedAssistant?.kind === "assistant" ? latestCompletedAssistant.id : null;
       return;
     }
-
-    if (!voiceRunPendingRef.current || snapshot.run !== "idle") return;
     if (!voiceModeLoaded) return;
-    if (!latestCompletedAssistant || latestCompletedAssistant.kind !== "assistant") return;
-    if (latestCompletedAssistant.id === voiceBaselineAssistantIdRef.current) return;
 
-    // We now have the completed assistant reply for the run that just ended.
-    // Clear the pending flag only after the new row actually arrives so a small
-    // protocol/transcript timing skew cannot make auto voice silently miss it.
-    voiceRunPendingRef.current = false;
-    const speakableText = prepareSpeechText(latestCompletedAssistant.text);
+    // Voice follows completed assistant prose, not the run lifecycle. Milo can
+    // emit a useful assistant message and then continue into more tool calls;
+    // that completed message is independently voice-eligible as soon as it lands.
+    const newlyCompleted = newCompletedAssistantReplies(
+      snapshot.transcript,
+      voiceHandledAssistantIdsRef.current,
+    );
+    if (newlyCompleted.length === 0) return;
+    for (const item of newlyCompleted) voiceHandledAssistantIdsRef.current.add(item.id);
+
+    if (voiceMode === "off") return;
+
+    // A reconnect/catch-up can deliver several newly completed rows in one
+    // render. Surface only the newest rather than firing a burst of stale audio;
+    // under normal live streaming there is one newly completed row at a time.
+    const reply = newlyCompleted[newlyCompleted.length - 1];
+    const speakableText = prepareSpeechText(reply.text);
+    clearVoiceDismissTimer();
     retireVoicePlayer();
     if (!speakableText) {
       setVoiceReply(null);
       return;
     }
-    setVoiceReply({ id: latestCompletedAssistant.id, text: speakableText });
-    if (voiceMode !== "auto") scheduleVoiceReplyCollapse(15000);
-    if (voiceMode === "auto" && !autoPlayedVoiceIdsRef.current.has(latestCompletedAssistant.id)) {
-      // The run/transcript protocol can briefly revisit the same completed row.
-      // Auto voice is a side effect, so make it idempotent by the row's stable ID.
-      autoPlayedVoiceIdsRef.current.add(latestCompletedAssistant.id);
+
+    setVoiceReply({ id: reply.id, text: speakableText });
+    if (voiceMode === "auto") {
       void playVoiceText(speakableText);
+    } else {
+      scheduleVoiceReplyCollapse(15000);
     }
-  }, [snapshot.run, snapshot.transcript, voiceMode, voiceModeLoaded, playVoiceText, retireVoicePlayer, scheduleVoiceReplyCollapse]);
+  }, [
+    snapshot.hydrating,
+    snapshot.transcript,
+    voiceMode,
+    voiceModeLoaded,
+    playVoiceText,
+    retireVoicePlayer,
+    clearVoiceDismissTimer,
+    scheduleVoiceReplyCollapse,
+  ]);
 
   const refreshAgentSecrets = useCallback(async () => {
     const session = sessionRef.current;
