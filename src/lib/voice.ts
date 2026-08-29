@@ -4,6 +4,14 @@ import { voiceHttpBaseUrl } from "./voiceTransport";
 
 export type VoiceMode = "off" | "tap" | "auto";
 
+export type TranscriptionProgress = {
+  progress: number;
+  etaSeconds: number | null;
+  elapsedSeconds: number | null;
+  audioDurationSeconds: number | null;
+  estimated: boolean;
+};
+
 const MODE_KEY = "milo.voice.mode.v1";
 export const WHISPER_MODEL = "Systran/faster-whisper-medium.en";
 export const KOKORO_VOICE = "bm_george";
@@ -65,12 +73,22 @@ async function transcriptionText(response: Response): Promise<string> {
   return text.trim();
 }
 
-export async function transcribeVoice(uri: string, token: string, serverUrl: string): Promise<string> {
+export async function transcribeVoice(
+  uri: string,
+  token: string,
+  serverUrl: string,
+  options?: { durationSeconds?: number; onProgress?: (progress: TranscriptionProgress) => void },
+): Promise<string> {
   const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
   const body = new FormData();
   body.append("model", WHISPER_MODEL);
   body.append("file", { uri, name: "milo-voice.m4a", type: "audio/mp4" } as never);
-  const headers = { Authorization: `Bearer ${token}` };
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    ...(options?.durationSeconds && options.durationSeconds > 0
+      ? { "X-Audio-Duration-Seconds": String(options.durationSeconds) }
+      : {}),
+  };
   const response = await fetch(`${voiceBaseUrl}/voice/transcribe`, {
     method: "POST",
     headers,
@@ -81,15 +99,55 @@ export async function transcribeVoice(uri: string, token: string, serverUrl: str
   // background job. This avoids holding a Cloudflare HTTP request open for the
   // entire Whisper run on long voice messages. Older gateways still work too.
   if (response.status !== 202) return transcriptionText(response);
-  const accepted = (await response.json()) as { job_id?: string };
+  const accepted = (await response.json()) as {
+    job_id?: string;
+    progress?: number;
+    eta_seconds?: number;
+    audio_duration_seconds?: number | null;
+    estimate?: boolean;
+  };
   if (!accepted.job_id) throw new Error("Voice transcription job was not created.");
+  options?.onProgress?.({
+    progress: accepted.progress ?? 0,
+    etaSeconds: accepted.eta_seconds ?? null,
+    elapsedSeconds: 0,
+    audioDurationSeconds: accepted.audio_duration_seconds ?? options?.durationSeconds ?? null,
+    estimated: accepted.estimate ?? true,
+  });
 
   const deadline = Date.now() + 15 * 60 * 1000;
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+    await new Promise((resolve) => setTimeout(resolve, 700));
     const poll = await fetch(`${voiceBaseUrl}/voice/transcribe/${encodeURIComponent(accepted.job_id)}`, { headers });
-    if (poll.status === 202) continue;
-    return transcriptionText(poll);
+    if (poll.status === 202) {
+      const status = (await poll.json()) as {
+        progress?: number;
+        eta_seconds?: number;
+        elapsed_seconds?: number;
+        audio_duration_seconds?: number | null;
+        estimate?: boolean;
+      };
+      options?.onProgress?.({
+        progress: status.progress ?? 0,
+        etaSeconds: status.eta_seconds ?? null,
+        elapsedSeconds: status.elapsed_seconds ?? null,
+        audioDurationSeconds: status.audio_duration_seconds ?? options?.durationSeconds ?? null,
+        estimated: status.estimate ?? true,
+      });
+      continue;
+    }
+    const text = await transcriptionText(poll);
+    options?.onProgress?.({
+      progress: 1,
+      etaSeconds: 0,
+      elapsedSeconds: null,
+      audioDurationSeconds: options?.durationSeconds ?? null,
+      estimated: false,
+    });
+    // Give the completed 100% state one visible frame before the composer
+    // replaces the progress panel with the transcript.
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    return text;
   }
   throw new Error("Voice transcription timed out after 15 minutes.");
 }

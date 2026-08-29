@@ -92,6 +92,7 @@ import {
   prepareSpeechText,
   voiceModeLabel,
   type VoiceMode,
+  type TranscriptionProgress,
 } from "../lib/voice";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
@@ -245,6 +246,7 @@ export default function ChatScreen() {
   const [voiceAutoSendLoaded, setVoiceAutoSendLoaded] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [transcribingVoice, setTranscribingVoice] = useState(false);
+  const [transcriptionProgress, setTranscriptionProgress] = useState<TranscriptionProgress | null>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceReply, setVoiceReply] = useState<{ id: string; text: string } | null>(null);
   const [voicePlaying, setVoicePlaying] = useState(false);
@@ -341,11 +343,15 @@ export default function ChatScreen() {
       if (recorderState.isRecording) await recorder.stop();
       setVoiceRecording(false);
       setTranscribingVoice(true);
+      setTranscriptionProgress({ progress: 0, etaSeconds: null, elapsedSeconds: 0, audioDurationSeconds: recorderState.durationMillis / 1000, estimated: true });
       const uri = recorder.uri;
       if (!uri) throw new Error("The recording could not be saved.");
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
-      const text = await transcribeVoice(uri, token, activeProfile.url);
+      const text = await transcribeVoice(uri, token, activeProfile.url, {
+        durationSeconds: recorderState.durationMillis / 1000,
+        onProgress: setTranscriptionProgress,
+      });
       if (voiceAutoSend) {
         const session = sessionRef.current;
         if (!session) throw new Error("Milo's chat session is not ready yet.");
@@ -361,6 +367,7 @@ export default function ChatScreen() {
       setVoiceError(error instanceof Error ? error.message : "Voice transcription failed.");
     } finally {
       setTranscribingVoice(false);
+      setTranscriptionProgress(null);
       await setAudioModeAsync({ allowsRecording: false });
     }
   }, [activeProfile, recorder, recorderState.isRecording, voiceAutoSend]);
@@ -1432,51 +1439,81 @@ export default function ChatScreen() {
           ) : null}
           {voiceRecording || transcribingVoice ? (
             <View style={[styles.voiceRecorderPanel, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}>
-              <Text role="bodyEm" tone="accent">{transcribingVoice ? "Transcribing…" : "Listening…"}</Text>
-              <Text role="title">{Math.floor(recorderState.durationMillis / 60000).toString().padStart(2, "0")}:{Math.floor((recorderState.durationMillis % 60000) / 1000).toString().padStart(2, "0")}</Text>
-              <Touchable
-                accessibilityRole="button"
-                accessibilityLabel={`Auto-send voice transcription ${voiceAutoSend ? "on" : "off"}`}
-                onPress={toggleVoiceAutoSend}
-                disabled={!voiceAutoSendLoaded || transcribingVoice}
-                style={[
-                  styles.voiceAutoSendPill,
-                  {
-                    backgroundColor: voiceAutoSend ? colors.bubble : colors.surface,
-                    borderColor: voiceAutoSend ? colors.accent : colors.surfaceEdge,
-                    opacity: voiceAutoSendLoaded ? 1 : 0.5,
-                  },
-                ]}
-              >
-                <StatusDot tone={voiceAutoSend ? "run" : "idle"} />
-                <Text role="sub" tone={voiceAutoSend ? "accent" : undefined}>Auto-send</Text>
-              </Touchable>
-              <View style={styles.waveform}>
-                {Array.from({ length: 24 }, (_, index) => {
-                  const level = Math.max(0.15, Math.min(1, ((recorderState.metering ?? -52) + 60) / 42));
-                  const shape = 0.35 + ((index * 7) % 11) / 16;
-                  return <View key={index} style={[styles.waveBar, { backgroundColor: colors.accent, height: 8 + 30 * level * shape }]} />;
-                })}
-              </View>
-              <View style={styles.voiceRecorderActions}>
-                <Touchable
-                  accessibilityRole="button"
-                  accessibilityLabel="Cancel voice recording"
-                  onPress={() => void cancelVoiceRecording()}
-                  style={[styles.voiceActionIcon, { backgroundColor: colors.bubble, borderColor: colors.surfaceEdge }]}
-                >
-                  <CloseIcon color={colors.ink2} />
-                </Touchable>
-                <Touchable
-                  accessibilityRole="button"
-                  accessibilityLabel="Use voice recording"
-                  disabled={transcribingVoice}
-                  onPress={() => void finishVoiceRecording()}
-                  style={[styles.voiceActionIcon, { backgroundColor: colors.accent, borderColor: colors.accent, opacity: transcribingVoice ? 0.5 : 1 }]}
-                >
-                  <CheckIcon color="#FFFFFF" />
-                </Touchable>
-              </View>
+              {transcribingVoice ? (
+                <>
+                  <Text role="bodyEm" tone="accent">Transcribing…</Text>
+                  <Text role="title">{Math.round((transcriptionProgress?.progress ?? 0) * 100)}%</Text>
+                  <View
+                    accessibilityRole="progressbar"
+                    accessibilityValue={{ min: 0, max: 100, now: Math.round((transcriptionProgress?.progress ?? 0) * 100) }}
+                    style={[styles.transcriptionTrack, { backgroundColor: colors.surfaceEdge }]}
+                  >
+                    <View
+                      style={[
+                        styles.transcriptionFill,
+                        {
+                          backgroundColor: colors.accent,
+                          width: `${Math.max(0, Math.min(100, (transcriptionProgress?.progress ?? 0) * 100))}%`,
+                        },
+                      ]}
+                    />
+                  </View>
+                  <Text role="sub" ink={2}>
+                    {transcriptionProgress?.etaSeconds === null || transcriptionProgress?.etaSeconds === undefined
+                      ? "Estimating time remaining…"
+                      : transcriptionProgress.etaSeconds > 0
+                        ? `Estimated ~${Math.max(1, Math.ceil(transcriptionProgress.etaSeconds))} sec remaining`
+                        : "Finishing transcription…"}
+                  </Text>
+                </>
+              ) : (
+                <>
+                  <Text role="bodyEm" tone="accent">Listening…</Text>
+                  <Text role="title">{Math.floor(recorderState.durationMillis / 60000).toString().padStart(2, "0")}:{Math.floor((recorderState.durationMillis % 60000) / 1000).toString().padStart(2, "0")}</Text>
+                  <Touchable
+                    accessibilityRole="button"
+                    accessibilityLabel={`Auto-send voice transcription ${voiceAutoSend ? "on" : "off"}`}
+                    onPress={toggleVoiceAutoSend}
+                    disabled={!voiceAutoSendLoaded}
+                    style={[
+                      styles.voiceAutoSendPill,
+                      {
+                        backgroundColor: voiceAutoSend ? colors.bubble : colors.surface,
+                        borderColor: voiceAutoSend ? colors.accent : colors.surfaceEdge,
+                        opacity: voiceAutoSendLoaded ? 1 : 0.5,
+                      },
+                    ]}
+                  >
+                    <StatusDot tone={voiceAutoSend ? "run" : "idle"} />
+                    <Text role="sub" tone={voiceAutoSend ? "accent" : undefined}>Auto-send</Text>
+                  </Touchable>
+                  <View style={styles.waveform}>
+                    {Array.from({ length: 24 }, (_, index) => {
+                      const level = Math.max(0.15, Math.min(1, ((recorderState.metering ?? -52) + 60) / 42));
+                      const shape = 0.35 + ((index * 7) % 11) / 16;
+                      return <View key={index} style={[styles.waveBar, { backgroundColor: colors.accent, height: 8 + 30 * level * shape }]} />;
+                    })}
+                  </View>
+                  <View style={styles.voiceRecorderActions}>
+                    <Touchable
+                      accessibilityRole="button"
+                      accessibilityLabel="Cancel voice recording"
+                      onPress={() => void cancelVoiceRecording()}
+                      style={[styles.voiceActionIcon, { backgroundColor: colors.bubble, borderColor: colors.surfaceEdge }]}
+                    >
+                      <CloseIcon color={colors.ink2} />
+                    </Touchable>
+                    <Touchable
+                      accessibilityRole="button"
+                      accessibilityLabel="Use voice recording"
+                      onPress={() => void finishVoiceRecording()}
+                      style={[styles.voiceActionIcon, { backgroundColor: colors.accent, borderColor: colors.accent }]}
+                    >
+                      <CheckIcon color="#FFFFFF" />
+                    </Touchable>
+                  </View>
+                </>
+              )}
             </View>
           ) : null}
           {voiceMode !== "off" && voiceReply && !voiceRecording ? (
@@ -1951,6 +1988,8 @@ const styles = StyleSheet.create({
   voiceModeContent: { flexDirection: "row", alignItems: "center", gap: 7 },
   micButton: { width: 44, height: 44, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", marginLeft: space.sm },
   voiceRecorderPanel: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.sheet, paddingHorizontal: space.lg, paddingVertical: space.md, gap: space.sm, alignItems: "center" },
+  transcriptionTrack: { width: "100%", height: 8, borderRadius: 4, overflow: "hidden" },
+  transcriptionFill: { height: "100%", borderRadius: 4 },
   waveform: { height: 48, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3, width: "100%" },
   waveBar: { width: 3, borderRadius: 2 },
   voiceRecorderActions: { flexDirection: "row", gap: space.md, justifyContent: "center", paddingTop: 2 },
