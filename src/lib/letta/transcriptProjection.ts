@@ -109,3 +109,14 @@ export function newestTextKey(rows: readonly TranscriptRow[]): string | null {
   }
   return null;
 }
+
+/**
+ * Text is actively streaming only while a text row is the transcript's live edge.
+ * Once a tool row arrives after assistant prose, that prose is complete even if
+ * the overall Letta run continues. Treating the newest text anywhere in the run
+ * as live keeps finished assistant messages falsely streaming through tool work.
+ */
+export function liveTextKeyAtEdge(rows: readonly TranscriptRow[]): string | null {
+  const row = rows[rows.length - 1];
+  return row && (row.kind === "assistant" || row.kind === "reasoning") ? row.key : null;
+}

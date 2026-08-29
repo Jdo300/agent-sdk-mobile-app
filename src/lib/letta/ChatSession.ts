@@ -25,7 +25,7 @@ import { getConversationModel, getConversationStaticDiagnostics, isAuthError, li
 import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode, type ToolStatus, type TranscriptItem } from "./model";
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
-import { newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
+import { liveTextKeyAtEdge, newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import { authoritativeRowsCoverCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
 import { isAuthoritativeCatchUpCurrent } from "./authoritativeCatchUp";
 import {
@@ -1786,7 +1786,7 @@ export class ChatSession {
   private project(snapshot: ChatSnapshot): ChatSnapshot {
     const rows = this.accumulator.rows();
     const running = snapshot.run === "running" || snapshot.run === "awaiting_approval";
-    const liveKey = running ? newestTextKey(rows) : null;
+    const liveKey = running ? liveTextKeyAtEdge(rows) : null;
     this.recordTimings(rows, liveKey);
 
     const state: ProjectionState = {

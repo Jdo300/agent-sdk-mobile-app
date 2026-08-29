@@ -82,6 +82,10 @@ export async function transcribeVoice(
   const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
   const body = new FormData();
   body.append("model", WHISPER_MODEL);
+  // Speaches can stream completed Whisper segments over SSE. The voice gateway
+  // consumes those milestones server-side for real progress/ETA updates while
+  // preserving Bloop's simple asynchronous job API.
+  body.append("stream", "true");
   body.append("file", { uri, name: "milo-voice.m4a", type: "audio/mp4" } as never);
   const headers = {
     Authorization: `Bearer ${token}`,

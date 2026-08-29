@@ -7,7 +7,7 @@
 import { describe, expect, it } from "bun:test";
 
 import type { TranscriptRow } from "@letta-ai/letta-agent-sdk/client";
-import { newestTextKey, projectRow, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
+import { liveTextKeyAtEdge, newestTextKey, projectRow, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import type { ToolItem, ToolStatus } from "./model";
 
 const base: ProjectionState = {
@@ -102,5 +102,15 @@ describe("transcript projection", () => {
   it("finds the newest text row, ignoring tool rows after it", () => {
     expect(newestTextKey([text("assistant", "a1", "x"), tool("t1", "complete")])).toBe("a1");
     expect(newestTextKey([tool("t1", "complete")])).toBeNull();
+  });
+
+  it("stops marking assistant prose live once tool work reaches the edge", () => {
+    const rows = [text("assistant", "a1", "done"), tool("t1", "ready")];
+    expect(newestTextKey(rows)).toBe("a1");
+    expect(liveTextKeyAtEdge(rows)).toBeNull();
+  });
+
+  it("keeps the current assistant row live while text is actually at the edge", () => {
+    expect(liveTextKeyAtEdge([text("assistant", "a1", "still arriving")])).toBe("a1");
   });
 });
