@@ -184,12 +184,14 @@ const TranscriptRow = memo(function TranscriptRow({
   onToolPress,
   onErrorRetry,
   onToggleGroup,
+  onAssistantReplay,
 }: {
   item: TranscriptRowItem;
   onUserRetry?: (id: string) => void;
   onToolPress?: (id: string) => void;
   onErrorRetry?: () => void;
   onToggleGroup?: (id: string) => void;
+  onAssistantReplay?: (id: string, text: string) => void;
 }) {
   switch (item.kind) {
     case "toolGroup":
@@ -199,7 +201,7 @@ const TranscriptRow = memo(function TranscriptRow({
     case "user":
       return <UserBubble item={item} onRetry={onUserRetry ? () => onUserRetry(item.id) : undefined} />;
     case "assistant":
-      return <AssistantBlock item={item} />;
+      return <AssistantBlock item={item} onVoiceReplay={onAssistantReplay && !item.streaming && !item.interrupted ? () => onAssistantReplay(item.id, item.text) : undefined} />;
     case "reasoning":
       return <ReasoningRow item={item} />;
     case "tool":
@@ -257,6 +259,7 @@ export default function ChatScreen() {
   const autoPlayedVoiceIdsRef = useRef(new Set<string>());
   const voiceHistorySeededRef = useRef(false);
   const voiceTrackWidthRef = useRef(0);
+  const voiceDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 100);
 
@@ -270,6 +273,7 @@ export default function ChatScreen() {
       setVoiceAutoSendLoaded(true);
     }).catch(() => setVoiceAutoSendLoaded(true));
     return () => {
+      if (voiceDismissTimerRef.current) clearTimeout(voiceDismissTimerRef.current);
       voicePlayRequestRef.current += 1;
       voicePlayerSubRef.current?.remove();
       try { voicePlayerRef.current?.pause(); } catch { /* already released */ }
@@ -293,16 +297,37 @@ export default function ChatScreen() {
     setVoiceProgress({ current: 0, duration: 0 });
   }, []);
 
+  const clearVoiceDismissTimer = useCallback(() => {
+    if (voiceDismissTimerRef.current) clearTimeout(voiceDismissTimerRef.current);
+    voiceDismissTimerRef.current = null;
+  }, []);
+
+  const collapseVoiceReply = useCallback(() => {
+    clearVoiceDismissTimer();
+    retireVoicePlayer();
+    setVoiceReply(null);
+  }, [clearVoiceDismissTimer, retireVoicePlayer]);
+
+  const scheduleVoiceReplyCollapse = useCallback((delayMs: number) => {
+    clearVoiceDismissTimer();
+    voiceDismissTimerRef.current = setTimeout(() => {
+      voiceDismissTimerRef.current = null;
+      retireVoicePlayer();
+      setVoiceReply(null);
+    }, delayMs);
+  }, [clearVoiceDismissTimer, retireVoicePlayer]);
+
   const cycleVoiceMode = useCallback(() => {
     const next = nextVoiceMode(voiceMode);
     setVoiceModeState(next);
     void persistVoiceMode(next);
     if (next === "off") {
+      clearVoiceDismissTimer();
       retireVoicePlayer();
       setVoiceReply(null);
     }
     haptic.tap();
-  }, [voiceMode, retireVoicePlayer]);
+  }, [voiceMode, retireVoicePlayer, clearVoiceDismissTimer]);
 
   const toggleVoiceAutoSend = useCallback(() => {
     const next = !voiceAutoSend;
@@ -382,6 +407,7 @@ export default function ChatScreen() {
 
   const playVoiceText = useCallback(async (text: string) => {
     if (!activeProfile || !text.trim()) return;
+    clearVoiceDismissTimer();
 
     // A voice start has async setup work before AVPlayer can be created. Retire
     // the current player immediately and invalidate any older start still in
@@ -416,7 +442,10 @@ export default function ChatScreen() {
         if (status.duration > 0) {
           setVoiceProgress({ current: status.currentTime || 0, duration: status.duration });
         }
-        if (status.didJustFinish) setVoicePlaying(false);
+        if (status.didJustFinish) {
+          setVoicePlaying(false);
+          scheduleVoiceReplyCollapse(4000);
+        }
       });
       player.play();
       setVoicePlaying(true);
@@ -425,9 +454,10 @@ export default function ChatScreen() {
       setVoicePlaying(false);
       setVoiceError(error instanceof Error ? error.message : "Voice playback failed.");
     }
-  }, [activeProfile, retireVoicePlayer]);
+  }, [activeProfile, retireVoicePlayer, clearVoiceDismissTimer, scheduleVoiceReplyCollapse]);
 
   const toggleVoicePlayback = useCallback(() => {
+    clearVoiceDismissTimer();
     const player = voicePlayerRef.current;
     if (player) {
       if (player.playing) {
@@ -457,7 +487,7 @@ export default function ChatScreen() {
       return;
     }
     if (voiceReply) void playVoiceText(voiceReply.text);
-  }, [voiceReply, voiceProgress.duration, playVoiceText]);
+  }, [voiceReply, voiceProgress.duration, playVoiceText, clearVoiceDismissTimer]);
 
   // Sample the native player's authoritative state for as long as the card has
   // a player. This avoids an early non-playing load event freezing the React
@@ -474,6 +504,7 @@ export default function ChatScreen() {
   }, [voiceReply]);
 
   const seekVoiceReply = useCallback((fraction: number) => {
+    clearVoiceDismissTimer();
     const player = voicePlayerRef.current;
     const duration = player?.duration || voiceProgress.duration;
     if (!player || !duration || !Number.isFinite(duration)) return;
@@ -481,12 +512,9 @@ export default function ChatScreen() {
     const nextTime = duration * clamped;
     setVoiceProgress({ current: nextTime, duration });
     void player.seekTo(nextTime);
-  }, [voiceProgress.duration]);
+  }, [voiceProgress.duration, clearVoiceDismissTimer]);
 
-  const dismissVoiceReply = useCallback(() => {
-    retireVoicePlayer();
-    setVoiceReply(null);
-  }, [retireVoicePlayer]);
+  const dismissVoiceReply = collapseVoiceReply;
   const attach = useCallback(async () => {
     haptic.tap();
     const picked = await pickImages();
@@ -1026,13 +1054,14 @@ export default function ChatScreen() {
       return;
     }
     setVoiceReply({ id: latestCompletedAssistant.id, text: speakableText });
+    if (voiceMode !== "auto") scheduleVoiceReplyCollapse(15000);
     if (voiceMode === "auto" && !autoPlayedVoiceIdsRef.current.has(latestCompletedAssistant.id)) {
       // The run/transcript protocol can briefly revisit the same completed row.
       // Auto voice is a side effect, so make it idempotent by the row's stable ID.
       autoPlayedVoiceIdsRef.current.add(latestCompletedAssistant.id);
       void playVoiceText(speakableText);
     }
-  }, [snapshot.run, snapshot.transcript, voiceMode, voiceModeLoaded, playVoiceText, retireVoicePlayer]);
+  }, [snapshot.run, snapshot.transcript, voiceMode, voiceModeLoaded, playVoiceText, retireVoicePlayer, scheduleVoiceReplyCollapse]);
 
   const refreshAgentSecrets = useCallback(async () => {
     const session = sessionRef.current;
@@ -1179,6 +1208,15 @@ export default function ChatScreen() {
     void sessionRef.current?.reconnect();
   }, []);
 
+  const onAssistantReplay = useCallback((id: string, markdown: string) => {
+    const text = prepareSpeechText(markdown);
+    if (!text) return;
+    clearVoiceDismissTimer();
+    retireVoicePlayer();
+    setVoiceReply({ id, text });
+    void playVoiceText(text);
+  }, [clearVoiceDismissTimer, retireVoicePlayer, playVoiceText]);
+
   // Stable renderItem keeps TranscriptRow's memo effective across flushes.
   const renderItem = useCallback(
     ({ item }: { item: TranscriptRowItem }) => (
@@ -1188,9 +1226,10 @@ export default function ChatScreen() {
         onToolPress={onToolPress}
         onErrorRetry={onErrorRetry}
         onToggleGroup={onToggleGroup}
+        onAssistantReplay={voiceMode !== "off" ? onAssistantReplay : undefined}
       />
     ),
-    [onUserRetry, onToolPress, onErrorRetry, onToggleGroup],
+    [onUserRetry, onToolPress, onErrorRetry, onToggleGroup, voiceMode, onAssistantReplay],
   );
 
   // Between send-accepted and the first streamed token there is no transcript

@@ -163,31 +163,42 @@ function Caret() {
   );
 }
 
-export const AssistantBlock = memo(function AssistantBlock({ item }: { item: AssistantItem }) {
+export const AssistantBlock = memo(function AssistantBlock({ item, onVoiceReplay }: { item: AssistantItem; onVoiceReplay?: () => void }) {
   const { copied, copyText } = useCopyFeedback(item.text);
   return (
-    <Touchable
-      accessibilityRole="none"
-      accessibilityHint="Long press for copy options"
-      // Copy only once the text is final — mid-stream it would be a torn read.
-      onLongPress={item.streaming ? undefined : () => showCopyMenu(item.text, copyText)}
-      scaleOnPress={false}
-      style={styles.assistant}
-    >
-      <Markdown text={item.text} />
-      {item.streaming ? <Caret /> : null}
-      {item.interrupted ? (
-        <Text role="sub" ink={3} style={styles.interrupted}>
-          Stopped
-        </Text>
+    <View style={styles.assistant}>
+      <Touchable
+        accessibilityRole="none"
+        accessibilityHint="Long press for copy options"
+        // Copy only once the text is final — mid-stream it would be a torn read.
+        onLongPress={item.streaming ? undefined : () => showCopyMenu(item.text, copyText)}
+        scaleOnPress={false}
+      >
+        <Markdown text={item.text} />
+        {item.streaming ? <Caret /> : null}
+        {item.interrupted ? (
+          <Text role="sub" ink={3} style={styles.interrupted}>
+            Stopped
+          </Text>
+        ) : null}
+        {copied ? (
+          <Text role="sub" ink={3}>
+            Copied
+          </Text>
+        ) : null}
+        {!item.streaming ? <Timestamp value={item.occurredAt} /> : null}
+      </Touchable>
+      {onVoiceReplay ? (
+        <Touchable
+          accessibilityRole="button"
+          accessibilityLabel="Play this Milo reply"
+          onPress={onVoiceReplay}
+          style={styles.voiceReplay}
+        >
+          <Text role="sub" ink={2}>▶ Listen</Text>
+        </Touchable>
       ) : null}
-      {copied ? (
-        <Text role="sub" ink={3}>
-          Copied
-        </Text>
-      ) : null}
-      {!item.streaming ? <Timestamp value={item.occurredAt} /> : null}
-    </Touchable>
+    </View>
   );
 });
 
@@ -463,6 +474,7 @@ const styles = StyleSheet.create({
   timestamp: { opacity: 0.78 },
   timestampRight: { textAlign: "right", paddingRight: space.xs },
   assistant: { gap: 4 },
+  voiceReplay: { alignSelf: "flex-start", paddingVertical: 2, paddingRight: space.sm },
   caret: { borderRadius: 1.5, marginLeft: 2 },
   interrupted: { marginTop: 2 },
   reasoning: { minHeight: 28 },
