@@ -12,3 +12,23 @@ export function isAuthoritativeCatchUpCurrent(
 ): boolean {
   return !closed && activeSession === session && generation === activeGeneration;
 }
+
+
+export function shouldWaitForAuthoritativeIdle(isProcessing: boolean, run: string): boolean {
+  return isProcessing || run !== "idle";
+}
+
+export function shouldReconnectSilentSend(options: {
+  closed: boolean;
+  serialBeforeSend: number;
+  currentSerial: number;
+  run: string;
+  connection: string;
+}): boolean {
+  return (
+    !options.closed &&
+    options.serialBeforeSend === options.currentSerial &&
+    (options.run === "running" || options.run === "awaiting_approval") &&
+    options.connection !== "auth_failed"
+  );
+}

@@ -24,8 +24,14 @@ directly to Local Milo services. Production/public access should use authenticat
   executing device for current status.
 - During reconnect catch-up, persisted history is **not rebased while the run is still
   processing**. This avoids duplicate/out-of-order bubbles when anonymous live text deltas do
-  not share identity with their persisted form. Once the device reports idle, Bloop performs an
-  authoritative tail repair and one delayed second pass for late persistence.
+  not share identity with their persisted form. The catch-up watcher stays alive until the
+  executing device reports idle; it does not assume a replacement viewer socket will replay the
+  original run's terminal event. Once idle, Bloop performs an authoritative tail repair and
+  persistence convergence.
+- After a send is accepted, Bloop also watches for live viewer-stream activity. If the control
+  path accepted the message but the viewer stays silent for several seconds, Bloop replaces that
+  transport and lets authoritative catch-up recover the server-side work instead of leaving a
+  frozen optimistic echo.
 - Optimistic user bubbles are keyed by OTID and disappear only when an actual persisted user row
   with that OTID is present.
 - Streaming tool groups remain structurally stable while a turn is active so rows do not jump

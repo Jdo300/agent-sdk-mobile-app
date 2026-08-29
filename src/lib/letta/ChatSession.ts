@@ -27,7 +27,7 @@ import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
 import { liveTextKeyAtEdge, newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import { authoritativeRowsCoverCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
-import { isAuthoritativeCatchUpCurrent } from "./authoritativeCatchUp";
+import { isAuthoritativeCatchUpCurrent, shouldReconnectSilentSend, shouldWaitForAuthoritativeIdle } from "./authoritativeCatchUp";
 import {
   emitSyncTelemetry,
   inspectPersistedHistory,
@@ -83,6 +83,7 @@ const RECONNECT_RETRY_MAX_MS = 5000;
 const AUTHORITATIVE_CATCHUP_MAX_MS = 30000;
 const AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS = 250;
 const AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS = 4000;
+const SEND_STREAM_ACTIVITY_TIMEOUT_MS = 5000;
 
 /** A transport loss does not imply the server-side run stopped. */
 function preserveRunAcrossTransportLoss(run: ChatSnapshot["run"]): ChatSnapshot["run"] {
@@ -208,6 +209,9 @@ export class ChatSession {
   private reconciliationGeneration = 0;
   private readonly protocolObserver = new ProtocolObserver();
   private streamGeneration = 0;
+  /** Incremented for every message observed on the live viewer stream. */
+  private streamActivitySerial = 0;
+  private sendActivityTimer: ReturnType<typeof setTimeout> | null = null;
   private authoritativeCatchUpTimer: ReturnType<typeof setTimeout> | null = null;
   private authoritativeCatchUpWake: (() => void) | null = null;
   private counter = 0;
@@ -379,6 +383,24 @@ export class ChatSession {
     return this.snapshot;
   }
 
+  private armSendActivityWatch(serialBeforeSend: number): void {
+    if (this.sendActivityTimer) clearTimeout(this.sendActivityTimer);
+    this.sendActivityTimer = setTimeout(() => {
+      this.sendActivityTimer = null;
+      if (!shouldReconnectSilentSend({
+        closed: this.closed,
+        serialBeforeSend,
+        currentSerial: this.streamActivitySerial,
+        run: this.snapshot.run,
+        connection: this.snapshot.connection,
+      })) return;
+      // The control path accepted the send but the viewer stream stayed silent.
+      // Rebuild the transport so the user is not left staring at a frozen echo;
+      // authoritative catch-up will converge whatever the server already did.
+      void this.reconnect({ forceNewTransport: true });
+    }, SEND_STREAM_ACTIVITY_TIMEOUT_MS);
+  }
+
   async send(text: string, attachments: Attachment[] = []): Promise<void> {
     const otid = `echo-${this.conversationId}-${Date.now()}-${this.counter++}`;
     await this.submitDurableTurn({
@@ -430,12 +452,14 @@ export class ChatSession {
 
     try {
       await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "sending");
+      const activityBeforeSend = this.streamActivitySerial;
       await this.ensureSession().send(
         attachments.length > 0
           ? [...toImageContent(attachments), ...(text ? [{ type: "text" as const, text }] : [])]
           : text,
         { otid },
       );
+      this.armSendActivityWatch(activityBeforeSend);
       await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "awaiting_echo");
     } catch (e) {
       const detail = e instanceof Error ? e.message : "Send failed.";
@@ -1038,14 +1062,30 @@ export class ChatSession {
     catchUpGeneration: number,
     reconciliationGeneration: number,
   ): Promise<void> {
-    const deadline = Date.now() + AUTHORITATIVE_CATCHUP_MAX_MS;
+    // Active server work can outlive the viewer socket that initiated it. Do not
+    // consume the persistence deadline while Milo is still working; keep this
+    // watcher alive until the server reports idle, even if the replacement
+    // viewer never receives the original run's terminal `result` event.
+    let deadline: number | null = null;
     let attempt = 0;
     try {
       while (this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) {
         const status = await session.getDeviceStatus();
         if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
         this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
-        if (status.isProcessing || this.snapshot.run !== "idle") return;
+        if (shouldWaitForAuthoritativeIdle(status.isProcessing, this.snapshot.run)) {
+          const delay = Math.min(
+            AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS,
+            Math.max(1000, AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** Math.min(attempt, 4)),
+          );
+          attempt += 1;
+          await this.waitForAuthoritativeCatchUp(delay, catchUpGeneration);
+          continue;
+        }
+        if (deadline === null) {
+          deadline = Date.now() + AUTHORITATIVE_CATCHUP_MAX_MS;
+          attempt = 0;
+        }
 
         if (!(await this.syncForwardHistory(reconciliationGeneration))) return;
         if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
@@ -1082,7 +1122,7 @@ export class ChatSession {
           });
           return;
         }
-        if (Date.now() >= deadline) {
+        if (deadline !== null && Date.now() >= deadline) {
           if (convergence.reason === "awaiting_otid_ack") {
             await this.markAmbiguousOutboxFailed(reconciliationGeneration);
           }
@@ -1195,6 +1235,10 @@ export class ChatSession {
     this.streamGeneration += 1;
     this.clearReconnectRetry();
     this.cancelAuthoritativeCatchUp();
+    if (this.sendActivityTimer) {
+      clearTimeout(this.sendActivityTimer);
+      this.sendActivityTimer = null;
+    }
     if (retainedChatSessions.get(this.retainedKey) === this) {
       retainedChatSessions.delete(this.retainedKey);
     }
@@ -1725,6 +1769,11 @@ export class ChatSession {
    * commits immediately — interactivity must never wait on the buffer.
    */
   private ingest(message: SDKMessage): void {
+    this.streamActivitySerial += 1;
+    if (this.sendActivityTimer) {
+      clearTimeout(this.sendActivityTimer);
+      this.sendActivityTimer = null;
+    }
     this.settleActivityWaiters();
     const observation = this.protocolObserver.observe(message);
     for (const event of observation.events) {
