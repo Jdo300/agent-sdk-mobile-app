@@ -81,7 +81,7 @@ import {
 } from "../lib/letta/model";
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
 import { pickImages, type Attachment } from "../lib/letta/attachments";
-import { completedAssistantReplies, newCompletedAssistantReplies } from "../lib/voiceEligibility";
+import { completedAssistantReplies, newestAssistantTimestamp, voiceReplyToAutoSpeak } from "../lib/voiceEligibility";
 import { getSecret } from "../lib/profiles/profiles";
 import {
   getVoiceMode,
@@ -259,6 +259,7 @@ export default function ChatScreen() {
   const voicePlayRequestRef = useRef(0);
   const voiceHandledAssistantIdsRef = useRef(new Set<string>());
   const voiceHistorySeededRef = useRef(false);
+  const voiceTimestampWatermarkRef = useRef(0);
   const voiceTrackWidthRef = useRef(0);
   const voiceDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
@@ -1013,31 +1014,49 @@ export default function ChatScreen() {
     // reconnecting a conversation can never make old replies speak again.
     if (snapshot.hydrating) {
       for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
+      voiceTimestampWatermarkRef.current = Math.max(
+        voiceTimestampWatermarkRef.current,
+        newestAssistantTimestamp(snapshot.transcript),
+      );
       return;
     }
     if (!voiceHistorySeededRef.current) {
       for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
+      voiceTimestampWatermarkRef.current = Math.max(
+        voiceTimestampWatermarkRef.current,
+        newestAssistantTimestamp(snapshot.transcript),
+      );
       voiceHistorySeededRef.current = true;
       return;
     }
     if (!voiceModeLoaded) return;
 
     // Voice follows completed assistant prose, not the run lifecycle. Milo can
-    // emit a useful assistant message and then continue into more tool calls;
-    // that completed message is independently voice-eligible as soon as it lands.
-    const newlyCompleted = newCompletedAssistantReplies(
+    // emit a useful assistant message and then continue into more tool calls.
+    // Identity alone is not enough here: reconciliation can re-key an older row.
+    // Only the newest visible completed assistant, newer than our entry/catch-up
+    // watermark, is allowed to trigger automatic speech.
+    const reply = voiceReplyToAutoSpeak(
       snapshot.transcript,
       voiceHandledAssistantIdsRef.current,
+      voiceTimestampWatermarkRef.current,
     );
-    if (newlyCompleted.length === 0) return;
-    for (const item of newlyCompleted) voiceHandledAssistantIdsRef.current.add(item.id);
+    if (!reply) {
+      // Still absorb any historical/re-keyed ids so they cannot become candidates
+      // on a later render after transcript shape changes.
+      for (const item of completedAssistants) {
+        if ((item.occurredAt ?? 0) <= voiceTimestampWatermarkRef.current) {
+          voiceHandledAssistantIdsRef.current.add(item.id);
+        }
+      }
+      return;
+    }
+    voiceHandledAssistantIdsRef.current.add(reply.id);
+    if (typeof reply.occurredAt === "number" && Number.isFinite(reply.occurredAt)) {
+      voiceTimestampWatermarkRef.current = Math.max(voiceTimestampWatermarkRef.current, reply.occurredAt);
+    }
 
     if (voiceMode === "off") return;
-
-    // A reconnect/catch-up can deliver several newly completed rows in one
-    // render. Surface only the newest rather than firing a burst of stale audio;
-    // under normal live streaming there is one newly completed row at a time.
-    const reply = newlyCompleted[newlyCompleted.length - 1];
     const speakableText = prepareSpeechText(reply.text);
     clearVoiceDismissTimer();
     retireVoicePlayer();
