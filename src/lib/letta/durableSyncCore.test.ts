@@ -3,6 +3,7 @@ import {
   deriveDurableCursors,
   mergeBackwardMessages,
   mergeForwardMessages,
+  normalizeDurableMessages,
   persistedUserAcknowledgements,
   persistedUserOtids,
 } from "./durableSyncCore";
@@ -25,6 +26,19 @@ describe("durable sync core", () => {
   test("prepends older pages without disturbing current order", () => {
     expect(mergeBackwardMessages([{ id: "m3" }, { id: "m4" }], [{ id: "m1" }, { id: "m2" }, { id: "m3" }])).toEqual([
       { id: "m1" }, { id: "m2" }, { id: "m3" }, { id: "m4" },
+    ]);
+  });
+
+  test("normalizes duplicate durable identities before SQLite persistence", () => {
+    const older = { id: "m2", message_type: "assistant_message", content: "partial" };
+    const newer = { id: "m2", message_type: "assistant_message", content: "final" };
+    expect(normalizeDurableMessages([
+      { id: "m1" }, older, { otid: "turn-3", content: "old" }, newer, { otid: "turn-3", content: "new" }, { content: "anonymous" },
+    ])).toEqual([
+      { id: "m1" },
+      newer,
+      { otid: "turn-3", content: "new" },
+      { content: "anonymous" },
     ]);
   });
 

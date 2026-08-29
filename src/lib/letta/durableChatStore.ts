@@ -1,7 +1,7 @@
 import type { SQLiteDatabase } from "expo-sqlite";
 
 import type { Attachment } from "./attachments";
-import { durableMessageOtid, newestDurableMessageId, persistedUserOtids } from "./durableSyncCore";
+import { durableMessageOtid, durableMessageStorageIdentity, newestDurableMessageId, normalizeDurableMessages, persistedUserOtids } from "./durableSyncCore";
 
 const DB_NAME = "bloop-chat.db";
 const SCHEMA_VERSION = 1;
@@ -114,12 +114,8 @@ async function openDatabase(): Promise<SQLiteDatabase> {
 }
 
 function messageId(message: unknown, sequence: number): string {
-  if (message && typeof message === "object") {
-    const id = (message as { id?: unknown }).id;
-    if (typeof id === "string" && id.length > 0) return id;
-    const otid = (message as { otid?: unknown }).otid;
-    if (typeof otid === "string" && otid.length > 0) return `otid:${otid}`;
-  }
+  const identity = durableMessageStorageIdentity(message);
+  if (identity) return identity;
   // Persisted server messages should always carry an id. Keep a deterministic
   // window-local fallback rather than dropping an unexpected protocol row.
   return `anonymous:${sequence}:${stableHash(JSON.stringify(message))}`;
@@ -212,8 +208,9 @@ export async function saveDurableCanonicalWindow(
     if (isCurrent && !isCurrent()) return;
     const db = await database();
     if (isCurrent && !isCurrent()) return;
+    const normalizedMessages = normalizeDurableMessages(messages);
     const forwardAfter = cursors.forwardAfter === undefined
-      ? newestDurableMessageId(messages)
+      ? newestDurableMessageId(normalizedMessages)
       : cursors.forwardAfter;
     const stale = Symbol("stale-durable-write");
     try {
@@ -238,9 +235,9 @@ export async function saveDurableCanonicalWindow(
         profileId,
         conversationId,
       );
-        for (let sequence = 0; sequence < messages.length; sequence += 1) {
+        for (let sequence = 0; sequence < normalizedMessages.length; sequence += 1) {
           if (isCurrent && !isCurrent()) throw stale;
-          const message = messages[sequence];
+          const message = normalizedMessages[sequence];
           await db.runAsync(
           `INSERT INTO durable_messages(profile_id, conversation_id, message_id, sequence, otid, raw_json)
            VALUES (?, ?, ?, ?, ?, ?)`,

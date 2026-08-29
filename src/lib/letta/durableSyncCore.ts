@@ -10,6 +10,34 @@ export function durableMessageOtid(message: unknown): string | null {
   return typeof otid === "string" && otid.length > 0 ? otid : null;
 }
 
+
+export function durableMessageStorageIdentity(message: unknown): string | null {
+  const id = durableMessageId(message);
+  if (id) return id;
+  const otid = durableMessageOtid(message);
+  return otid ? `otid:${otid}` : null;
+}
+
+/**
+ * SQLite persistence must be idempotent across reconnect/reconciliation. A
+ * transient canonical window can contain the same persisted message twice
+ * (for example live + backfilled forms of one server UUID). Keep the newest
+ * occurrence and its transcript position, while retaining anonymous rows whose
+ * sequence-based storage key is intentionally unique.
+ */
+export function normalizeDurableMessages(messages: readonly unknown[]): unknown[] {
+  const seen = new Set<string>();
+  const reversed: unknown[] = [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    const identity = durableMessageStorageIdentity(message);
+    if (identity && seen.has(identity)) continue;
+    if (identity) seen.add(identity);
+    reversed.push(message);
+  }
+  return reversed.reverse();
+}
+
 export function newestDurableMessageId(messages: readonly unknown[]): string | null {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const id = durableMessageId(messages[i]);
