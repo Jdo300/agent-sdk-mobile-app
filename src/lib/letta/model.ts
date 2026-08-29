@@ -34,6 +34,8 @@ export interface UserItem {
   images?: string[];
   /** Local echo until the server confirms the message. */
   pending?: boolean;
+  /** True only while the message is still local and can genuinely be cancelled before handoff. */
+  cancelable?: boolean;
   failed?: boolean;
   /** Wall-clock time this row occurred (server time for history, local arrival time while live). */
   occurredAt?: number;

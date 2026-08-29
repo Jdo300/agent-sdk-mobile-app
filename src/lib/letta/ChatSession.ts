@@ -217,6 +217,8 @@ export class ChatSession {
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
+  /** User cancellations accepted before the App Server handoff begins. */
+  private cancelledLocalOtids = new Set<string>();
   /** Definitely-unsent journal rows recovered after a process restart. */
   private queuedRecoveryTurns: DurableOutboxItem[] = [];
   private approvalResolvers = new Map<
@@ -439,19 +441,33 @@ export class ChatSession {
           id: otid,
           text,
           pending: true,
+          cancelable: true,
           occurredAt: item.createdAt,
           ...(attachments.length > 0 ? { images: attachments.map((a) => a.uri) } : {}),
         }),
       );
     } else {
-      this.markEcho(otid, { pending: true, failed: false });
+      this.markEcho(otid, { pending: true, cancelable: true, failed: false });
       this.commit(this.project(this.snapshot));
     }
     if (attachments.length > 0) this.pendingAttachments.set(otid, attachments);
     if (this.snapshot.run === "idle") this.commit(patch(this.snapshot, { run: "running" }));
 
     try {
+      // This is the last genuinely cancellable point. Once send() begins the SDK
+      // exposes no abort primitive, so remove the Cancel affordance before handoff.
+      if (this.cancelledLocalOtids.has(otid)) {
+        this.cancelledLocalOtids.delete(otid);
+        return;
+      }
+      this.markEcho(otid, { cancelable: false });
+      this.commit(this.project(this.snapshot));
       await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "sending");
+      if (this.cancelledLocalOtids.has(otid)) {
+        this.cancelledLocalOtids.delete(otid);
+        await removeDurableOutbox(this.conn.profile.id, this.conversationId, otid).catch(() => {});
+        return;
+      }
       const activityBeforeSend = this.streamActivitySerial;
       await this.ensureSession().send(
         attachments.length > 0
@@ -482,15 +498,64 @@ export class ChatSession {
   }
 
   /** Update an in-flight echo in place (pending -> sent, or failed). */
-  private markEcho(otid: string, changes: { pending?: boolean; failed?: boolean }): void {
+  private markEcho(otid: string, changes: { pending?: boolean; cancelable?: boolean; failed?: boolean }): void {
     this.localRows = this.localRows.map((row) =>
       row.item.kind === "user" && row.item.id === otid
         ? {
             ...row,
-            item: { ...row.item, ...changes, ...(changes.pending === false ? { pending: undefined } : {}) },
+            item: {
+              ...row.item,
+              ...changes,
+              ...(changes.pending === false ? { pending: undefined, cancelable: undefined } : {}),
+              ...(changes.cancelable === false ? { cancelable: undefined } : {}),
+            },
           }
         : row,
     );
+  }
+
+  private dropLocalOutgoing(itemId: string): void {
+    const items = this.snapshot.transcript;
+    const index = items.findIndex((item) => item.id === itemId);
+    const pairedErrorId = index >= 0 && items[index + 1]?.kind === "error" ? items[index + 1]!.id : null;
+    this.localRows = this.localRows.filter((row) => row.item.id !== itemId && row.item.id !== pairedErrorId);
+    this.echoOtids.delete(itemId);
+    this.unacknowledgedOtids.delete(itemId);
+    this.pendingAttachments.delete(itemId);
+    this.queuedRecoveryTurns = this.queuedRecoveryTurns.filter((item) => item.otid !== itemId);
+    const projected = this.project(this.snapshot);
+    const hasOtherPendingLocalSend = this.localRows.some(
+      (row) => row.item.kind === "user" && Boolean(row.item.pending),
+    );
+    this.commit(
+      !this.deviceIsProcessing && !hasOtherPendingLocalSend && projected.run === "running"
+        ? patch(projected, { run: "idle" })
+        : projected,
+    );
+  }
+
+  /** Cancel only while the message is still local and handoff has not begun. */
+  async cancelPendingSend(itemId: string): Promise<void> {
+    const item = this.snapshot.transcript.find((entry) => entry.id === itemId);
+    if (!item || item.kind !== "user" || !item.pending || !item.cancelable) return;
+    // Set synchronously so submitDurableTurn sees the cancellation after any
+    // currently-awaited SQLite operation and before entering SDK send().
+    this.cancelledLocalOtids.add(itemId);
+    try {
+      await removeDurableOutbox(this.conn.profile.id, this.conversationId, itemId);
+    } catch {
+      this.cancelledLocalOtids.delete(itemId);
+      return;
+    }
+    this.dropLocalOutgoing(itemId);
+  }
+
+  /** Explicitly discard a failed local send; server history is untouched. */
+  async removeFailedSend(itemId: string): Promise<void> {
+    const item = this.snapshot.transcript.find((entry) => entry.id === itemId);
+    if (!item || item.kind !== "user" || !item.failed) return;
+    await removeDurableOutbox(this.conn.profile.id, this.conversationId, itemId);
+    this.dropLocalOutgoing(itemId);
   }
 
   /** Re-send a failed bubble: drop it (and its error row) and send fresh. */
@@ -499,13 +564,12 @@ export class ChatSession {
     const index = items.findIndex((t) => t.id === itemId);
     const item = items[index];
     if (!item || item.kind !== "user" || !item.failed) return;
-    // The error row committed alongside the failure sits right after it.
+    // The error row committed alongside the failure sits right after it. Remove
+    // it from local source state as well so project() cannot resurrect it.
     const next = items[index + 1];
-    const dropError = next?.kind === "error";
-    this.commit({
-      ...this.snapshot,
-      transcript: items.filter((_t, i) => i !== index && !(dropError && i === index + 1)),
-    });
+    if (next?.kind === "error") {
+      this.localRows = this.localRows.filter((row) => row.item.id !== next.id);
+    }
     const durable = await loadDurableConversation(this.conn.profile.id, this.conversationId).catch(() => null);
     const saved = durable?.outbox.find((entry) => entry.otid === itemId);
     const images = saved?.attachments ?? this.pendingAttachments.get(itemId) ?? [];
@@ -1246,6 +1310,7 @@ export class ChatSession {
     this.localRows = [];
     this.echoOtids.clear();
     this.unacknowledgedOtids.clear();
+    this.cancelledLocalOtids.clear();
     publishActivity(this.conversationId, null);
     this.settleActivityWaiters(new Error("Session closed"));
     if (this.flushTimer) {

@@ -182,6 +182,8 @@ function SendIcon({ color = "#FFFFFF", size = 20 }: { color?: string; size?: num
 const TranscriptRow = memo(function TranscriptRow({
   item,
   onUserRetry,
+  onUserRemove,
+  onUserCancel,
   onToolPress,
   onErrorRetry,
   onToggleGroup,
@@ -189,6 +191,8 @@ const TranscriptRow = memo(function TranscriptRow({
 }: {
   item: TranscriptRowItem;
   onUserRetry?: (id: string) => void;
+  onUserRemove?: (id: string) => void;
+  onUserCancel?: (id: string) => void;
   onToolPress?: (id: string) => void;
   onErrorRetry?: () => void;
   onToggleGroup?: (id: string) => void;
@@ -200,7 +204,14 @@ const TranscriptRow = memo(function TranscriptRow({
         <ToolGroupRow group={item} onToggle={() => onToggleGroup?.(item.id)} />
       );
     case "user":
-      return <UserBubble item={item} onRetry={onUserRetry ? () => onUserRetry(item.id) : undefined} />;
+      return (
+        <UserBubble
+          item={item}
+          onRetry={onUserRetry ? () => onUserRetry(item.id) : undefined}
+          onRemove={onUserRemove ? () => onUserRemove(item.id) : undefined}
+          onCancel={onUserCancel ? () => onUserCancel(item.id) : undefined}
+        />
+      );
     case "assistant":
       return <AssistantBlock item={item} onVoiceReplay={onAssistantReplay && !item.streaming && !item.interrupted ? () => onAssistantReplay(item.id, item.text) : undefined} />;
     case "reasoning":
@@ -1222,6 +1233,15 @@ export default function ChatScreen() {
     },
     [pinToLatest],
   );
+  const onUserRemove = useCallback((id: string) => {
+    haptic.tap();
+    void sessionRef.current?.removeFailedSend(id);
+  }, []);
+  const onUserCancel = useCallback((id: string) => {
+    haptic.tap();
+    void sessionRef.current?.cancelPendingSend(id);
+  }, []);
+
   const onErrorRetry = useCallback(() => {
     haptic.tap();
     void sessionRef.current?.reconnect();
@@ -1242,6 +1262,8 @@ export default function ChatScreen() {
       <TranscriptRow
         item={item}
         onUserRetry={onUserRetry}
+        onUserRemove={onUserRemove}
+        onUserCancel={onUserCancel}
         onToolPress={onToolPress}
         onErrorRetry={onErrorRetry}
         onToggleGroup={onToggleGroup}

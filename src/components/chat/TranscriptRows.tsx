@@ -56,18 +56,27 @@ function showCopyMenu(markdown: string, copyText: (text: string) => void) {
 // Row components are memoized: transcript items are immutable (upsertItem
 // replaces only the changed item), so during a streaming flush every settled
 // row skips its render on reference equality alone.
-export const UserBubble = memo(function UserBubble({ item, onRetry }: { item: UserItem; onRetry?: () => void }) {
+export const UserBubble = memo(function UserBubble({
+  item,
+  onRetry,
+  onRemove,
+  onCancel,
+}: {
+  item: UserItem;
+  onRetry?: () => void;
+  onRemove?: () => void;
+  onCancel?: () => void;
+}) {
   const { colors } = useTheme();
   const { copied, copyText } = useCopyFeedback(item.text);
   return (
     <View style={styles.userRow}>
       <Touchable
-        accessibilityRole={item.failed ? "button" : "none"}
-        accessibilityLabel={item.failed ? "Message not sent. Retry" : item.text}
+        accessibilityRole="none"
+        accessibilityLabel={item.text}
         accessibilityHint="Long press for copy options"
-        onPress={item.failed ? onRetry : undefined}
         onLongPress={() => showCopyMenu(item.text, copyText)}
-        scaleOnPress={item.failed}
+        scaleOnPress={false}
         style={styles.userTouch}
       >
         <View
@@ -98,10 +107,48 @@ export const UserBubble = memo(function UserBubble({ item, onRetry }: { item: Us
           {item.text ? <Text style={styles.userText}>{item.text}</Text> : null}
         </View>
         <Timestamp value={item.occurredAt} align="right" />
+        {item.pending ? (
+          <View style={styles.userMetaActions}>
+            <Text role="sub" ink={3}>Sending…</Text>
+            {item.cancelable && onCancel ? (
+              <>
+                <Text role="sub" ink={3}> · </Text>
+                <Touchable
+                  accessibilityRole="button"
+                  accessibilityLabel="Cancel sending message"
+                  onPress={onCancel}
+                  hitSlop={8}
+                  scaleOnPress={false}
+                >
+                  <Text role="sub" ink={2}>Cancel</Text>
+                </Touchable>
+              </>
+            ) : null}
+          </View>
+        ) : null}
         {item.failed ? (
-          <Text role="sub" tone="danger" style={styles.userMeta}>
-            Not sent · Tap to retry
-          </Text>
+          <View style={styles.userMetaActions}>
+            <Text role="sub" tone="danger">Not sent · </Text>
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Retry sending message"
+              onPress={onRetry}
+              hitSlop={8}
+              scaleOnPress={false}
+            >
+              <Text role="sub" tone="danger">Retry</Text>
+            </Touchable>
+            <Text role="sub" tone="danger"> · </Text>
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Remove unsent message"
+              onPress={onRemove}
+              hitSlop={8}
+              scaleOnPress={false}
+            >
+              <Text role="sub" tone="danger">Remove</Text>
+            </Touchable>
+          </View>
         ) : null}
         {copied ? (
           <Text role="sub" ink={3} style={styles.userMeta}>
@@ -470,6 +517,12 @@ const styles = StyleSheet.create({
   },
   userText: { fontSize: 15, lineHeight: 21 },
   userMeta: { paddingRight: space.xs },
+  userMetaActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    paddingRight: space.xs,
+  },
   timestamp: { opacity: 0.78 },
   timestampRight: { textAlign: "right", paddingRight: space.xs },
   assistant: { gap: 4 },
