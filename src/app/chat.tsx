@@ -80,7 +80,7 @@ import {
   type ToolItem,
 } from "../lib/letta/model";
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
-import { pickImages, type Attachment } from "../lib/letta/attachments";
+import { pickImages, pickAudio, type Attachment, type AudioAttachment } from "../lib/letta/attachments";
 import { completedAssistantReplies, newestAssistantTimestamp, voiceReplyToAutoSpeak } from "../lib/voiceEligibility";
 import { getSecret } from "../lib/profiles/profiles";
 import {
@@ -104,6 +104,7 @@ import {
   pumpVoiceChunkUpload,
   type VoiceChunkUploadSession,
 } from "../lib/voiceChunkUpload";
+import { registerConversationPush } from "../lib/pushNotifications";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
 import { motion, radius, space } from "../theme/tokens";
@@ -284,6 +285,9 @@ export default function ChatScreen() {
   // Collapsed tool runs the reader has opened (see lib/letta/grouping).
   const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(() => new Set());
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  // The + attachment menu (Photo / Audio) and the audio transcription flow.
+  const [audioQueue, setAudioQueue] = useState<AudioAttachment[]>([]);
+  const [transcribingAudio, setTranscribingAudio] = useState(false);
   const [voiceMode, setVoiceModeState] = useState<VoiceMode>("tap");
   const [voiceModeLoaded, setVoiceModeLoaded] = useState(false);
   const [voiceAutoSend, setVoiceAutoSend] = useState(false);
@@ -680,11 +684,57 @@ export default function ChatScreen() {
   }, [voiceProgress.duration, clearVoiceDismissTimer]);
 
   const dismissVoiceReply = collapseVoiceReply;
-  const attach = useCallback(async () => {
+const attachImage = useCallback(async () => {
     haptic.tap();
     const picked = await pickImages();
     if (picked.length > 0) setAttachments((current) => [...current, ...picked].slice(0, 4));
   }, []);
+
+  const attachAudio = useCallback(async () => {
+    haptic.tap();
+    const picked = await pickAudio();
+    if (picked.length > 0) setAudioQueue((current) => [...current, ...picked].slice(0, 4));
+  }, []);
+
+  const attach = useCallback(() => {
+    haptic.tap();
+    attachMenuSheetRef.current?.present();
+  }, []);
+
+  // Upload a picked recording to the voice gateway (Whisper) and send the
+  // transcript as a normal text message. The original audio stays on rgserver
+  // (voice-gateway/uploads) so it can be attached to whatever we file it into.
+  const sendAudioTranscript = useCallback(
+    async (audio: AudioAttachment) => {
+      const session = sessionRef.current;
+      if (!session || !activeProfile) throw new Error("Milo's chat session is not ready yet.");
+      const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
+      if (!token) throw new Error("The Local Milo capability token is unavailable.");
+      followLiveRef.current = true;
+      nearBottomRef.current = true;
+      setNearBottom(true);
+      const text = await transcribeVoice(audio.uri, token, activeProfile.url, {});
+      // Prefix the transcript with the source filename so the origin is clear in
+      // the conversation. Jason's note (if any) travels as a separate message.
+      await session.send(`Transcribed from "${audio.name}":\n\n${text}`);
+    },
+    [activeProfile, getSecret],
+  );
+
+  const sendQueuedAudio = useCallback(async () => {
+    if (audioQueue.length === 0) return;
+    const items = audioQueue;
+    setAudioQueue([]);
+    setTranscribingAudio(true);
+    for (const audio of items) {
+      try {
+        await sendAudioTranscript(audio);
+      } catch (e) {
+        setVoiceError(e instanceof Error ? e.message : "Audio transcription failed.");
+      }
+    }
+    setTranscribingAudio(false);
+  }, [audioQueue, sendAudioTranscript]);
   const nearBottomRef = useRef(true);
   // Live-follow is explicit user intent, not inferred from layout-generated
   // scroll events. Incoming tokens can move an inverted FlatList's offset even
@@ -782,6 +832,7 @@ export default function ChatScreen() {
   const controlsSheetRef = useRef<BottomSheetModal>(null);
   const secretSheetRef = useRef<BottomSheetModal>(null);
   const conversationStatusSheetRef = useRef<BottomSheetModal>(null);
+  const attachMenuSheetRef = useRef<BottomSheetModal>(null);
   const renameSheetRef = useRef<BottomSheetModal>(null);
   const [conversationDiagnostics, setConversationDiagnostics] = useState<ConversationDiagnostics | null>(null);
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
@@ -1343,6 +1394,27 @@ export default function ChatScreen() {
   const agentName = params.agentName ?? "Agent";
   const title = serverTitle ?? params.title ?? "Conversation";
 
+  // A server-side turn_end hook delivers notifications after iOS suspends the
+  // app. Opening a remote conversation subscribes this physical Bloop install
+  // to that conversation and refreshes its current title for notification UI.
+  useEffect(() => {
+    if (activeProfile?.type !== "remote" || !params.conversationId || !params.agentId) return;
+    let cancelled = false;
+    void (async () => {
+      const capabilityToken = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
+      if (!capabilityToken || cancelled) return;
+      await registerConversationPush({
+        capabilityToken,
+        serverUrl: activeProfile.url,
+        conversationId: params.conversationId,
+        agentId: params.agentId,
+        agentName,
+        title,
+      });
+    })();
+    return () => { cancelled = true; };
+  }, [activeProfile, params.conversationId, params.agentId, agentName, title]);
+
   // Inverted-list data (references do chat this way — e.g. paseo's native
   // strategy): the visual bottom is offset 0, so new content pins natively
   // and keyboard/layout changes can't break "near bottom" tracking.
@@ -1433,6 +1505,147 @@ export default function ChatScreen() {
   const toolActive = lastItem?.kind === "tool" && (lastItem.status === "running" || lastItem.status === "pending");
   const waitingForModel = running && !streamingNow && !toolActive;
 
+  // Voice recording/playback/progress state updates at high frequency. Keep the
+  // expensive transcript list as a stable React subtree unless inputs that can
+  // actually change the list change; this prevents 10 Hz voice UI ticks from
+  // making VirtualizedList revisit a long conversation.
+  const transcriptList = useMemo(
+    () =>
+      snapshot.hydrating ? (
+                  <SkeletonList rows={4} avatar={false} />
+                ) : (
+                  <FlatList
+                  ref={listRef}
+                  data={listData}
+                  inverted
+                  keyExtractor={(item) => item.id}
+                  renderItem={renderItem}
+                  contentContainerStyle={styles.transcript}
+                  // Virtualization tuned like paseo's native strategy: enough rows
+                  // up front that a fast scroll into history doesn't blank, and a
+                  // wide window so streaming flushes never evict nearby cells.
+                  initialNumToRender={14}
+                  maxToRenderPerBatch={12}
+                  windowSize={9}
+                  // Inverted list: offset 0 IS the newest content, so being at the
+                  // bottom survives keyboard/layout changes, and pinning while
+                  // streaming is native. A reader who scrolled up keeps their place
+                  // (maintainVisibleContentPosition); Android ignores it under the
+                  // inversion transform, so iOS-only — same trade the references make.
+                  maintainVisibleContentPosition={
+                    // Keep this configuration stable. Toggling the prop itself while
+                    // rows are measuring can cause an inverted FlatList to jump.
+                    // While following live, onContentSizeChange explicitly pins offset 0.
+                    Platform.OS === "ios" ? { minIndexForVisible: 0 } : undefined
+                  }
+                  // maintainVisibleContentPosition keeps a scrolled-up reader in place
+                  // but does not guarantee the live edge stays pinned once a hydration
+                  // batch measures, so re-pin explicitly for a reader who is following.
+                  onContentSizeChange={() => {
+                    if (!userScrollingRef.current && followLiveRef.current) {
+                      // While following, growth belongs below the reader. Keep the
+                      // visual live edge pinned instead of preserving the old cell.
+                      scrollToLatest(false);
+                    }
+                  }}
+                  // Visual bottom, above the composer — shows while the model has
+                  // accepted the send but nothing has streamed back yet.
+                  ListHeaderComponent={waitingForModel ? <ThinkingRow /> : null}
+                  // Inverted list: the "end" is the visual top, so this is where
+                  // reaching the oldest loaded row asks for the previous page.
+                  onEndReached={() => void sessionRef.current?.loadOlder()}
+                  onEndReachedThreshold={0.2}
+                  ListFooterComponent={
+                    snapshot.loadingOlder ? (
+                      <View style={styles.olderSpinner}>
+                        <ActivityIndicator size="small" color={colors.ink3} />
+                      </View>
+                    ) : null
+                  }
+                  ListEmptyComponent={
+                    <View style={styles.invertedEmpty}>
+                      <EmptyState message={`No messages yet. Say hello to ${agentName}.`} />
+                    </View>
+                  }
+                  // Dragging the transcript pulls the keyboard down with the gesture.
+                  keyboardDismissMode="interactive"
+                  keyboardShouldPersistTaps="handled"
+                  onScrollBeginDrag={() => {
+                    // Manual interaction freezes live-follow immediately. Layout and
+                    // programmatic scroll events never enter this path.
+                    userScrollingRef.current = true;
+                    followLiveRef.current = false;
+                    dismissChatKeyboard();
+                  }}
+                  onMomentumScrollBegin={() => {
+                    userScrollingRef.current = true;
+                  }}
+                  onScrollEndDrag={(e) => {
+                    const offset = Math.max(0, e.nativeEvent.contentOffset.y);
+                    const nearBottom = offset < 80;
+                    const atLiveEdge = offset <= 2;
+                    if (nearBottomRef.current !== nearBottom) {
+                      nearBottomRef.current = nearBottom;
+                      setNearBottom(nearBottom);
+                    }
+                    // A manual drag disables follow immediately. Do not silently turn
+                    // it back on merely because the reader stopped *near* the bottom;
+                    // only returning to the actual live edge opts back into follow.
+                    followLiveRef.current = atLiveEdge;
+                    userScrollingRef.current = false;
+                  }}
+                  onMomentumScrollEnd={(e) => {
+                    const offset = Math.max(0, e.nativeEvent.contentOffset.y);
+                    const nearBottom = offset < 80;
+                    const atLiveEdge = offset <= 2;
+                    if (nearBottomRef.current !== nearBottom) {
+                      nearBottomRef.current = nearBottom;
+                      setNearBottom(nearBottom);
+                    }
+                    followLiveRef.current = atLiveEdge;
+                    userScrollingRef.current = false;
+                    if (atLiveEdge) scrollToLatest(false);
+                  }}
+                  onScroll={(e) => {
+                    const offset = Math.max(0, e.nativeEvent.contentOffset.y);
+                    const nearBottom = offset < 80;
+                    if (nearBottomRef.current !== nearBottom) {
+                      nearBottomRef.current = nearBottom;
+                      setNearBottom(nearBottom);
+                    }
+      
+                    // Browser wheel/trackpad scrolling does not reliably fire
+                    // onScrollBeginDrag, and iOS can finish the drag callback before
+                    // all movement settles. Treat moving materially away from offset 0
+                    // as reader intent unless it immediately follows one of our own
+                    // programmatic pins. This makes manual scroll position authoritative
+                    // while content continues streaming.
+                    if (Date.now() < programmaticScrollUntilRef.current) return;
+                    if (offset > 6) {
+                      followLiveRef.current = false;
+                      return;
+                    }
+                    // Only an active reader gesture can opt back into live-follow;
+                    // layout/content changes reaching zero must not silently do it.
+                    if (userScrollingRef.current && offset <= 2) {
+                      followLiveRef.current = true;
+                    }
+                  }}
+                  scrollEventThrottle={16}
+                  />
+                ),
+    [
+      snapshot.hydrating,
+      snapshot.loadingOlder,
+      listData,
+      renderItem,
+      waitingForModel,
+      agentName,
+      colors.ink3,
+      scrollToLatest,
+    ],
+  );
+
   // Transient link states read as "working", not "broken" — only a genuine
   // loss of connectivity or bad credentials earns the danger tone.
   const status = statusFor(snapshot.run, snapshot.connection);
@@ -1473,123 +1686,7 @@ export default function ChatScreen() {
       />
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.flex}>
         <View style={styles.flex}>
-          {snapshot.hydrating ? (
-            <SkeletonList rows={4} avatar={false} />
-          ) : (
-            <FlatList
-            ref={listRef}
-            data={listData}
-            inverted
-            keyExtractor={(item) => item.id}
-            renderItem={renderItem}
-            contentContainerStyle={styles.transcript}
-            // Virtualization tuned like paseo's native strategy: enough rows
-            // up front that a fast scroll into history doesn't blank, and a
-            // wide window so streaming flushes never evict nearby cells.
-            initialNumToRender={30}
-            maxToRenderPerBatch={30}
-            windowSize={21}
-            // Inverted list: offset 0 IS the newest content, so being at the
-            // bottom survives keyboard/layout changes, and pinning while
-            // streaming is native. A reader who scrolled up keeps their place
-            // (maintainVisibleContentPosition); Android ignores it under the
-            // inversion transform, so iOS-only — same trade the references make.
-            maintainVisibleContentPosition={
-              // Keep this configuration stable. Toggling the prop itself while
-              // rows are measuring can cause an inverted FlatList to jump.
-              // While following live, onContentSizeChange explicitly pins offset 0.
-              Platform.OS === "ios" ? { minIndexForVisible: 0 } : undefined
-            }
-            // maintainVisibleContentPosition keeps a scrolled-up reader in place
-            // but does not guarantee the live edge stays pinned once a hydration
-            // batch measures, so re-pin explicitly for a reader who is following.
-            onContentSizeChange={() => {
-              if (!userScrollingRef.current && followLiveRef.current) {
-                // While following, growth belongs below the reader. Keep the
-                // visual live edge pinned instead of preserving the old cell.
-                scrollToLatest(false);
-              }
-            }}
-            // Visual bottom, above the composer — shows while the model has
-            // accepted the send but nothing has streamed back yet.
-            ListHeaderComponent={waitingForModel ? <ThinkingRow /> : null}
-            // Inverted list: the "end" is the visual top, so this is where
-            // reaching the oldest loaded row asks for the previous page.
-            onEndReached={() => void sessionRef.current?.loadOlder()}
-            onEndReachedThreshold={0.2}
-            ListFooterComponent={
-              snapshot.loadingOlder ? (
-                <View style={styles.olderSpinner}>
-                  <ActivityIndicator size="small" color={colors.ink3} />
-                </View>
-              ) : null
-            }
-            ListEmptyComponent={
-              <View style={styles.invertedEmpty}>
-                <EmptyState message={`No messages yet. Say hello to ${agentName}.`} />
-              </View>
-            }
-            // Dragging the transcript pulls the keyboard down with the gesture.
-            keyboardDismissMode="interactive"
-            keyboardShouldPersistTaps="handled"
-            onScrollBeginDrag={() => {
-              // Manual interaction freezes live-follow immediately. Layout and
-              // programmatic scroll events never enter this path.
-              userScrollingRef.current = true;
-              followLiveRef.current = false;
-              dismissChatKeyboard();
-            }}
-            onMomentumScrollBegin={() => {
-              userScrollingRef.current = true;
-            }}
-            onScrollEndDrag={(e) => {
-              const offset = Math.max(0, e.nativeEvent.contentOffset.y);
-              const nearBottom = offset < 80;
-              const atLiveEdge = offset <= 2;
-              nearBottomRef.current = nearBottom;
-              setNearBottom(nearBottom);
-              // A manual drag disables follow immediately. Do not silently turn
-              // it back on merely because the reader stopped *near* the bottom;
-              // only returning to the actual live edge opts back into follow.
-              followLiveRef.current = atLiveEdge;
-              userScrollingRef.current = false;
-            }}
-            onMomentumScrollEnd={(e) => {
-              const offset = Math.max(0, e.nativeEvent.contentOffset.y);
-              const nearBottom = offset < 80;
-              const atLiveEdge = offset <= 2;
-              nearBottomRef.current = nearBottom;
-              setNearBottom(nearBottom);
-              followLiveRef.current = atLiveEdge;
-              userScrollingRef.current = false;
-              if (atLiveEdge) scrollToLatest(false);
-            }}
-            onScroll={(e) => {
-              const offset = Math.max(0, e.nativeEvent.contentOffset.y);
-              const nearBottom = offset < 80;
-              nearBottomRef.current = nearBottom;
-              setNearBottom(nearBottom);
-
-              // Browser wheel/trackpad scrolling does not reliably fire
-              // onScrollBeginDrag, and iOS can finish the drag callback before
-              // all movement settles. Treat moving materially away from offset 0
-              // as reader intent unless it immediately follows one of our own
-              // programmatic pins. This makes manual scroll position authoritative
-              // while content continues streaming.
-              if (Date.now() < programmaticScrollUntilRef.current) return;
-              if (offset > 6) {
-                followLiveRef.current = false;
-                return;
-              }
-              // Only an active reader gesture can opt back into live-follow;
-              // layout/content changes reaching zero must not silently do it.
-              if (userScrollingRef.current && offset <= 2) {
-                followLiveRef.current = true;
-              }
-            }}
-            scrollEventThrottle={16}
-            />
-          )}
+          {transcriptList}
           {/* Anchored to the list's own bottom edge, so it clears the composer
               at any height and never lands on the transcript's newest row. */}
           {!nearBottom ? (
@@ -1667,6 +1764,37 @@ export default function ChatScreen() {
                   </View>
                 </Touchable>
               ))}
+            </View>
+          ) : null}
+          {audioQueue.length > 0 && snapshot.approvals.length === 0 ? (
+            <View style={[styles.attachRow, { alignItems: "center" }]}>
+              {audioQueue.map((a) => (
+                <Touchable
+                  key={a.id}
+                  accessibilityRole="button"
+                  accessibilityLabel="Remove audio"
+                  onPress={() => setAudioQueue((current) => current.filter((c) => c.id !== a.id))}
+                  style={[styles.attachChip, { flexDirection: "row", alignItems: "center", paddingLeft: space.sm, paddingRight: space.sm, backgroundColor: colors.surface, borderColor: colors.surfaceEdge, borderWidth: 1 }]}
+                >
+                  <Text role="micro" ink={2} style={{ flexShrink: 1 }}>
+                    🎙 {a.name.length > 16 ? a.name.slice(0, 13) + "…" : a.name}
+                  </Text>
+                  <Text role="micro" ink={3} style={{ marginLeft: space.xs }}>
+                    ✕
+                  </Text>
+                </Touchable>
+              ))}
+              <Touchable
+                accessibilityRole="button"
+                accessibilityLabel="Send audio for transcription"
+                onPress={() => void sendQueuedAudio()}
+                disabled={transcribingAudio}
+                style={[{ backgroundColor: colors.accent }, styles.attachSend]}
+              >
+                <Text role="micro" ink={1}>
+                  {transcribingAudio ? "Transcribing…" : "Send"}
+                </Text>
+              </Touchable>
             </View>
           ) : null}
           {voiceRecording || transcribingVoice ? (
@@ -1836,12 +1964,12 @@ export default function ChatScreen() {
           >
             <Touchable
               accessibilityRole="button"
-              accessibilityLabel="Attach images"
-              onPress={() => void attach()}
-              disabled={snapshot.hydrating || attachments.length >= 4}
+              accessibilityLabel="Attach a photo or audio"
+              onPress={() => attach()}
+              disabled={snapshot.hydrating || (attachments.length + audioQueue.length) >= 4 || transcribingAudio}
               style={styles.attachButton}
             >
-              <Text role="title" ink={attachments.length >= 4 ? 3 : 2}>
+              <Text role="title" ink={(attachments.length + audioQueue.length) >= 4 || transcribingAudio ? 3 : 2}>
                 ＋
               </Text>
             </Touchable>
@@ -1941,6 +2069,32 @@ export default function ChatScreen() {
           queueSheetRef.current?.dismiss();
         }}
       />
+<Sheet ref={attachMenuSheetRef} title="Attach">
+        <Touchable
+          accessibilityRole="button"
+          accessibilityLabel="Attach a photo"
+          onPress={() => void attachImage()}
+          style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.md, borderRadius: radius.row }}
+        >
+          <Text role="body" ink={1} style={{ fontSize: 20 }}>📷</Text>
+          <View>
+            <Text role="title">Photo</Text>
+            <Text role="micro" ink={3}>From your library</Text>
+          </View>
+        </Touchable>
+        <Touchable
+          accessibilityRole="button"
+          accessibilityLabel="Attach a recording to transcribe"
+          onPress={() => void attachAudio()}
+          style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.md, borderRadius: radius.row }}
+        >
+          <Text role="body" ink={1} style={{ fontSize: 20 }}>🎙</Text>
+          <View>
+            <Text role="title">Audio</Text>
+            <Text role="micro" ink={3}>Pick a recording to transcribe</Text>
+          </View>
+        </Touchable>
+      </Sheet>
       <Sheet ref={controlsSheetRef} title="Permission mode">
         {(
           [
@@ -2204,6 +2358,14 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   attachButton: { paddingRight: space.sm, minHeight: 32, justifyContent: "center" },
+  attachSend: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: space.md,
+    paddingVertical: space.sm,
+    borderRadius: radius.row,
+    minHeight: 32,
+  },
   latest: {
     borderWidth: StyleSheet.hairlineWidth,
     borderRadius: radius.chip,

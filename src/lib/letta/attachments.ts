@@ -1,12 +1,20 @@
 /**
- * Image attachments for the composer.
+ * Image + audio attachments for the composer.
  *
- * Downscaled and re-encoded at intake (as remodex does) rather than at send:
- * a modern phone photo is ~4000px of base64 that would bloat every turn's
- * context for no visual gain on a phone-sized transcript.
+ * Images are downscaled and re-encoded at intake (as remodex does) rather than
+ * at send: a modern phone photo is ~4000px of base64 that would bloat every
+ * turn's context for no visual gain on a phone-sized transcript.
+ *
+ * Audio is different: the Letta Agent SDK only accepts text+image content parts
+ * in a user message, so a picked recording is NOT sent into the chat as an
+ * attachment. Instead it is uploaded to the voice gateway (Whisper) and the
+ * resulting transcript is sent as a normal text message. The original audio is
+ * kept on rgserver (voice-gateway/uploads) so it can be attached to whatever we
+ * file the transcript into (e.g. a Nextcloud note).
  */
 import * as ImageManipulator from "expo-image-manipulator";
 import * as ImagePicker from "expo-image-picker";
+import * as DocumentPicker from "expo-document-picker";
 
 import type { ImageContent } from "@letta-ai/letta-agent-sdk/client";
 
@@ -81,4 +89,50 @@ export function toImageContent(attachments: Attachment[]): ImageContent[] {
     type: "image",
     source: { type: "base64", media_type: a.mediaType, data: a.data },
   }));
+}
+
+/**
+ * An audio picked from the iOS Recordings / Voice Memos / Files app.
+ * See the module header for why this is not a message content part.
+ */
+export interface AudioAttachment {
+  id: string;
+  /** Local uri (cache copy) of the picked audio file. */
+  uri: string;
+  /** Original file name (e.g. "My Recording.m4a"). */
+  name: string;
+  /** MIME type when the picker reported one (e.g. audio/x-m4a). */
+  mediaType: string | null;
+  /** File size in bytes, if known. */
+  size: number | null;
+  /** Last-modified epoch ms, if known. */
+  lastModified: number | null;
+}
+
+/**
+ * Open the system file picker for audio (and video, since phone recordings can
+ * be .m4a/.mov) and return the picked files. Empty when cancelled or denied.
+ *
+ * Uses expo-document-picker so it reaches the iOS Recordings app / Voice Memos /
+ * Files -> On My iPhone, which expo-image-picker (images/videos only) cannot.
+ */
+export async function pickAudio(): Promise<AudioAttachment[]> {
+  const result = await DocumentPicker.getDocumentAsync({
+    type: ["audio/*", "video/*"],
+    multiple: true,
+    copyToCacheDirectory: true,
+  });
+  if (result.canceled) return [];
+  const out: AudioAttachment[] = [];
+  result.assets.forEach((a, index) => {
+    out.push({
+      id: `aud-${Date.now()}-${index}`,
+      uri: a.uri,
+      name: a.name,
+      mediaType: a.mimeType ?? null,
+      size: a.size ?? null,
+      lastModified: a.lastModified ?? null,
+    });
+  });
+  return out;
 }
