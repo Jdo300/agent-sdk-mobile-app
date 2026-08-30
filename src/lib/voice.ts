@@ -66,6 +66,14 @@ export function voiceModeLabel(mode: VoiceMode): string {
   return "Auto";
 }
 
+export type AcceptedTranscriptionJob = {
+  job_id?: string;
+  progress?: number;
+  eta_seconds?: number;
+  audio_duration_seconds?: number | null;
+  estimate?: boolean;
+};
+
 function uploadVoice(
   url: string,
   headers: Record<string, string>,
@@ -150,13 +158,18 @@ export async function transcribeVoice(
     if (!text?.trim()) throw new Error("Whisper returned an empty transcription.");
     return text.trim();
   }
-  const accepted = JSON.parse(upload.text) as {
-    job_id?: string;
-    progress?: number;
-    eta_seconds?: number;
-    audio_duration_seconds?: number | null;
-    estimate?: boolean;
-  };
+  const accepted = JSON.parse(upload.text) as AcceptedTranscriptionJob;
+  return pollAcceptedTranscription(accepted, token, serverUrl, options);
+}
+
+export async function pollAcceptedTranscription(
+  accepted: AcceptedTranscriptionJob,
+  token: string,
+  serverUrl: string,
+  options?: { durationSeconds?: number; onProgress?: (progress: TranscriptionProgress) => void },
+): Promise<string> {
+  const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
+  const headers = { Authorization: `Bearer ${token}` };
   if (!accepted.job_id) throw new Error("Voice transcription job was not created.");
   let progressAnchor: TranscriptionProgress = {
     phase: "transcribing",

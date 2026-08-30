@@ -89,12 +89,21 @@ import {
   setVoiceMode as persistVoiceMode,
   speechSource,
   transcribeVoice,
+  pollAcceptedTranscription,
   KOKORO_PLAYBACK_RATE,
   prepareSpeechText,
   voiceModeLabel,
   type VoiceMode,
   type TranscriptionProgress,
 } from "../lib/voice";
+import {
+  completedVoiceFile,
+  createVoiceChunkUpload,
+  finalizeVoiceChunkUpload,
+  patchVoiceChunkHeader,
+  pumpVoiceChunkUpload,
+  type VoiceChunkUploadSession,
+} from "../lib/voiceChunkUpload";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
 import { motion, radius, space } from "../theme/tokens";
@@ -266,6 +275,14 @@ export default function ChatScreen() {
   const [voicePlaying, setVoicePlaying] = useState(false);
   const [voiceProgress, setVoiceProgress] = useState({ current: 0, duration: 0 });
   const finishingVoiceRef = useRef(false);
+  const voiceRecordingGenerationRef = useRef(0);
+  const voiceChunkUploadRef = useRef<{
+    session: VoiceChunkUploadSession;
+    token: string;
+    serverUrl: string;
+    timer: ReturnType<typeof setInterval> | null;
+    inFlight: Promise<void> | null;
+  } | null>(null);
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
   const voicePlayRequestRef = useRef(0);
@@ -288,6 +305,9 @@ export default function ChatScreen() {
     }).catch(() => setVoiceAutoSendLoaded(true));
     return () => {
       if (voiceDismissTimerRef.current) clearTimeout(voiceDismissTimerRef.current);
+      if (voiceChunkUploadRef.current?.timer) clearInterval(voiceChunkUploadRef.current.timer);
+      voiceChunkUploadRef.current = null;
+      voiceRecordingGenerationRef.current += 1;
       voicePlayRequestRef.current += 1;
       voicePlayerSubRef.current?.remove();
       try { voicePlayerRef.current?.pause(); } catch { /* already released */ }
@@ -350,6 +370,39 @@ export default function ChatScreen() {
     haptic.tap();
   }, [voiceAutoSend]);
 
+  const stopVoiceChunkUpload = useCallback(() => {
+    const current = voiceChunkUploadRef.current;
+    if (current?.timer) clearInterval(current.timer);
+    if (current) current.timer = null;
+    voiceChunkUploadRef.current = null;
+    return current;
+  }, []);
+
+  const startVoiceChunkUpload = useCallback(async (generation: number) => {
+    if (!activeProfile) return;
+    try {
+      const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
+      if (!token || generation !== voiceRecordingGenerationRef.current) return;
+      const session = await createVoiceChunkUpload(token, activeProfile.url);
+      if (generation !== voiceRecordingGenerationRef.current) return;
+      const state = { session, token, serverUrl: activeProfile.url, timer: null as ReturnType<typeof setInterval> | null, inFlight: null as Promise<void> | null };
+      const pump = () => {
+        if (generation !== voiceRecordingGenerationRef.current || state.inFlight) return;
+        const uri = recorder.uri;
+        if (!uri) return;
+        const pending = pumpVoiceChunkUpload(state.session, uri, state.token, state.serverUrl)
+          .catch(() => { /* transient/background failures retry on the next tick */ })
+          .finally(() => { if (state.inFlight === pending) state.inFlight = null; });
+        state.inFlight = pending;
+      };
+      state.timer = setInterval(pump, 3000);
+      voiceChunkUploadRef.current = state;
+      pump();
+    } catch {
+      // Optimization only. The completed recording still uses the full upload path.
+    }
+  }, [activeProfile, recorder]);
+
   const startVoiceRecording = useCallback(async () => {
     if (!activeProfile || voiceRecording || transcribingVoice) return;
     setVoiceError(null);
@@ -361,11 +414,16 @@ export default function ChatScreen() {
     await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
     await recorder.prepareToRecordAsync();
     recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
+    const generation = voiceRecordingGenerationRef.current + 1;
+    voiceRecordingGenerationRef.current = generation;
     setVoiceRecording(true);
+    void startVoiceChunkUpload(generation);
     haptic.tap();
-  }, [activeProfile, voiceRecording, transcribingVoice, recorder]);
+  }, [activeProfile, voiceRecording, transcribingVoice, recorder, startVoiceChunkUpload]);
 
   const cancelVoiceRecording = useCallback(async () => {
+    voiceRecordingGenerationRef.current += 1;
+    stopVoiceChunkUpload();
     try {
       if (recorderState.isRecording) await recorder.stop();
     } finally {
@@ -373,11 +431,13 @@ export default function ChatScreen() {
       setVoiceError(null);
       await setAudioModeAsync({ allowsRecording: false });
     }
-  }, [recorder, recorderState.isRecording]);
+  }, [recorder, recorderState.isRecording, stopVoiceChunkUpload]);
 
   const finishVoiceRecording = useCallback(async () => {
     if (!activeProfile || finishingVoiceRef.current) return;
     finishingVoiceRef.current = true;
+    voiceRecordingGenerationRef.current += 1;
+    const chunkUpload = stopVoiceChunkUpload();
     setVoiceError(null);
     const durationSeconds = Math.max(0, recorderState.durationMillis / 1000);
     // Flip the UI immediately, before native audio finalization. Long recordings
@@ -414,10 +474,51 @@ export default function ChatScreen() {
       if (!uri) throw new Error("The recording could not be saved.");
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
-      const text = await transcribeVoice(uri, token, activeProfile.url, {
-        durationSeconds,
-        onProgress: setTranscriptionProgress,
-      });
+      let text: string;
+      if (chunkUpload && chunkUpload.token === token && chunkUpload.serverUrl === activeProfile.url) {
+        try {
+          if (chunkUpload.inFlight) await chunkUpload.inFlight;
+          await pumpVoiceChunkUpload(
+            chunkUpload.session,
+            uri,
+            token,
+            activeProfile.url,
+            true,
+            (uploaded, total) => setTranscriptionProgress({
+              phase: "uploading",
+              progress: total > 0 ? Math.min(1, uploaded / total) : 0,
+              etaSeconds: null,
+              elapsedSeconds: null,
+              audioDurationSeconds: durationSeconds || null,
+              estimated: true,
+            }),
+          );
+          await patchVoiceChunkHeader(chunkUpload.session, uri, token, activeProfile.url);
+          const completed = completedVoiceFile(uri);
+          const finalized = await finalizeVoiceChunkUpload(chunkUpload.session, token, activeProfile.url, {
+            durationSeconds,
+            finalSize: completed.size,
+            md5: completed.md5,
+          });
+          if (finalized.status !== 202) throw new Error(`Pre-upload finalize failed (${finalized.status}).`);
+          text = await pollAcceptedTranscription(JSON.parse(finalized.text), token, activeProfile.url, {
+            durationSeconds,
+            onProgress: setTranscriptionProgress,
+          });
+        } catch {
+          // Any interrupted/mismatched partial upload falls back to the known-good
+          // whole-file path. Never trade reliability for this optimization.
+          text = await transcribeVoice(uri, token, activeProfile.url, {
+            durationSeconds,
+            onProgress: setTranscriptionProgress,
+          });
+        }
+      } else {
+        text = await transcribeVoice(uri, token, activeProfile.url, {
+          durationSeconds,
+          onProgress: setTranscriptionProgress,
+        });
+      }
       if (voiceAutoSend) {
         const session = sessionRef.current;
         if (!session) throw new Error("Milo's chat session is not ready yet.");
@@ -438,7 +539,7 @@ export default function ChatScreen() {
       setTranscriptionProgress(null);
       await setAudioModeAsync({ allowsRecording: false });
     }
-  }, [activeProfile, recorder, recorderState.isRecording, recorderState.durationMillis, voiceAutoSend]);
+  }, [activeProfile, recorder, recorderState.isRecording, recorderState.durationMillis, voiceAutoSend, stopVoiceChunkUpload]);
 
   // `forDuration` enforces the ten-minute ceiling in native audio code. Once
   // that automatic stop is reflected back into recorder state, finalize it just
