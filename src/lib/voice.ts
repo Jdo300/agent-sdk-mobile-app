@@ -5,6 +5,7 @@ import { voiceHttpBaseUrl } from "./voiceTransport";
 export type VoiceMode = "off" | "tap" | "auto";
 
 export type TranscriptionProgress = {
+  phase: "preparing" | "uploading" | "transcribing" | "finishing";
   progress: number;
   etaSeconds: number | null;
   elapsedSeconds: number | null;
@@ -65,6 +66,41 @@ export function voiceModeLabel(mode: VoiceMode): string {
   return "Auto";
 }
 
+function uploadVoice(
+  url: string,
+  headers: Record<string, string>,
+  body: FormData,
+  audioDurationSeconds: number | null,
+  onProgress?: (progress: TranscriptionProgress) => void,
+): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const startedAt = Date.now();
+    xhr.open("POST", url);
+    for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+    xhr.upload.onprogress = (event) => {
+      const now = Date.now();
+      const elapsed = Math.max(0, (now - startedAt) / 1000);
+      const total = event.lengthComputable && event.total > 0 ? event.total : 0;
+      const fraction = total > 0 ? Math.max(0, Math.min(0.99, event.loaded / total)) : 0;
+      const bytesPerSecond = elapsed > 0.15 ? event.loaded / elapsed : 0;
+      const eta = total > event.loaded && bytesPerSecond > 0 ? (total - event.loaded) / bytesPerSecond : null;
+      onProgress?.({
+        phase: "uploading",
+        progress: fraction,
+        etaSeconds: eta,
+        elapsedSeconds: elapsed,
+        audioDurationSeconds,
+        estimated: true,
+      });
+    };
+    xhr.onerror = () => reject(new Error("Voice upload failed."));
+    xhr.ontimeout = () => reject(new Error("Voice upload timed out."));
+    xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText ?? "" });
+    xhr.send(body);
+  });
+}
+
 async function transcriptionText(response: Response): Promise<string> {
   if (!response.ok) throw new Error(`Voice transcription failed (${response.status})`);
   const payload = (await response.json()) as { text?: string } | string;
@@ -93,17 +129,28 @@ export async function transcribeVoice(
       ? { "X-Audio-Duration-Seconds": String(options.durationSeconds) }
       : {}),
   };
-  const response = await fetch(`${voiceBaseUrl}/voice/transcribe`, {
-    method: "POST",
-    headers,
-    body,
+  const audioDurationSeconds = options?.durationSeconds && options.durationSeconds > 0 ? options.durationSeconds : null;
+  options?.onProgress?.({
+    phase: "uploading",
+    progress: 0,
+    etaSeconds: null,
+    elapsedSeconds: 0,
+    audioDurationSeconds,
+    estimated: true,
   });
+  const upload = await uploadVoice(`${voiceBaseUrl}/voice/transcribe`, headers, body, audioDurationSeconds, options?.onProgress);
 
   // Newer gateways acknowledge the upload immediately and transcribe in a
   // background job. This avoids holding a Cloudflare HTTP request open for the
   // entire Whisper run on long voice messages. Older gateways still work too.
-  if (response.status !== 202) return transcriptionText(response);
-  const accepted = (await response.json()) as {
+  if (upload.status !== 202) {
+    if (upload.status < 200 || upload.status >= 300) throw new Error(`Voice transcription failed (${upload.status})`);
+    const payload = JSON.parse(upload.text) as { text?: string } | string;
+    const text = typeof payload === "string" ? payload : payload.text;
+    if (!text?.trim()) throw new Error("Whisper returned an empty transcription.");
+    return text.trim();
+  }
+  const accepted = JSON.parse(upload.text) as {
     job_id?: string;
     progress?: number;
     eta_seconds?: number;
@@ -112,6 +159,7 @@ export async function transcribeVoice(
   };
   if (!accepted.job_id) throw new Error("Voice transcription job was not created.");
   let progressAnchor: TranscriptionProgress = {
+    phase: "transcribing",
     progress: accepted.progress ?? 0,
     etaSeconds: accepted.eta_seconds ?? null,
     elapsedSeconds: 0,
@@ -135,6 +183,7 @@ export async function transcribeVoice(
         const elapsed = anchorElapsed + sinceAnchor;
         options.onProgress?.({
           ...progressAnchor,
+          phase: "transcribing",
           progress: Math.min(0.95, Math.max(progressAnchor.progress, (elapsed / estimatedTotal) * 0.95)),
           etaSeconds: Math.max(0, estimatedTotal - elapsed),
           elapsedSeconds: elapsed,
@@ -156,6 +205,7 @@ export async function transcribeVoice(
         estimate?: boolean;
       };
       progressAnchor = {
+        phase: "transcribing",
         progress: status.progress ?? 0,
         etaSeconds: status.eta_seconds ?? null,
         elapsedSeconds: status.elapsed_seconds ?? null,
@@ -168,6 +218,7 @@ export async function transcribeVoice(
     }
     const text = await transcriptionText(poll);
     options?.onProgress?.({
+      phase: "finishing",
       progress: 1,
       etaSeconds: 0,
       elapsedSeconds: null,

@@ -265,6 +265,7 @@ export default function ChatScreen() {
   const [voiceReply, setVoiceReply] = useState<{ id: string; text: string } | null>(null);
   const [voicePlaying, setVoicePlaying] = useState(false);
   const [voiceProgress, setVoiceProgress] = useState({ current: 0, duration: 0 });
+  const finishingVoiceRef = useRef(false);
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
   const voicePlayRequestRef = useRef(0);
@@ -375,19 +376,46 @@ export default function ChatScreen() {
   }, [recorder, recorderState.isRecording]);
 
   const finishVoiceRecording = useCallback(async () => {
-    if (!activeProfile) return;
+    if (!activeProfile || finishingVoiceRef.current) return;
+    finishingVoiceRef.current = true;
     setVoiceError(null);
+    const durationSeconds = Math.max(0, recorderState.durationMillis / 1000);
+    // Flip the UI immediately, before native audio finalization. Long recordings
+    // can take noticeable time to close/write, and previously looked frozen here.
+    setVoiceRecording(false);
+    setTranscribingVoice(true);
+    setTranscriptionProgress({
+      phase: "preparing",
+      progress: 0,
+      etaSeconds: null,
+      elapsedSeconds: 0,
+      audioDurationSeconds: durationSeconds || null,
+      estimated: true,
+    });
+    let preparingTicker: ReturnType<typeof setInterval> | null = null;
     try {
-      if (recorderState.isRecording) await recorder.stop();
-      setVoiceRecording(false);
-      setTranscribingVoice(true);
-      setTranscriptionProgress({ progress: 0, etaSeconds: null, elapsedSeconds: 0, audioDurationSeconds: recorderState.durationMillis / 1000, estimated: true });
+      if (recorderState.isRecording) {
+        const preparingStartedAt = Date.now();
+        preparingTicker = setInterval(() => {
+          setTranscriptionProgress({
+            phase: "preparing",
+            progress: 0,
+            etaSeconds: null,
+            elapsedSeconds: (Date.now() - preparingStartedAt) / 1000,
+            audioDurationSeconds: durationSeconds || null,
+            estimated: true,
+          });
+        }, 250);
+        await recorder.stop();
+        clearInterval(preparingTicker);
+        preparingTicker = null;
+      }
       const uri = recorder.uri;
       if (!uri) throw new Error("The recording could not be saved.");
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
       const text = await transcribeVoice(uri, token, activeProfile.url, {
-        durationSeconds: recorderState.durationMillis / 1000,
+        durationSeconds,
         onProgress: setTranscriptionProgress,
       });
       if (voiceAutoSend) {
@@ -404,11 +432,13 @@ export default function ChatScreen() {
     } catch (error) {
       setVoiceError(error instanceof Error ? error.message : "Voice transcription failed.");
     } finally {
+      if (preparingTicker) clearInterval(preparingTicker);
+      finishingVoiceRef.current = false;
       setTranscribingVoice(false);
       setTranscriptionProgress(null);
       await setAudioModeAsync({ allowsRecording: false });
     }
-  }, [activeProfile, recorder, recorderState.isRecording, voiceAutoSend]);
+  }, [activeProfile, recorder, recorderState.isRecording, recorderState.durationMillis, voiceAutoSend]);
 
   // `forDuration` enforces the ten-minute ceiling in native audio code. Once
   // that automatic stop is reflected back into recorder state, finalize it just
@@ -1521,7 +1551,15 @@ export default function ChatScreen() {
             <View style={[styles.voiceRecorderPanel, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}>
               {transcribingVoice ? (
                 <>
-                  <Text role="bodyEm" tone="accent">Transcribing…</Text>
+                  <Text role="bodyEm" tone="accent">
+                    {transcriptionProgress?.phase === "preparing"
+                      ? "Preparing recording…"
+                      : transcriptionProgress?.phase === "uploading"
+                        ? "Uploading voice message…"
+                        : transcriptionProgress?.phase === "finishing"
+                          ? "Finishing transcription…"
+                          : "Transcribing…"}
+                  </Text>
                   <Text role="title">{Math.round((transcriptionProgress?.progress ?? 0) * 100)}%</Text>
                   <View
                     accessibilityRole="progressbar"
@@ -1539,11 +1577,15 @@ export default function ChatScreen() {
                     />
                   </View>
                   <Text role="sub" ink={2}>
-                    {transcriptionProgress?.etaSeconds === null || transcriptionProgress?.etaSeconds === undefined
-                      ? "Estimating time remaining…"
-                      : transcriptionProgress.etaSeconds > 0
-                        ? `Estimated ~${Math.max(1, Math.ceil(transcriptionProgress.etaSeconds))} sec remaining`
-                        : "Finishing transcription…"}
+                    {transcriptionProgress?.phase === "preparing"
+                      ? `Saving the recording before upload…${transcriptionProgress.elapsedSeconds ? ` ${Math.ceil(transcriptionProgress.elapsedSeconds)}s elapsed` : ""}`
+                      : transcriptionProgress?.etaSeconds === null || transcriptionProgress?.etaSeconds === undefined
+                        ? transcriptionProgress?.phase === "uploading"
+                          ? `Uploading…${transcriptionProgress.elapsedSeconds ? ` ${Math.ceil(transcriptionProgress.elapsedSeconds)}s elapsed` : ""}`
+                          : "Estimating time remaining…"
+                        : transcriptionProgress.etaSeconds > 0
+                          ? `Estimated ~${Math.max(1, Math.ceil(transcriptionProgress.etaSeconds))} sec remaining`
+                          : "Finishing transcription…"}
                   </Text>
                 </>
               ) : (
