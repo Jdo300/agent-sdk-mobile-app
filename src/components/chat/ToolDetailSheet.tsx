@@ -85,6 +85,7 @@ function PayloadSection({ label, text, tail }: { label: string; text: string; ta
 
 export const ToolDetailSheet = forwardRef<BottomSheetModal, { tool: ToolItem | null }>(
   function ToolDetailSheet({ tool }, ref) {
+    const { colors } = useTheme();
     const active = tool?.status === "pending" || tool?.status === "running";
     return (
       <Sheet ref={ref} scroll title={tool?.name ?? "Tool"}>
