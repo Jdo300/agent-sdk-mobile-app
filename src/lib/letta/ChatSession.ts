@@ -138,6 +138,19 @@ export function subscribeConversationActivity(listener: () => void): () => void 
   return () => activityListeners.delete(listener);
 }
 
+function sameTranscriptItem(a: TranscriptItem, b: TranscriptItem): boolean {
+  if (a.kind !== b.kind || a.id !== b.id) return false;
+  const aRecord = a as unknown as Record<string, unknown>;
+  const bRecord = b as unknown as Record<string, unknown>;
+  const aKeys = Object.keys(aRecord);
+  const bKeys = Object.keys(bRecord);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (!Object.is(aRecord[key], bRecord[key])) return false;
+  }
+  return true;
+}
+
 export class ChatSession {
   private conn: { profile: Profile; secret: string };
   private conversationId: string;
@@ -157,6 +170,11 @@ export class ChatSession {
    * approval flow owns, and rows the server has never seen.
    */
   private accumulator: TranscriptAccumulator = createTranscriptAccumulator();
+  /**
+   * Preserve projected row object identity when visible fields are unchanged so
+   * FlatList/React.memo can skip historical rows during streaming updates.
+   */
+  private projectedRowCache = new Map<string, TranscriptItem>();
   /**
    * Rows no server message can produce (an echo still in flight, an error),
    * each anchored to the number of accumulator rows that existed when it was
@@ -1913,7 +1931,19 @@ export class ChatSession {
       rowOccurredAt: this.rowOccurredAt,
       toolCompletedAt: this.toolCompletedAt,
     };
-    const items = projectRows(rows, state);
+    const projected = projectRows(rows, state);
+    const liveIds = new Set<string>();
+    const items = projected.map((item) => {
+      liveIds.add(item.id);
+      const previous = this.projectedRowCache.get(item.id);
+      if (previous && sameTranscriptItem(previous, item)) return previous;
+      this.projectedRowCache.set(item.id, item);
+      return item;
+    });
+    // Keep the cache bounded to rows that still exist in the accumulator.
+    for (const id of this.projectedRowCache.keys()) {
+      if (!liveIds.has(id)) this.projectedRowCache.delete(id);
+    }
 
     // An echo retires the moment the accumulator reports the persisted message
     // under the same otid — identity, not a guess about matching text.

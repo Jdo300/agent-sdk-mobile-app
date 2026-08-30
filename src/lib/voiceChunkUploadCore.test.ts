@@ -16,7 +16,8 @@ describe("voice background upload planning", () => {
     expect(stableVoiceUploadTarget(4_321_000, true)).toBe(4_321_000);
   });
 
-  test("caps each network write and advances without overlap", () => {
+  test("caps each network write to a UI-friendly background size and advances without overlap", () => {
+    expect(VOICE_MAX_CHUNK_BYTES).toBe(128 * 1024);
     expect(nextVoiceChunkRange(0, VOICE_MAX_CHUNK_BYTES + 500)).toEqual({
       offset: 0,
       length: VOICE_MAX_CHUNK_BYTES,

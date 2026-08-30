@@ -230,6 +230,27 @@ const TranscriptRow = memo(function TranscriptRow({
     case "error":
       return <ErrorRow item={item} onRetry={onErrorRetry} />;
   }
+}, (previous, next) => {
+  if (
+    previous.onUserRetry !== next.onUserRetry ||
+    previous.onUserRemove !== next.onUserRemove ||
+    previous.onUserCancel !== next.onUserCancel ||
+    previous.onToolPress !== next.onToolPress ||
+    previous.onErrorRetry !== next.onErrorRetry ||
+    previous.onToggleGroup !== next.onToggleGroup ||
+    previous.onAssistantReplay !== next.onAssistantReplay
+  ) return false;
+  if (previous.item === next.item) return true;
+  const previousItem = previous.item;
+  const nextItem = next.item;
+  if (previousItem.kind !== "toolGroup" || nextItem.kind !== "toolGroup") return false;
+  if (
+    previousItem.id !== nextItem.id ||
+    previousItem.failed !== nextItem.failed ||
+    previousItem.expanded !== nextItem.expanded ||
+    previousItem.tools.length !== nextItem.tools.length
+  ) return false;
+  return previousItem.tools.every((tool, index) => tool === nextItem.tools[index]);
 });
 
 function statusFor(

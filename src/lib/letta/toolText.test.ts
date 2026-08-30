@@ -20,4 +20,9 @@ describe("human-readable tool summaries", () => {
   test("falls back to a readable tool name instead of raw JSON", () => {
     expect(summarizeToolInput({ opaque: { nested: true } }, "custom_tool_name")).toBe("Custom tool name");
   });
+  test("does not scan an arbitrarily large shell payload just to label the card", () => {
+    const huge = `git status --short --branch\n${"x".repeat(250_000)}`;
+    expect(summarizeToolInput({ command: huge }, "Bash")).toBe("Check repository status");
+  });
+
 });

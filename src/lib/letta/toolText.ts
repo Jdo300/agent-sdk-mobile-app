@@ -44,7 +44,10 @@ function readableToolName(name: string): string {
 }
 
 function commandIntent(command: string): string | null {
-  const first = command.trim().split(/\n|&&|;/, 1)[0]?.trim() ?? "";
+  // Tool projection runs on every live stream update. Bound inspection to a
+  // short prefix so a generated multi-KB shell/script payload cannot turn the
+  // friendly-label feature into work proportional to the full command size.
+  const first = command.slice(0, 768).trim().split(/\n|&&|;/, 1)[0]?.trim() ?? "";
   if (!first) return null;
   if (/^(git\s+status|git\s+-[^ ]+\s+status)\b/i.test(first)) return "Check repository status";
   if (/^git\s+(diff|show|log)\b/i.test(first)) return "Inspect repository changes";

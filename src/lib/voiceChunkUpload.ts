@@ -91,13 +91,19 @@ export async function pumpVoiceChunkUpload(
   const file = new File(uri);
   const total = file.size;
   const target = stableVoiceUploadTarget(total, final);
-  while (session.offset < target) {
+  // While recording, do at most one small synchronous file read per timer tick.
+  // FileHandle.readBytes is a synchronous native call, so draining a large
+  // backlog here can monopolize the JS thread and make taps/scrolling feel
+  // frozen. After stop (`final=true`) responsiveness no longer competes with
+  // the recording UI, so flush the remaining ranges immediately.
+  do {
     const range = nextVoiceChunkRange(session.offset, target);
     if (!range) break;
     await uploadRange(session, uri, token, serverUrl, range.offset, range.length);
     session.offset += range.length;
     onProgress?.(session.offset, total);
-  }
+    if (!final) break;
+  } while (session.offset < target);
 }
 
 /** Re-send the container header after AVAudioRecorder closes and patches it. */

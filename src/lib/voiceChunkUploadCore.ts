@@ -1,5 +1,5 @@
 export const VOICE_LIVE_SAFETY_TAIL_BYTES = 64 * 1024;
-export const VOICE_MAX_CHUNK_BYTES = 1024 * 1024;
+export const VOICE_MAX_CHUNK_BYTES = 128 * 1024;
 
 export function stableVoiceUploadTarget(fileSize: number, final: boolean): number {
   const size = Math.max(0, Math.floor(fileSize));
