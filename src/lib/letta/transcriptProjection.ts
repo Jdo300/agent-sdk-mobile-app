@@ -38,7 +38,7 @@ export function projectRow(row: TranscriptRow, state: ProjectionState): Transcri
       id: row.key,
       toolCallId: row.toolCallId,
       name: row.toolName,
-      summary: summarizeToolInput(row.toolInput),
+      summary: summarizeToolInput(row.toolInput, row.toolName),
       input: formatToolInput(row.toolInput),
       // A denial is the user-meaningful terminal state and outranks the error
       // tool_result the server sends after it.

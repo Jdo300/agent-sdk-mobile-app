@@ -378,7 +378,7 @@ export const ToolGroupRow = memo(function ToolGroupRow({
   group: ToolGroupItem;
   onToggle: () => void;
 }) {
-  const names = [...new Set(group.tools.map((t) => t.name))];
+  const summaries = [...new Set(group.tools.map((t) => t.summary).filter(Boolean))];
   const label = `Ran ${group.tools.length} tool${group.tools.length === 1 ? "" : "s"}`;
   return (
     <Touchable
@@ -406,9 +406,9 @@ export const ToolGroupRow = memo(function ToolGroupRow({
               : ""}
           </Text>
         ) : null}
-        <Text role="sub" ink={3} numberOfLines={1} style={styles.reasoningPreview} mono>
-          {names.slice(0, 3).join(", ")}
-          {names.length > 3 ? "…" : ""}
+        <Text role="sub" ink={3} numberOfLines={1} style={styles.reasoningPreview}>
+          {summaries.slice(0, 3).join(" · ")}
+          {summaries.length > 3 ? "…" : ""}
         </Text>
         <Text role="sub" ink={3}>
           {group.expanded ? "▾" : "›"}
@@ -443,7 +443,7 @@ export const ToolCard = memo(function ToolCard({ item, onPress }: { item: ToolIt
         <Text role="sub" ink={2} tone={glyphTone}>
           {toolGlyph[item.status]}
         </Text>
-        <Text role="sub" ink={2} mono>
+        <Text role="sub" ink={2}>
           {item.name}
         </Text>
         {item.occurredAt ? (
@@ -468,7 +468,7 @@ export const ToolCard = memo(function ToolCard({ item, onPress }: { item: ToolIt
           </Text>
         ) : null}
       </View>
-      <Text role="sub" ink={2} mono numberOfLines={1}>
+      <Text role="sub" ink={1} numberOfLines={2}>
         {item.summary}
       </Text>
       {copied ? (

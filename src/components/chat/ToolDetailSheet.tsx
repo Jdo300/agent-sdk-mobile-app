@@ -112,8 +112,12 @@ export const ToolDetailSheet = forwardRef<BottomSheetModal, { tool: ToolItem | n
                 </Text>
               ) : null}
             </View>
+            <View style={[styles.intent, { borderColor: colors.surfaceEdge }]}>
+              <Text role="micro" ink={3}>What Milo is doing</Text>
+              <Text role="body" ink={1}>{tool.summary}</Text>
+            </View>
             {/* Keyed per call so Show more state never leaks across tools. */}
-            <PayloadSection key={`${tool.id}-in`} label="Input" text={tool.input ?? tool.summary} tail={false} />
+            <PayloadSection key={`${tool.id}-in`} label="Command / parameters" text={tool.input ?? tool.summary} tail={false} />
             {tool.result ? (
               <PayloadSection
                 key={`${tool.id}-out`}
@@ -135,6 +139,11 @@ export const ToolDetailSheet = forwardRef<BottomSheetModal, { tool: ToolItem | n
 
 const styles = StyleSheet.create({
   metaRow: { flexDirection: "row", alignItems: "center", gap: space.xs },
+  intent: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingBottom: space.md,
+    gap: space.xs,
+  },
   section: {
     borderWidth: StyleSheet.hairlineWidth,
     borderRadius: radius.row,

@@ -429,3 +429,14 @@ Verified 2026-07-25 against `letta-agent-sdk` +
 
 Every 🔌 row is a concrete upstream API request for the Agent SDK — the wrapper layer in
 `src/lib/letta/` is both the app's adapter and the SDK team's backlog, file by file.
+
+### Tool-call presentation hierarchy
+
+Tool activity in the transcript is supervisory UI, not a terminal dump. Collapsed tool cards should answer **what the agent is doing** before exposing **how it is doing it**.
+
+- Prefer explicit tool-provided `description`, `summary`, `purpose`, or `intent` metadata over raw command/path fields.
+- When no description exists, derive a concise deterministic activity label from common tool semantics (for example, `Check repository status`, `Run tests`, `Read voice_gateway.py`, or `Search for “…”`). Do not invoke another model merely to label a tool card.
+- Keep the underlying tool name/status/timing visible as secondary metadata.
+- Full command/parameter payloads and complete outputs remain available in the detail sheet for debugging/auditability.
+- Grouped settled-tool rows summarize the member activity descriptions rather than repeating opaque tool names such as `Bash, Bash, Read`.
+- Unknown tools fall back to a humanized tool name rather than raw JSON in the collapsed transcript.
