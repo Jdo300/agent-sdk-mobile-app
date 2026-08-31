@@ -8,6 +8,7 @@ import { forwardRef, useState } from "react";
 import { Platform, StyleSheet, TextInput, View } from "react-native";
 
 import type { ModelOption, ReasoningEffort } from "../../lib/letta/api";
+import { compatibleEffortForModel } from "../../lib/letta/modelSelection";
 
 const SheetTextInput = Platform.OS === "web" ? TextInput : NativeBottomSheetTextInput;
 import { useTheme } from "../../theme/ThemeProvider";
@@ -93,7 +94,7 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
               key={m.handle}
               accessibilityRole="button"
               accessibilityLabel={`Model ${m.label}${selected ? ", selected" : ""}`}
-              onPress={() => onSelect(m.handle, effort ?? undefined)}
+              onPress={() => onSelect(m.handle, compatibleEffortForModel(m, effort))}
               style={styles.modelRow}
             >
               <View style={styles.modelRowInner}>
