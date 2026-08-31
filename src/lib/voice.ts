@@ -322,7 +322,17 @@ export async function pollAcceptedTranscription(
     estimated: accepted.estimate ?? true,
   };
   let progressAnchorAt = Date.now();
-  options?.onProgress?.(progressAnchor);
+  let displayedProgress = Math.max(0, Math.min(0.95, progressAnchor.progress));
+  let completed = false;
+  const emitProgress = (progress: TranscriptionProgress) => {
+    if (completed && progress.phase !== "finishing") return;
+    const nextProgress = progress.phase === "finishing"
+      ? 1
+      : Math.max(displayedProgress, Math.min(0.95, progress.progress));
+    displayedProgress = nextProgress;
+    options?.onProgress?.({ ...progress, progress: nextProgress });
+  };
+  emitProgress(progressAnchor);
 
   // Server polling stays deliberately modest, but the UI should feel live.
   // Between authoritative estimates, advance the same elapsed/ETA model locally
@@ -336,7 +346,7 @@ export async function pollAcceptedTranscription(
         if (anchorEta === null || anchorEta <= 0) return;
         const estimatedTotal = Math.max(0.1, anchorElapsed + anchorEta);
         const elapsed = anchorElapsed + sinceAnchor;
-        options.onProgress?.({
+        emitProgress({
           ...progressAnchor,
           phase: "transcribing",
           progress: Math.min(0.95, Math.max(progressAnchor.progress, (elapsed / estimatedTotal) * 0.95)),
@@ -368,11 +378,13 @@ export async function pollAcceptedTranscription(
         estimated: status.estimate ?? true,
       };
       progressAnchorAt = Date.now();
-      options?.onProgress?.(progressAnchor);
+      emitProgress(progressAnchor);
       continue;
     }
     const text = await transcriptionText(poll);
-    options?.onProgress?.({
+    completed = true;
+    if (progressTicker) clearInterval(progressTicker);
+    emitProgress({
       phase: "finishing",
       progress: 1,
       etaSeconds: 0,
