@@ -1458,6 +1458,20 @@ export class ChatSession {
             "Delivery was interrupted before confirmation.",
           ).catch(() => {});
         }
+        // awaiting_echo means the App Server accepted the send but this client
+        // has not yet observed its persisted user UUID. With a bounded hot
+        // history window, absence from the newest cached rows is NOT evidence
+        // that the send is missing. Rendering it here would resurrect an old
+        // optimistic echo at the end of the transcript on every cold open.
+        if (item.state === "awaiting_echo") {
+          emitSyncTelemetry({
+            kind: "sync_retry",
+            conversationId: this.conversationId,
+            generation,
+            reason: "withheld_ambiguous_outbox_echo",
+          });
+          continue;
+        }
         this.localRows.push({
           anchor: this.accumulator.rows().length,
           item: {
@@ -1466,9 +1480,7 @@ export class ChatSession {
             text: item.text,
             occurredAt: item.createdAt,
             ...(item.attachments.length > 0 ? { images: item.attachments.map((attachment) => attachment.uri) } : {}),
-            ...(item.state === "failed" || item.state === "queued" || item.state === "sending"
-              ? { failed: true }
-              : {}),
+            failed: true,
           },
         });
       }
@@ -1992,7 +2004,16 @@ export class ChatSession {
       if (acknowledged) acknowledgedEchoes.add(item.id);
       return !acknowledged;
     });
-    for (const otid of acknowledgedEchoes) this.echoOtids.delete(otid);
+    for (const otid of acknowledgedEchoes) {
+      this.echoOtids.delete(otid);
+      this.unacknowledgedOtids.delete(otid);
+      this.pendingAttachments.delete(otid);
+      this.queuedRecoveryTurns = this.queuedRecoveryTurns.filter((item) => item.otid !== otid);
+      // The live persisted USER row is definitive acknowledgement. Retire the
+      // durable outbox immediately; waiting for a later canonical-window save
+      // is unsafe once old user rows can age out of the bounded hot cache.
+      void removeDurableOutbox(this.conn.profile.id, this.conversationId, otid).catch(() => {});
+    }
 
     const transcript: TranscriptItem[] = [];
     let placed = 0;
