@@ -45,7 +45,7 @@ import {
   updateDurableOutboxState,
   type DurableOutboxItem,
 } from "./durableChatStore";
-import { mergeForwardMessages, newestDurableMessageId } from "./durableSyncCore";
+import { mergeForwardMessages, newestDurableMessageId, persistedUserOtids } from "./durableSyncCore";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -274,10 +274,14 @@ export class ChatSession {
     const existing = retainedChatSessions.get(key);
     if (existing && !existing.closed) {
       // Refresh credentials/profile metadata in case the saved connection changed
-      // while the screen was away, but preserve the live SDK session and stream.
+      // while the screen was away, but preserve an active SDK run. Reattaching a
+      // previously-unobserved view must still revalidate server history: a retained
+      // stream snapshot is useful continuity, not an authoritative reopen source.
+      const wasUnobserved = existing.viewRefs === 0;
       existing.conn = conn;
       if (initialPermissionMode) existing.preferredPermissionMode = initialPermissionMode;
       existing.viewRefs += 1;
+      if (wasUnobserved) void existing.reconnect();
       return existing;
     }
 
@@ -516,7 +520,12 @@ export class ChatSession {
         { otid },
       );
       this.armSendActivityWatch(activityBeforeSend);
-      await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "awaiting_echo");
+      // The durable outbox owns the message only until the App Server accepts the
+      // SDK handoff. After send() resolves, replaying or later labelling it unsent
+      // would risk duplicates and false failures. The live optimistic row may stay
+      // visible until its persisted user echo arrives, but process-restart truth is
+      // now server history, not a lingering awaiting_echo journal record.
+      await removeDurableOutbox(this.conn.profile.id, this.conversationId, otid).catch(() => {});
     } catch (e) {
       const detail = e instanceof Error ? e.message : "Send failed.";
       await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "failed", detail).catch(() => {});
@@ -1431,14 +1440,12 @@ export class ChatSession {
       const cached = await loadDurableConversation(this.conn.profile.id, this.conversationId);
       if (!this.reconciliationIsCurrent(generation, "durable_cache_load")) return false;
       this.durableHydrated = true;
-      this.nextBefore = cached.nextBefore;
-      this.forwardAfter = cached.forwardAfter;
-      if (cached.messages.length > 0) {
-        this.loadedHistoryMessages = cached.messages;
-        this.accumulator = rebuildAuthoritativeTranscript(cached.messages);
-        this.captureHistoryTimestamps(cached.messages);
-      }
-      const persistedOtids = new Set(userRowOtids(this.accumulator.rows()));
+
+      // SQLite is a journal/cache, never a source of visible conversation truth on
+      // normal open. In particular, do NOT seed loadedHistoryMessages, cursors, or
+      // the accumulator from cached history here. The server's newest page below
+      // is the only history allowed to leave the hydrating state.
+      const persistedOtids = new Set(persistedUserOtids(cached.messages));
       this.queuedRecoveryTurns = cached.outbox.filter((item) => outboxRecoveryAction(item.state) === "replay");
       for (const item of cached.outbox) {
         if (persistedOtids.has(item.otid)) {
@@ -1446,47 +1453,40 @@ export class ChatSession {
           void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
           continue;
         }
-        if (item.state !== "failed") this.unacknowledgedOtids.add(item.otid);
-        this.echoOtids.add(item.otid);
-        if (item.attachments.length > 0) this.pendingAttachments.set(item.otid, item.attachments);
-        if (item.state === "queued" || item.state === "sending") {
-          void updateDurableOutboxState(
-            this.conn.profile.id,
-            this.conversationId,
-            item.otid,
-            "failed",
-            "Delivery was interrupted before confirmation.",
-          ).catch(() => {});
-        }
-        // awaiting_echo means the App Server accepted the send but this client
-        // has not yet observed its persisted user UUID. With a bounded hot
-        // history window, absence from the newest cached rows is NOT evidence
-        // that the send is missing. Rendering it here would resurrect an old
-        // optimistic echo at the end of the transcript on every cold open.
-        if (item.state === "awaiting_echo") {
+
+        const recovery = outboxRecoveryAction(item.state);
+        if (recovery === "converge") {
+          // Old versions kept sending/awaiting_echo rows after handoff. They are
+          // ambiguous after a restart and must never become fake "Not sent" rows.
+          // Keep no visible/local echo; authoritative server history decides.
           emitSyncTelemetry({
             kind: "sync_retry",
             conversationId: this.conversationId,
             generation,
-            reason: "withheld_ambiguous_outbox_echo",
+            reason: "discarded_legacy_ambiguous_outbox",
           });
+          void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
           continue;
         }
+
+        if (item.attachments.length > 0) this.pendingAttachments.set(item.otid, item.attachments);
+        this.echoOtids.add(item.otid);
         this.localRows.push({
-          anchor: this.accumulator.rows().length,
+          // Project after whatever authoritative newest page is fetched below.
+          anchor: Number.MAX_SAFE_INTEGER,
           item: {
             kind: "user",
             id: item.otid,
             text: item.text,
             occurredAt: item.createdAt,
             ...(item.attachments.length > 0 ? { images: item.attachments.map((attachment) => attachment.uri) } : {}),
-            failed: true,
+            ...(item.state === "failed" ? { failed: true } : { pending: true, cancelable: true }),
           },
         });
       }
-      if (cached.messages.length > 0 || cached.outbox.length > 0) {
-        this.commit(this.project(this.snapshot));
-      }
+      // Do not commit cache-derived rows yet. The first visible transcript commit
+      // happens only after authoritative newest history has been fetched. Local
+      // queued/failed rows are projected on top of that server page afterward.
       return true;
     } catch {
       // Cache failure must not block server hydration; the network path repairs it.
@@ -1522,45 +1522,31 @@ export class ChatSession {
   /**
    * Load existing history before any turn runs.
    *
-   * Cloud: over REST — opening a cloud session provisions a sandbox, far too
-   * heavy for just reading (SDK-FEEDBACK.md #3).
-   * Remote: through the session itself — remote sessions are cheap, and the
-   * app-server accepts only ONE control-channel client per process, so using
-   * the SDK's management transport here would hold the slot and deadlock the
-   * session's own connect (SDK-FEEDBACK.md "Still open" #4).
+   * Persisted history is read through the SDK management client on both backends.
+   * It is intentionally independent from the live runtime/viewer so cold-open
+   * history cannot race stream mutation. Cloud execution stays lazy; remote
+   * runtime attachment happens only after the authoritative page is painted.
    */
   private async hydrate(options?: { reconcileDevice?: boolean; applyHistory?: boolean; generation?: number }): Promise<boolean> {
     const generation = options?.generation ?? this.reconciliationGeneration;
     try {
       if (!(await this.hydrateDurableCache(generation))) return false;
-      if (this.conn.profile.type === "remote") {
-        // Survive React dev double-mounting: the first, immediately-closed
-        // instance must not open sockets, or its teardown races the second
-        // instance for the app-server's single control slot.
+      if (this.conn.profile.type === "remote" && options?.applyHistory !== false) {
+        // Initial React dev double-mount protection only. Reconnect/reattach uses
+        // pure management history and should revalidate immediately.
         await new Promise((resolve) => setTimeout(resolve, 400));
         if (!this.reconciliationIsCurrent(generation, "hydrate_remote_delay")) return false;
       }
-      const initialOpen = options?.applyHistory !== false && this.snapshot.hydrating;
-      const hadDurableHistory = this.loadedHistoryMessages.length > 0;
-      const durableBefore = this.nextBefore;
-      // A cold open is a viewport operation, not a full-history convergence job.
-      // Fetch the newest bounded server window immediately and paint it. Reconnect
-      // recovery keeps the exhaustive forward-sync path because delivery/OTID
-      // convergence matters there; ordinary navigation must never page through a
-      // huge backlog before the user can interact with the chat.
-      if (!initialOpen && hadDurableHistory && this.forwardAfter) {
-        if (!(await this.syncForwardHistory(generation))) return false;
-      }
+      // Opening/reopening is always latest-first and server-authoritative. Do not
+      // forward-sync from a cache cursor or merge an older local window into the
+      // newest page: those operations made result order depend on which async path
+      // completed first. Older history is a viewport concern and can be paged again.
       const page = await this.fetchInitialHistory();
       if (!this.reconciliationIsCurrent(generation, "hydrate_initial_history")) return false;
       this.observePersistedHistory(page.messages, generation, "hydrate");
-      if (initialOpen) {
-        this.loadedHistoryMessages = [...page.messages];
-        this.nextBefore = page.nextBefore;
-      } else {
-        this.nextBefore = hadDurableHistory ? durableBefore : page.nextBefore;
-        this.mergeLatestHistory(page.messages);
-      }
+      this.loadedHistoryMessages = [...page.messages];
+      this.nextBefore = page.nextBefore;
+      this.forwardAfter = newestDurableMessageId(page.messages);
       if (!(await this.persistCanonicalWindow(generation))) return false;
       // Initial hydration has no live row. Reconnect hydration deliberately
       // defers this until device status says idle (see performReconnect()).
@@ -1569,21 +1555,29 @@ export class ChatSession {
       }
       this.captureHistoryTimestamps(page.messages);
 
-      let next = this.project(patch(this.snapshot, { hasMore: page.hasMore }));
-      if (options?.reconcileDevice !== false && this.session) {
-        // Cold open/reload must establish runtime truth before the UI claims the
-        // conversation is ready. The SDK session was created with the saved
-        // permission mode, so approval recovery cannot race a later mode restore.
-        // A stranded unrestricted tool therefore resumes here instead of being
-        // rendered as an idle-looking forever-running card.
-        await this.session.recoverPendingApprovals().catch(() => {});
-        if (!this.reconciliationIsCurrent(generation, "hydrate_approvals")) return false;
-        const status = await this.session.getDeviceStatus().catch(() => null);
-        if (!this.reconciliationIsCurrent(generation, "hydrate_device_status")) return false;
-        if (status) next = this.applyDeviceStatus(next, status);
+      // Paint authoritative persisted history before attaching any live runtime.
+      // A stream callback must never race this operation and then be overwritten
+      // by a snapshot captured before that callback ran.
+      if (options?.applyHistory !== false) {
+        if (!this.reconciliationIsCurrent(generation, "hydrate_history_commit")) return false;
+        this.commit(patch(this.project(patch(this.snapshot, { hasMore: page.hasMore })), { hydrating: false }));
       }
-      if (!this.reconciliationIsCurrent(generation, "hydrate_commit")) return false;
-      this.commit(patch(next, { hydrating: false }));
+
+      if (options?.reconcileDevice !== false) {
+        // Remote runtimes are cheap; attach only after persisted history is on
+        // screen. Cloud remains lazy to avoid provisioning execution just to read.
+        if (this.conn.profile.type === "remote" && !this.session) this.ensureSession();
+        const session = this.session;
+        if (session) {
+          await session.recoverPendingApprovals().catch(() => {});
+          if (!this.reconciliationIsCurrent(generation, "hydrate_approvals") || this.session !== session) return false;
+          const status = await session.getDeviceStatus().catch(() => null);
+          if (!this.reconciliationIsCurrent(generation, "hydrate_device_status") || this.session !== session) return false;
+          if (status) this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
+        }
+      }
+
+      if (options?.applyHistory === false && !this.reconciliationIsCurrent(generation, "hydrate_reconnect_complete")) return false;
 
       const queued = this.queuedRecoveryTurns.filter((item) =>
         this.localRows.some((row) => row.item.kind === "user" && row.item.id === item.otid),
@@ -1657,10 +1651,6 @@ export class ChatSession {
     after: string,
     limit = AUTHORITATIVE_PAGE_SIZE,
   ): Promise<{ messages: unknown[]; hasMore: boolean }> {
-    if (this.conn.profile.type === "remote") {
-      const result = await this.ensureSession().listMessages({ after, order: "asc", limit });
-      return { messages: result.messages, hasMore: result.hasMore ?? result.messages.length >= limit };
-    }
     const result = await listConversationMessages(this.conn, this.conversationId, { after, order: "asc", limit });
     return { messages: result.messages, hasMore: result.hasMore };
   }
@@ -1699,19 +1689,9 @@ export class ChatSession {
     before?: string,
     limit = AUTHORITATIVE_PAGE_SIZE,
   ): Promise<{ messages: unknown[]; nextBefore: string | null; hasMore: boolean }> {
-    // Both backends page reliably now (letta-cloud#13377 + letta-code#3526), so
-    // the first paint stays cheap and older pages arrive on scroll.
-    if (this.conn.profile.type === "remote") {
-      const result = await this.ensureSession().listMessages({ limit, ...(before ? { before } : {}) });
-      const messages = result.messages.slice().reverse();
-      const oldestId = (messages[0] as { id?: string } | undefined)?.id ?? null;
-      const full = result.messages.length >= limit;
-      return {
-        messages,
-        nextBefore: result.nextBefore ?? (full ? oldestId : null),
-        hasMore: result.hasMore ?? full,
-      };
-    }
+    // History is a pure management read on both backends. Do not create/resume a
+    // live runtime merely to fetch persisted messages; doing so lets stream state
+    // race the authoritative cold-open rebase.
     return listConversationMessages(this.conn, this.conversationId, { limit, ...(before ? { before } : {}) });
   }
 
