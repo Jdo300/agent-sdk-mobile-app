@@ -1978,9 +1978,9 @@ const attachImage = useCallback(async () => {
           accessibilityRole="button"
           accessibilityLabel="Attach a photo"
           onPress={() => void attachImage()}
-          style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.md, borderRadius: radius.row }}
+          style={styles.attachMenuRow}
         >
-          <Text role="body" ink={1} style={{ fontSize: 20 }}>📷</Text>
+          <View style={styles.attachMenuIcon}><Text role="body" ink={1} style={{ fontSize: 20 }}>📷</Text></View>
           <View>
             <Text role="title">Photo</Text>
             <Text role="micro" ink={3}>From your library</Text>
@@ -1990,9 +1990,9 @@ const attachImage = useCallback(async () => {
           accessibilityRole="button"
           accessibilityLabel="Attach a recording to transcribe"
           onPress={() => void attachAudio()}
-          style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.md, borderRadius: radius.row }}
+          style={styles.attachMenuRow}
         >
-          <Text role="body" ink={1} style={{ fontSize: 20 }}>🎙</Text>
+          <View style={styles.attachMenuIcon}><Text role="body" ink={1} style={{ fontSize: 20 }}>🎙</Text></View>
           <View>
             <Text role="title">Audio</Text>
             <Text role="micro" ink={3}>Pick a recording to transcribe</Text>
@@ -2262,6 +2262,18 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   attachButton: { paddingRight: space.sm, minHeight: 32, justifyContent: "center" },
+  attachMenuRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.md,
+    paddingVertical: space.md,
+    borderRadius: radius.row,
+  },
+  attachMenuIcon: {
+    width: 28,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   attachSend: {
     flexDirection: "row",
     alignItems: "center",
