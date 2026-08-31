@@ -85,6 +85,10 @@ function uploadVoice(
     const xhr = new XMLHttpRequest();
     const startedAt = Date.now();
     xhr.open("POST", url);
+    // React Native XHR has no default timeout. A wedged radio/socket would
+    // otherwise leave the voice UI awaiting this promise forever. Two minutes
+    // is deliberately generous for a long recording over a poor connection.
+    xhr.timeout = 120_000;
     for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
     xhr.upload.onprogress = (event) => {
       const now = Date.now();
