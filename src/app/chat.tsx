@@ -11,6 +11,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   FlatList,
   Keyboard,
   KeyboardAvoidingView,
@@ -96,6 +97,7 @@ import {
   type TranscriptionProgress,
 } from "../lib/voice";
 import { registerConversationPush } from "../lib/pushNotifications";
+import { newVoiceTraceId, replayPersistedVoiceTrace, voiceTrace } from "../lib/voiceDiagnostics";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
 import { motion, radius, space } from "../theme/tokens";
@@ -291,6 +293,7 @@ export default function ChatScreen() {
   const [voicePlaying, setVoicePlaying] = useState(false);
   const [voiceProgress, setVoiceProgress] = useState({ current: 0, duration: 0 });
   const finishingVoiceRef = useRef(false);
+  const voiceTraceIdRef = useRef<string | null>(null);
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
   const voicePlayRequestRef = useRef(0);
@@ -301,6 +304,26 @@ export default function ChatScreen() {
   const voiceDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 100);
+
+  useEffect(() => {
+    void replayPersistedVoiceTrace();
+    let expected = Date.now() + 1000;
+    const stallTimer = setInterval(() => {
+      const now = Date.now();
+      const delayMs = now - expected;
+      expected = now + 1000;
+      const traceId = voiceTraceIdRef.current;
+      if (traceId && delayMs > 1500) voiceTrace(traceId, "js_event_loop_stall", { delayMs });
+    }, 1000);
+    const appStateSub = AppState.addEventListener("change", (state) => {
+      const traceId = voiceTraceIdRef.current;
+      if (traceId) voiceTrace(traceId, "app_state", { state });
+    });
+    return () => {
+      clearInterval(stallTimer);
+      appStateSub.remove();
+    };
+  }, []);
 
   useEffect(() => {
     void getVoiceMode().then((mode) => {
@@ -377,15 +400,22 @@ export default function ChatScreen() {
 
   const startVoiceRecording = useCallback(async () => {
     if (!activeProfile || voiceRecording || transcribingVoice) return;
+    const traceId = newVoiceTraceId();
+    voiceTraceIdRef.current = traceId;
+    voiceTrace(traceId, "record_start_requested", { conversationId: params.conversationId });
     setVoiceError(null);
     const permission = await requestRecordingPermissionsAsync();
+    voiceTrace(traceId, "record_permission", { granted: permission.granted });
     if (!permission.granted) {
       setVoiceError("Microphone permission is required for voice messages.");
       return;
     }
     await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+    voiceTrace(traceId, "recorder_prepare_begin");
     await recorder.prepareToRecordAsync();
+    voiceTrace(traceId, "recorder_prepare_done");
     recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
+    voiceTrace(traceId, "recorder_record_called");
     setVoiceRecording(true);
     haptic.tap();
   }, [activeProfile, voiceRecording, transcribingVoice, recorder]);
@@ -402,6 +432,9 @@ export default function ChatScreen() {
 
   const finishVoiceRecording = useCallback(async () => {
     if (!activeProfile || finishingVoiceRef.current) return;
+    const traceId = voiceTraceIdRef.current ?? newVoiceTraceId();
+    voiceTraceIdRef.current = traceId;
+    voiceTrace(traceId, "finish_requested", { isRecording: recorderState.isRecording, durationMillis: recorderState.durationMillis });
     finishingVoiceRef.current = true;
     setVoiceError(null);
     const durationSeconds = Math.max(0, recorderState.durationMillis / 1000);
@@ -431,11 +464,14 @@ export default function ChatScreen() {
             estimated: true,
           });
         }, 250);
+        voiceTrace(traceId, "recorder_stop_begin");
         await recorder.stop();
+        voiceTrace(traceId, "recorder_stop_done", { uriAvailable: Boolean(recorder.uri) });
         clearInterval(preparingTicker);
         preparingTicker = null;
       }
       const uri = recorder.uri;
+      voiceTrace(traceId, "recording_uri", { available: Boolean(uri) });
       if (!uri) throw new Error("The recording could not be saved.");
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (!token) throw new Error("The Local Milo capability token is unavailable.");
@@ -444,17 +480,25 @@ export default function ChatScreen() {
       // devices: a background read could overlap stop()/container finalization and
       // wedge the native audio/file path. Upload the completed file only after
       // recorder.stop() has returned; the XHR upload still reports real progress.
+      voiceTrace(traceId, "transcribe_call_begin");
       const text = await transcribeVoice(uri, token, activeProfile.url, {
         durationSeconds,
-        onProgress: setTranscriptionProgress,
+        traceId,
+        onProgress: (progress) => {
+          voiceTrace(traceId, "ui_progress", { phase: progress.phase, progress: progress.progress });
+          setTranscriptionProgress(progress);
+        },
       });
+      voiceTrace(traceId, "transcribe_call_done", { textLength: text.length });
       if (voiceAutoSend) {
         const session = sessionRef.current;
         if (!session) throw new Error("Milo's chat session is not ready yet.");
         followLiveRef.current = true;
         nearBottomRef.current = true;
         setNearBottom(true);
+        voiceTrace(traceId, "autosend_begin", { textLength: text.length });
         const sent = await session.send(text);
+        voiceTrace(traceId, "autosend_result", { sent });
         if (!sent) {
           throw new Error("Transcription completed, but the chat send failed. Your transcript is preserved as an unsent message below; tap Retry to send it again.");
         }
@@ -463,6 +507,7 @@ export default function ChatScreen() {
         setDraft(text);
       }
     } catch (error) {
+      voiceTrace(traceId, "voice_flow_error", { message: error instanceof Error ? error.message : String(error) });
       setVoiceError(error instanceof Error ? error.message : "Voice transcription failed.");
     } finally {
       if (preparingTicker) clearInterval(preparingTicker);
@@ -470,6 +515,8 @@ export default function ChatScreen() {
       setTranscribingVoice(false);
       setTranscriptionProgress(null);
       await setAudioModeAsync({ allowsRecording: false });
+      voiceTrace(traceId, "voice_flow_finally");
+      voiceTraceIdRef.current = null;
     }
   }, [activeProfile, recorder, recorderState.isRecording, recorderState.durationMillis, voiceAutoSend]);
 

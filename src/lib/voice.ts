@@ -1,4 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as LegacyFileSystem from "expo-file-system/legacy";
+
+import { voiceTrace } from "./voiceDiagnostics";
 
 import { voiceHttpBaseUrl } from "./voiceTransport";
 
@@ -77,7 +80,7 @@ export type AcceptedTranscriptionJob = {
 class VoiceUploadRetryableError extends Error {}
 
 const VOICE_UPLOAD_STALL_MS = 12_000;
-const VOICE_UPLOAD_MAX_ATTEMPTS = 3;
+const VOICE_NATIVE_UPLOAD_STALL_MS = 30_000;
 
 function uploadVoice(
   url: string,
@@ -85,6 +88,7 @@ function uploadVoice(
   body: FormData,
   audioDurationSeconds: number | null,
   attempt: number,
+  traceId: string,
   onProgress?: (progress: TranscriptionProgress) => void,
 ): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
@@ -103,7 +107,7 @@ function uploadVoice(
       settled = true;
       clearStallTimer();
       try { xhr.abort(); } catch {}
-      console.info("[bloop-voice] upload retryable failure", { attempt, loaded: lastLoaded, message });
+      voiceTrace(traceId, "xhr_retryable_failure", { attempt, loaded: lastLoaded, message });
       reject(new VoiceUploadRetryableError(message));
     };
     const armStallTimer = () => {
@@ -145,15 +149,76 @@ function uploadVoice(
       if (settled) return;
       settled = true;
       clearStallTimer();
-      console.info("[bloop-voice] upload completed", { attempt, status: xhr.status, loaded: lastLoaded });
+      voiceTrace(traceId, "xhr_completed", { attempt, status: xhr.status, loaded: lastLoaded });
       resolve({ status: xhr.status, text: xhr.responseText ?? "" });
     };
     // Cover the specific failure where RN creates the XHR but emits no initial
     // upload progress at all. Any real byte movement rearms this timer.
     armStallTimer();
-    console.info("[bloop-voice] upload started", { attempt });
+    voiceTrace(traceId, "xhr_started", { attempt });
     xhr.send(body);
   });
+}
+
+async function uploadVoiceNative(
+  url: string,
+  headers: Record<string, string>,
+  uri: string,
+  audioDurationSeconds: number | null,
+  traceId: string,
+  onProgress?: (progress: TranscriptionProgress) => void,
+): Promise<{ status: number; text: string }> {
+  const startedAt = Date.now();
+  let lastLoaded = 0;
+  let lastProgressAt = startedAt;
+  const task = LegacyFileSystem.createUploadTask(
+    url,
+    uri,
+    {
+      headers,
+      httpMethod: "POST",
+      uploadType: LegacyFileSystem.FileSystemUploadType.MULTIPART,
+      fieldName: "file",
+      mimeType: "audio/mp4",
+      parameters: { model: WHISPER_MODEL, stream: "true" },
+      sessionType: LegacyFileSystem.FileSystemSessionType.BACKGROUND,
+    },
+    ({ totalBytesSent, totalBytesExpectedToSend }) => {
+      const now = Date.now();
+      if (totalBytesSent > lastLoaded) {
+        lastLoaded = totalBytesSent;
+        lastProgressAt = now;
+      }
+      const elapsed = Math.max(0, (now - startedAt) / 1000);
+      const total = totalBytesExpectedToSend > 0 ? totalBytesExpectedToSend : 0;
+      const fraction = total > 0 ? Math.max(0, Math.min(0.99, totalBytesSent / total)) : 0;
+      const bytesPerSecond = elapsed > 0.15 ? totalBytesSent / elapsed : 0;
+      const eta = total > totalBytesSent && bytesPerSecond > 0 ? (total - totalBytesSent) / bytesPerSecond : null;
+      voiceTrace(traceId, "native_progress", { loaded: totalBytesSent, total });
+      onProgress?.({ phase: "uploading", progress: fraction, etaSeconds: eta, elapsedSeconds: elapsed, audioDurationSeconds, estimated: true });
+    },
+  );
+  voiceTrace(traceId, "native_started");
+  let watchdog: ReturnType<typeof setInterval> | null = null;
+  try {
+    const watchdogPromise = new Promise<never>((_, reject) => {
+      watchdog = setInterval(() => {
+        if (Date.now() - lastProgressAt < VOICE_NATIVE_UPLOAD_STALL_MS) return;
+        voiceTrace(traceId, "native_stalled", { loaded: lastLoaded });
+        void task.cancelAsync().catch(() => {});
+        reject(new VoiceUploadRetryableError("Native voice upload stalled."));
+      }, 1000);
+    });
+    const result = await Promise.race([task.uploadAsync(), watchdogPromise]);
+    if (!result) throw new VoiceUploadRetryableError("Native voice upload ended without a response.");
+    voiceTrace(traceId, "native_completed", { status: result.status, loaded: lastLoaded });
+    return { status: result.status, text: result.body ?? "" };
+  } catch (error) {
+    voiceTrace(traceId, "native_failed", { message: error instanceof Error ? error.message : String(error), loaded: lastLoaded });
+    throw error;
+  } finally {
+    if (watchdog) clearInterval(watchdog);
+  }
 }
 
 async function transcriptionText(response: Response): Promise<string> {
@@ -168,9 +233,11 @@ export async function transcribeVoice(
   uri: string,
   token: string,
   serverUrl: string,
-  options?: { durationSeconds?: number; onProgress?: (progress: TranscriptionProgress) => void },
+  options?: { durationSeconds?: number; onProgress?: (progress: TranscriptionProgress) => void; traceId?: string },
 ): Promise<string> {
   const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
+  const traceId = options?.traceId ?? `voice-${Date.now().toString(36)}`;
+  voiceTrace(traceId, "transcribe_begin", { durationSeconds: options?.durationSeconds ?? null });
   const makeBody = () => {
     const body = new FormData();
     body.append("model", WHISPER_MODEL);
@@ -196,33 +263,32 @@ export async function transcribeVoice(
     audioDurationSeconds,
     estimated: true,
   });
-  let upload: { status: number; text: string } | null = null;
-  for (let attempt = 1; attempt <= VOICE_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      upload = await uploadVoice(
-        `${voiceBaseUrl}/voice/transcribe`,
-        headers,
-        makeBody(),
-        audioDurationSeconds,
-        attempt,
-        options?.onProgress,
-      );
-      break;
-    } catch (error) {
-      if (!(error instanceof VoiceUploadRetryableError) || attempt >= VOICE_UPLOAD_MAX_ATTEMPTS) throw error;
-      console.info("[bloop-voice] retrying upload", { attempt, nextAttempt: attempt + 1 });
-      options?.onProgress?.({
-        phase: "uploading",
-        progress: 0,
-        etaSeconds: null,
-        elapsedSeconds: 0,
-        audioDurationSeconds,
-        estimated: true,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
-    }
+  let upload: { status: number; text: string };
+  try {
+    upload = await uploadVoice(
+      `${voiceBaseUrl}/voice/transcribe`,
+      headers,
+      makeBody(),
+      audioDurationSeconds,
+      1,
+      traceId,
+      options?.onProgress,
+    );
+  } catch (error) {
+    if (!(error instanceof VoiceUploadRetryableError)) throw error;
+    // RN XHR occasionally wedges before transmitting byte zero on physical iOS.
+    // Switch transports instead of retrying the same stuck networking layer.
+    voiceTrace(traceId, "fallback_to_native", { reason: error.message });
+    options?.onProgress?.({ phase: "uploading", progress: 0, etaSeconds: null, elapsedSeconds: 0, audioDurationSeconds, estimated: true });
+    upload = await uploadVoiceNative(
+      `${voiceBaseUrl}/voice/transcribe`,
+      headers,
+      uri,
+      audioDurationSeconds,
+      traceId,
+      options?.onProgress,
+    );
   }
-  if (!upload) throw new Error("Voice upload failed.");
 
   // Newer gateways acknowledge the upload immediately and transcribe in a
   // background job. This avoids holding a Cloudflare HTTP request open for the
