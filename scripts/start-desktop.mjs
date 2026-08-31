@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import http from "node:http";
+import { readFileSync } from "node:fs";
 import process from "node:process";
 import httpProxy from "http-proxy";
 import { WebSocket, WebSocketServer } from "ws";
@@ -12,6 +13,10 @@ const WEB_PORT = Number(process.env.BLOOP_WEB_PORT ?? 8082);
 const EXPO_PORT = Number(process.env.BLOOP_EXPO_PORT ?? 8083);
 const TOKEN_PROTOCOL_PREFIX = "letta-bearer.";
 const NO_AUTH_PROTOCOL = "letta-noauth";
+const LOCAL_PROFILE_ID = "profile-local-milo-office";
+const LOCAL_PROFILE_NAME = process.env.BLOOP_LOCAL_PROFILE_NAME ?? "Local Milo";
+const LOCAL_TARGET = process.env.BLOOP_LOCAL_TARGET ?? "ws://10.0.0.128:4610";
+const LOCAL_TOKEN_FILE = process.env.BLOOP_LOCAL_TOKEN_FILE ?? `${process.env.HOME}/.config/bloop/local-milo-token`;
 
 function isLoopbackOrigin(origin) {
   if (!origin) return false;
@@ -27,6 +32,26 @@ function decodeBase64Url(value) {
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
   const padding = "=".repeat((4 - (normalized.length % 4)) % 4);
   return Buffer.from(normalized + padding, "base64").toString("utf8");
+}
+
+function normalizedWsTarget(value) {
+  const parsed = new URL(value);
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+function localCapabilityToken() {
+  const token = readFileSync(LOCAL_TOKEN_FILE, "utf8").trim();
+  if (!token) throw new Error(`Local Milo token file is empty: ${LOCAL_TOKEN_FILE}`);
+  return token;
+}
+
+function isLocalTarget(target) {
+  try {
+    return normalizedWsTarget(target) === normalizedWsTarget(LOCAL_TARGET);
+  } catch {
+    return false;
+  }
 }
 
 const bridge = new WebSocketServer({
@@ -60,6 +85,19 @@ bridge.on("connection", (browser, request) => {
       browser.close(1008, "Invalid authentication token");
       return;
     }
+  } else if (browser.protocol === NO_AUTH_PROTOCOL && isLocalTarget(target)) {
+    try {
+      token = localCapabilityToken();
+    } catch {
+      browser.close(1011, "Local Milo credential unavailable");
+      return;
+    }
+  } else if (browser.protocol === NO_AUTH_PROTOCOL) {
+    // Tokenless browser connections are only allowed to the host-configured
+    // Local Milo target. This keeps the office bootstrap convenient without
+    // turning the loopback bridge into a generic unauthenticated proxy.
+    browser.close(1008, "Unauthenticated target is not allowlisted");
+    return;
   }
 
   const upstream = new WebSocket(target.toString(), {
@@ -107,7 +145,36 @@ proxy.on("error", (_error, _req, response) => {
     response.end("Bloop web server is starting");
   }
 });
-const web = http.createServer((request, response) => proxy.web(request, response));
+const web = http.createServer((request, response) => {
+  const requestUrl = new URL(request.url ?? "/", `http://${WEB_HOST}:${WEB_PORT}`);
+  if (requestUrl.pathname === "/__bloop/bootstrap") {
+    response.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response.end(JSON.stringify({
+      profile: {
+        id: LOCAL_PROFILE_ID,
+        type: "remote",
+        name: LOCAL_PROFILE_NAME,
+        url: LOCAL_TARGET,
+        lastTest: "ok",
+        createdAt: 1,
+      },
+    }));
+    return;
+  }
+  // Opening the office browser URL is the login experience. Profile bootstrap
+  // happens in the provider before Agents loads; this redirect avoids the
+  // generic connection picker on a machine dedicated to Local Milo.
+  if (requestUrl.pathname === "/") {
+    response.writeHead(302, { Location: "/agents" });
+    response.end();
+    return;
+  }
+  proxy.web(request, response);
+});
 web.on("upgrade", (request, socket, head) => proxy.ws(request, socket, head));
 web.listen(WEB_PORT, WEB_HOST, () => {
   console.log(`Bloop desktop web proxy listening on http://${WEB_HOST}:${WEB_PORT}`);

@@ -16,6 +16,7 @@ import {
 import {
   getActiveProfileId,
   listProfiles,
+  saveProfile,
   setActiveProfileId,
   type Profile,
 } from "./profiles";
@@ -36,6 +37,30 @@ const Context = createContext<ProfilesState>({
   refresh: async () => {},
 });
 
+async function bootstrapOfficeBrowserProfile(): Promise<void> {
+  if (typeof window === "undefined") return;
+  try {
+    const response = await fetch("/__bloop/bootstrap", { cache: "no-store" });
+    if (!response.ok) return;
+    const payload = (await response.json()) as { profile?: Profile };
+    const profile = payload.profile;
+    if (
+      !profile ||
+      profile.type !== "remote" ||
+      typeof profile.id !== "string" ||
+      typeof profile.name !== "string" ||
+      typeof profile.url !== "string"
+    ) return;
+    // The office bridge owns authentication. Intentionally persist no browser
+    // secret: WebSocket NO_AUTH is accepted only for this bridge's allowlisted
+    // Local Milo target and the bridge injects the host-side capability token.
+    await saveProfile(profile, null);
+    await setActiveProfileId(profile.id);
+  } catch {
+    // Normal Expo/mobile/web builds do not expose this endpoint.
+  }
+}
+
 export function ProfilesProvider({ children }: { children: ReactNode }) {
   const [loaded, setLoaded] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -50,12 +75,14 @@ export function ProfilesProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([listProfiles(), getActiveProfileId()]).then(([list, active]) => {
+    void (async () => {
+      await bootstrapOfficeBrowserProfile();
+      const [list, active] = await Promise.all([listProfiles(), getActiveProfileId()]);
       if (cancelled) return;
       setProfiles(list);
       setActiveId(active);
       setLoaded(true);
-    });
+    })();
     return () => {
       cancelled = true;
     };
