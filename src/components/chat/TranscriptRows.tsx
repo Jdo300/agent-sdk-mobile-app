@@ -126,6 +126,30 @@ export const UserBubble = memo(function UserBubble({
             ) : null}
           </View>
         ) : null}
+        {item.deliveryUnknown ? (
+          <View style={styles.userMetaActions}>
+            <Text role="sub" tone="danger">Delivery unconfirmed · </Text>
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Retry unconfirmed message"
+              onPress={onRetry}
+              hitSlop={8}
+              scaleOnPress={false}
+            >
+              <Text role="sub" tone="danger">Retry</Text>
+            </Touchable>
+            <Text role="sub" tone="danger"> · </Text>
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Remove unconfirmed message"
+              onPress={onRemove}
+              hitSlop={8}
+              scaleOnPress={false}
+            >
+              <Text role="sub" tone="danger">Remove</Text>
+            </Touchable>
+          </View>
+        ) : null}
         {item.failed ? (
           <View style={styles.userMetaActions}>
             <Text role="sub" tone="danger">Not sent · </Text>

@@ -14,10 +14,6 @@ export function isAuthoritativeCatchUpCurrent(
 }
 
 
-export function shouldWaitForAuthoritativeIdle(isProcessing: boolean, run: string): boolean {
-  return isProcessing || run !== "idle";
-}
-
 export function shouldReconnectSilentSend(options: {
   closed: boolean;
   serialBeforeSend: number;

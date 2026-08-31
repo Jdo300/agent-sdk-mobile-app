@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { inspectPersistedHistory, outboxRecoveryAction, ProtocolObserver, isGenerationCurrent, syncConvergenceState } from "./protocolHardening";
+import { inspectPersistedHistory, ProtocolObserver, isGenerationCurrent } from "./protocolHardening";
 
 describe("protocol hardening", () => {
   test("drops duplicate/out-of-order seq replay and reports gaps", () => {
@@ -45,26 +45,7 @@ describe("protocol hardening", () => {
     expect(replay.events.some((event) => event.kind === "protocol_replay")).toBe(true);
   });
 
-  test("elapsed time never substitutes for persistence/OTID convergence", () => {
-    // Simulate polls extending well past the old 900ms guess. None may claim
-    // success until both canonical coverage and the persisted OTID exist.
-    for (const elapsedMs of [0, 250, 900, 1500, 3000]) {
-      void elapsedMs;
-      expect(syncConvergenceState(false, true)).toEqual({
-        converged: false,
-        reason: "awaiting_persisted_rows",
-      });
-    }
-    expect(syncConvergenceState(true, true)).toEqual({ converged: false, reason: "awaiting_otid_ack" });
-    expect(syncConvergenceState(true, false)).toEqual({ converged: true, reason: "converged" });
-  });
 
-  test("process-restart outbox recovery never auto-replays ambiguous sends", () => {
-    expect(outboxRecoveryAction("queued")).toBe("replay");
-    expect(outboxRecoveryAction("sending")).toBe("converge");
-    expect(outboxRecoveryAction("awaiting_echo")).toBe("converge");
-    expect(outboxRecoveryAction("failed")).toBe("manual_retry");
-  });
 
   test("generation equality is the only stale-result admission rule", () => {
     expect(isGenerationCurrent(4, 4)).toBe(true);

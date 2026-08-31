@@ -128,26 +128,7 @@ export function inspectPersistedHistory(messages: readonly unknown[]): Persisted
   return { visibleCount, missingIdCount, duplicateIdCount };
 }
 
-
-export type SyncConvergenceReason = "converged" | "awaiting_persisted_rows" | "awaiting_otid_ack";
-
-export function syncConvergenceState(
-  authoritativeCoverage: boolean,
-  hasUnacknowledgedEcho: boolean,
-): { converged: boolean; reason: SyncConvergenceReason } {
-  if (!authoritativeCoverage) return { converged: false, reason: "awaiting_persisted_rows" };
-  if (hasUnacknowledgedEcho) return { converged: false, reason: "awaiting_otid_ack" };
-  return { converged: true, reason: "converged" };
-}
-
-export type OutboxRecoveryAction = "replay" | "converge" | "manual_retry";
-
-export function outboxRecoveryAction(state: "queued" | "sending" | "awaiting_echo" | "failed"): OutboxRecoveryAction {
-  if (state === "queued") return "replay";
-  if (state === "sending" || state === "awaiting_echo") return "converge";
-  return "manual_retry";
-}
-
+/** Async sync callbacks may mutate state only in the lifecycle generation that spawned them. */
 export function isGenerationCurrent(captured: number, active: number): boolean {
   return captured === active;
 }

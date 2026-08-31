@@ -37,6 +37,8 @@ export interface UserItem {
   /** True only while the message is still local and can genuinely be cancelled before handoff. */
   cancelable?: boolean;
   failed?: boolean;
+  /** Handoff was interrupted; server delivery could not be proven either way. */
+  deliveryUnknown?: boolean;
   /** Wall-clock time this row occurred (server time for history, local arrival time while live). */
   occurredAt?: number;
 }

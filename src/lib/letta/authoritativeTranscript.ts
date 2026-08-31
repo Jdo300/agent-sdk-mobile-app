@@ -37,6 +37,27 @@ export function authoritativeRowsCoverCurrent(
   return true;
 }
 
+
+/** Rows belonging to the newest user turn, or the full set if no user row exists. */
+export function latestTurnRows(rows: readonly TranscriptRow[]): TranscriptRow[] {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    if (rows[index]?.kind === "user") return rows.slice(index);
+  }
+  return [...rows];
+}
+
+/**
+ * Reconnect persistence only needs to prove that the newest live turn exists in
+ * canonical history. Older loaded pages are viewport state and may be discarded
+ * when the connection is rebuilt.
+ */
+export function authoritativeLatestTurnCoversCurrent(
+  current: readonly TranscriptRow[],
+  candidate: readonly TranscriptRow[],
+): boolean {
+  return authoritativeRowsCoverCurrent(latestTurnRows(current), latestTurnRows(candidate));
+}
+
 function isMeaningfulRow(row: TranscriptRow): boolean {
   return row.kind === "tool_call" || row.text.length > 0;
 }

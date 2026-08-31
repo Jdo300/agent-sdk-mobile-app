@@ -1,12 +1,8 @@
 import type { SQLiteDatabase } from "expo-sqlite";
 
 import type { Attachment } from "./attachments";
-import { durableMessageOtid, durableMessageStorageIdentity, newestDurableMessageId, normalizeDurableMessages, persistedUserOtids } from "./durableSyncCore";
-
 const DB_NAME = "bloop-chat.db";
-const SCHEMA_VERSION = 1;
-export const DURABLE_HOT_WINDOW_MESSAGES = 100;
-
+const SCHEMA_VERSION = 2;
 export type DurableOutboxState = "queued" | "sending" | "awaiting_echo" | "failed";
 
 export interface DurableOutboxItem {
@@ -19,23 +15,6 @@ export interface DurableOutboxItem {
   error: string | null;
   createdAt: number;
   updatedAt: number;
-}
-
-export interface DurableConversationSnapshot {
-  messages: unknown[];
-  nextBefore: string | null;
-  forwardAfter: string | null;
-  outbox: DurableOutboxItem[];
-}
-
-interface ConversationRow {
-  next_before: string | null;
-  forward_after: string | null;
-}
-
-interface MessageRow {
-  message_id: string;
-  raw_json: string;
 }
 
 interface OutboxRow {
@@ -74,27 +53,6 @@ async function openDatabase(): Promise<SQLiteDatabase> {
       key TEXT PRIMARY KEY NOT NULL,
       value TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS durable_conversations (
-      profile_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      next_before TEXT,
-      forward_after TEXT,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY (profile_id, conversation_id)
-    );
-    CREATE TABLE IF NOT EXISTS durable_messages (
-      profile_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      message_id TEXT NOT NULL,
-      sequence INTEGER NOT NULL,
-      otid TEXT,
-      raw_json TEXT NOT NULL,
-      PRIMARY KEY (profile_id, conversation_id, message_id)
-    );
-    CREATE INDEX IF NOT EXISTS durable_messages_sequence
-      ON durable_messages(profile_id, conversation_id, sequence);
-    CREATE INDEX IF NOT EXISTS durable_messages_otid
-      ON durable_messages(profile_id, conversation_id, otid);
     CREATE TABLE IF NOT EXISTS durable_outbox (
       profile_id TEXT NOT NULL,
       conversation_id TEXT NOT NULL,
@@ -108,28 +66,31 @@ async function openDatabase(): Promise<SQLiteDatabase> {
       PRIMARY KEY (profile_id, conversation_id, otid)
     );
   `);
-  await db.runAsync(
-    "INSERT OR REPLACE INTO durable_meta(key, value) VALUES ('schema_version', ?)",
-    String(SCHEMA_VERSION),
+  const schemaRow = await db.getFirstAsync<{ value: string }>(
+    "SELECT value FROM durable_meta WHERE key = 'schema_version'",
   );
-  return db;
-}
-
-function messageId(message: unknown, sequence: number): string {
-  const identity = durableMessageStorageIdentity(message);
-  if (identity) return identity;
-  // Persisted server messages should always carry an id. Keep a deterministic
-  // window-local fallback rather than dropping an unexpected protocol row.
-  return `anonymous:${sequence}:${stableHash(JSON.stringify(message))}`;
-}
-
-function stableHash(value: string): string {
-  let hash = 2166136261;
-  for (let i = 0; i < value.length; i += 1) {
-    hash ^= value.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
+  const previousSchema = schemaRow ? Number.parseInt(schemaRow.value, 10) : 0;
+  if (!Number.isFinite(previousSchema) || previousSchema < SCHEMA_VERSION) {
+    // v1 mixed cached transcript history with delivery-journal state and could
+    // manufacture stale/failed bubbles during reconnect. None of that state is
+    // trustworthy enough to migrate. Server history is authoritative, so reset
+    // the cache and legacy outbox once; future schemas can add narrower migrations.
+    await db.withTransactionAsync(async () => {
+      await db.runAsync("DROP TABLE IF EXISTS durable_messages");
+      await db.runAsync("DROP TABLE IF EXISTS durable_conversations");
+      await db.runAsync("DELETE FROM durable_outbox");
+      await db.runAsync(
+        "INSERT OR REPLACE INTO durable_meta(key, value) VALUES ('schema_version', ?)",
+        String(SCHEMA_VERSION),
+      );
+    });
+  } else {
+    await db.runAsync(
+      "INSERT OR REPLACE INTO durable_meta(key, value) VALUES ('schema_version', ?)",
+      String(SCHEMA_VERSION),
+    );
   }
-  return (hash >>> 0).toString(36);
+  return db;
 }
 
 function parseAttachments(raw: string): Attachment[] {
@@ -155,127 +116,15 @@ function decodeOutbox(row: OutboxRow): DurableOutboxItem {
   };
 }
 
-/** Load durable canonical history and locally-owned sends before touching the network. */
-export async function loadDurableConversation(
-  profileId: string,
-  conversationId: string,
-): Promise<DurableConversationSnapshot> {
+/** Load only locally-owned delivery journal rows. Transcript history is never sourced from SQLite. */
+export async function loadDurableOutbox(profileId: string, conversationId: string): Promise<DurableOutboxItem[]> {
   const db = await database();
-  const [conversation, rows, outbox] = await Promise.all([
-    db.getFirstAsync<ConversationRow>(
-      "SELECT next_before, forward_after FROM durable_conversations WHERE profile_id = ? AND conversation_id = ?",
-      profileId,
-      conversationId,
-    ),
-    db.getAllAsync<MessageRow>(
-      `SELECT message_id, raw_json FROM durable_messages
-       WHERE profile_id = ? AND conversation_id = ?
-       ORDER BY sequence DESC LIMIT ?`,
-      profileId,
-      conversationId,
-      DURABLE_HOT_WINDOW_MESSAGES,
-    ),
-    db.getAllAsync<OutboxRow>(
-      "SELECT profile_id, conversation_id, otid, text, attachments_json, state, error, created_at, updated_at FROM durable_outbox WHERE profile_id = ? AND conversation_id = ? ORDER BY created_at ASC",
-      profileId,
-      conversationId,
-    ),
-  ]);
-  // SQLite reads newest-first so it can stop after the hot window; reverse once
-  // in JS to restore canonical transcript order. The full archive remains on
-  // the App Server and is paged backward only when the reader scrolls up.
-  rows.reverse();
-  const messages: unknown[] = [];
-  for (const row of rows) {
-    try {
-      messages.push(JSON.parse(row.raw_json));
-    } catch {
-      // Corrupt cache rows are ignored; the next server sync repairs the window.
-    }
-  }
-  return {
-    messages,
-    // If the durable table held a larger historical window, its stored
-    // next_before cursor points before rows we intentionally did not hydrate.
-    // The oldest loaded UUID is the correct server cursor for the next page.
-    nextBefore:
-      rows.length >= DURABLE_HOT_WINDOW_MESSAGES
-        ? rows[0]?.message_id ?? null
-        : conversation?.next_before ?? null,
-    forwardAfter: conversation?.forward_after ?? newestDurableMessageId(messages),
-    outbox: outbox.map(decodeOutbox),
-  };
-}
-
-/**
- * Persist the complete canonical window exactly in server order. Rewriting the
- * loaded window avoids timestamp/UUID ordering guesses for tightly-spaced tool
- * and reasoning messages while SQLite remains the durable source of truth.
- */
-export async function saveDurableCanonicalWindow(
-  profileId: string,
-  conversationId: string,
-  messages: readonly unknown[],
-  cursors: { nextBefore: string | null; forwardAfter?: string | null },
-  isCurrent?: () => boolean,
-): Promise<void> {
-  return serializeWrite(async () => {
-    if (isCurrent && !isCurrent()) return;
-    const db = await database();
-    if (isCurrent && !isCurrent()) return;
-    const normalizedAll = normalizeDurableMessages(messages);
-    const trimmed = normalizedAll.length > DURABLE_HOT_WINDOW_MESSAGES;
-    const normalizedMessages = trimmed
-      ? normalizedAll.slice(-DURABLE_HOT_WINDOW_MESSAGES)
-      : normalizedAll;
-    const forwardAfter = cursors.forwardAfter === undefined
-      ? newestDurableMessageId(normalizedMessages)
-      : cursors.forwardAfter;
-    const nextBefore = trimmed
-      ? durableMessageStorageIdentity(normalizedMessages[0]) ?? cursors.nextBefore
-      : cursors.nextBefore;
-    const stale = Symbol("stale-durable-write");
-    try {
-      await db.withTransactionAsync(async () => {
-        if (isCurrent && !isCurrent()) throw stale;
-        await db.runAsync(
-        `INSERT INTO durable_conversations(profile_id, conversation_id, next_before, forward_after, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(profile_id, conversation_id) DO UPDATE SET
-           next_before = excluded.next_before,
-           forward_after = excluded.forward_after,
-           updated_at = excluded.updated_at`,
-        profileId,
-        conversationId,
-        nextBefore,
-        forwardAfter,
-        Date.now(),
-      );
-        if (isCurrent && !isCurrent()) throw stale;
-        await db.runAsync(
-        "DELETE FROM durable_messages WHERE profile_id = ? AND conversation_id = ?",
-        profileId,
-        conversationId,
-      );
-        for (let sequence = 0; sequence < normalizedMessages.length; sequence += 1) {
-          if (isCurrent && !isCurrent()) throw stale;
-          const message = normalizedMessages[sequence];
-          await db.runAsync(
-          `INSERT INTO durable_messages(profile_id, conversation_id, message_id, sequence, otid, raw_json)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          profileId,
-          conversationId,
-          messageId(message, sequence),
-          sequence,
-          durableMessageOtid(message),
-          JSON.stringify(message),
-          );
-        }
-      });
-    } catch (error) {
-      if (error !== stale) throw error;
-    }
-  });
+  const rows = await db.getAllAsync<OutboxRow>(
+    "SELECT profile_id, conversation_id, otid, text, attachments_json, state, error, created_at, updated_at FROM durable_outbox WHERE profile_id = ? AND conversation_id = ? ORDER BY created_at ASC",
+    profileId,
+    conversationId,
+  );
+  return rows.map(decodeOutbox);
 }
 
 export async function putDurableOutbox(item: DurableOutboxItem): Promise<void> {
@@ -339,26 +188,4 @@ export async function removeDurableOutbox(
       otid,
     );
   });
-}
-
-/** Persisted user echoes retire matching durable outbox rows by OTID. */
-export async function retirePersistedOutboxEchoes(
-  profileId: string,
-  conversationId: string,
-  messages: readonly unknown[],
-): Promise<string[]> {
-  const otids = persistedUserOtids(messages);
-  if (otids.length === 0) return [];
-  await serializeWrite(async () => {
-    const db = await database();
-    for (const otid of otids) {
-      await db.runAsync(
-        "DELETE FROM durable_outbox WHERE profile_id = ? AND conversation_id = ? AND otid = ?",
-        profileId,
-        conversationId,
-        otid,
-      );
-    }
-  });
-  return otids;
 }

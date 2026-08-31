@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { createTranscriptAccumulator, type SDKMessage, type TranscriptRow } from "@letta-ai/letta-agent-sdk/client";
-import { authoritativeRowsCoverCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
+import { authoritativeLatestTurnCoversCurrent, authoritativeRowsCoverCurrent, latestTurnRows, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
 
 const persisted = [
   {
@@ -85,4 +85,20 @@ describe("authoritative transcript rebuild", () => {
 
     expect(authoritativeRowsCoverCurrent(live.rows(), missingReturn.rows())).toBe(false);
   });
+  it("reconnect coverage ignores older viewport pages but protects the newest turn", () => {
+    const current = [
+      { kind: "user", key: "old-u", text: "old" },
+      { kind: "assistant", key: "old-a", text: "old reply" },
+      { kind: "user", key: "new-u", text: "new" },
+      { kind: "assistant", key: "new-a", text: "new reply" },
+    ] as any;
+    const canonical = [
+      { kind: "user", key: "new-u-server", text: "new" },
+      { kind: "assistant", key: "new-a-server", text: "new reply" },
+    ] as any;
+    expect(latestTurnRows(current).map((row) => row.text)).toEqual(["new", "new reply"]);
+    expect(authoritativeLatestTurnCoversCurrent(current, canonical)).toBe(true);
+    expect(authoritativeLatestTurnCoversCurrent(current, canonical.slice(0, 1))).toBe(false);
+  });
+
 });

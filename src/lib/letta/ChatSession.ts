@@ -26,26 +26,22 @@ import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
 import { liveTextKeyAtEdge, newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
-import { authoritativeRowsCoverCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
-import { isAuthoritativeCatchUpCurrent, shouldReconnectSilentSend, shouldWaitForAuthoritativeIdle } from "./authoritativeCatchUp";
+import { authoritativeLatestTurnCoversCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
+import { isAuthoritativeCatchUpCurrent, shouldReconnectSilentSend } from "./authoritativeCatchUp";
 import {
   emitSyncTelemetry,
   inspectPersistedHistory,
   isGenerationCurrent,
-  outboxRecoveryAction,
   ProtocolObserver,
-  syncConvergenceState,
 } from "./protocolHardening";
 import {
-  loadDurableConversation,
+  loadDurableOutbox,
   putDurableOutbox,
   removeDurableOutbox,
-  retirePersistedOutboxEchoes,
-  saveDurableCanonicalWindow,
   updateDurableOutboxState,
   type DurableOutboxItem,
 } from "./durableChatStore";
-import { mergeForwardMessages, newestDurableMessageId, persistedUserOtids } from "./durableSyncCore";
+import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -76,9 +72,7 @@ const ABORT_ACK_TIMEOUT_MS = 2000;
 const ABORT_CONFIRM_TIMEOUT_MS = 5000;
 const ABORT_CONFIRM_INTERVAL_MS = 250;
 const AUTHORITATIVE_PAGE_SIZE = 50;
-const AUTHORITATIVE_MAX_PAGES = 8;
 const INITIAL_HISTORY_MAX_PAGES = 2;
-const FORWARD_SYNC_MAX_PAGES = 100;
 const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
 const AUTHORITATIVE_CATCHUP_MAX_MS = 30000;
@@ -185,8 +179,6 @@ export class ChatSession {
   private localRows: { anchor: number; item: TranscriptItem }[] = [];
   /** OTIDs used only to project/retire optimistic user bubbles. */
   private echoOtids = new Set<string>();
-  /** OTIDs that still lack a persisted user-message UUID acknowledgement. */
-  private unacknowledgedOtids = new Set<string>();
   /** Reasoning think time, keyed by accumulator row key. */
   private thinkStartedAt = new Map<string, number>();
   private thinkSeconds = new Map<string, number>();
@@ -212,9 +204,9 @@ export class ChatSession {
   private nextBefore: string | null = null;
   /** Raw persisted history currently loaded in the transcript, oldest first. */
   private loadedHistoryMessages: unknown[] = [];
-  /** Durable forward cursor: newest server UUID already committed locally. */
-  private forwardAfter: string | null = null;
-  private durableHydrated = false;
+  /** Startup delivery journal is read once; it never supplies transcript history. */
+  private deliveryJournalLoaded = false;
+  private startupOutbox: DurableOutboxItem[] = [];
   private pendingStream: SDKMessage[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   /** Foreground, stream-failure and Retry triggers all join one recovery. */
@@ -273,15 +265,12 @@ export class ChatSession {
     const key = retainedSessionKey(conn.profile.id, conversationId);
     const existing = retainedChatSessions.get(key);
     if (existing && !existing.closed) {
-      // Refresh credentials/profile metadata in case the saved connection changed
-      // while the screen was away, but preserve an active SDK run. Reattaching a
-      // previously-unobserved view must still revalidate server history: a retained
-      // stream snapshot is useful continuity, not an authoritative reopen source.
-      const wasUnobserved = existing.viewRefs === 0;
+      // Navigation never mutates synchronization state. An active retained session
+      // already owns the freshest live stream; idle unobserved sessions dispose
+      // themselves and therefore cannot be stale reopen sources.
       existing.conn = conn;
       if (initialPermissionMode) existing.preferredPermissionMode = initialPermissionMode;
       existing.viewRefs += 1;
-      if (wasUnobserved) void existing.reconnect();
       return existing;
     }
 
@@ -477,7 +466,6 @@ export class ChatSession {
 
     const { otid, text, attachments } = item;
     this.echoOtids.add(otid);
-    this.unacknowledgedOtids.add(otid);
     if (!this.localRows.some((row) => row.item.kind === "user" && row.item.id === otid)) {
       this.commit(
         this.appendLocal(this.snapshot, {
@@ -491,7 +479,7 @@ export class ChatSession {
         }),
       );
     } else {
-      this.markEcho(otid, { pending: true, cancelable: true, failed: false });
+      this.markEcho(otid, { pending: true, cancelable: true, failed: false, deliveryUnknown: false });
       this.commit(this.project(this.snapshot));
     }
     if (attachments.length > 0) this.pendingAttachments.set(otid, attachments);
@@ -528,17 +516,25 @@ export class ChatSession {
       await removeDurableOutbox(this.conn.profile.id, this.conversationId, otid).catch(() => {});
     } catch (e) {
       const detail = e instanceof Error ? e.message : "Send failed.";
-      await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "failed", detail).catch(() => {});
       const transportFailure = isTransportError(detail);
-      this.markEcho(otid, { pending: false, failed: true });
-      const next = patch(this.project(this.snapshot), {
-        run: "idle" as const,
-        ...(transportFailure
-          ? { connection: isAuthError(e) ? ("auth_failed" as const) : ("reconnecting" as const) }
-          : {}),
-      });
-      this.commit(transportFailure ? this.scrubTransportErrors(next) : this.appendError(next, detail));
-      if (transportFailure && !isAuthError(e)) this.scheduleReconnectRetry();
+      if (transportFailure) {
+        // A transport exception can occur after the App Server accepted the send.
+        // Preserve the journal in `sending`, keep one local bubble, and reconcile
+        // against server history. Do not manufacture a false Not sent state and do
+        // not make callers create a second copy of the same message.
+        this.markEcho(otid, { pending: false, cancelable: false, failed: false, deliveryUnknown: true });
+        const next = patch(this.project(this.snapshot), {
+          connection: isAuthError(e) ? ("auth_failed" as const) : ("reconnecting" as const),
+          run: preserveRunAcrossTransportLoss(this.snapshot.run),
+        });
+        this.commit(this.scrubTransportErrors(next));
+        if (!isAuthError(e)) this.scheduleReconnectRetry();
+        return true;
+      }
+
+      await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "failed", detail).catch(() => {});
+      this.markEcho(otid, { pending: false, failed: true, deliveryUnknown: false });
+      this.commit(patch(this.appendError(this.project(this.snapshot), detail), { run: "idle" }));
       return false;
     }
     this.pendingAttachments.delete(otid);
@@ -548,7 +544,7 @@ export class ChatSession {
   }
 
   /** Update an in-flight echo in place (pending -> sent, or failed). */
-  private markEcho(otid: string, changes: { pending?: boolean; cancelable?: boolean; failed?: boolean }): void {
+  private markEcho(otid: string, changes: { pending?: boolean; cancelable?: boolean; failed?: boolean; deliveryUnknown?: boolean }): void {
     this.localRows = this.localRows.map((row) =>
       row.item.kind === "user" && row.item.id === otid
         ? {
@@ -570,7 +566,6 @@ export class ChatSession {
     const pairedErrorId = index >= 0 && items[index + 1]?.kind === "error" ? items[index + 1]!.id : null;
     this.localRows = this.localRows.filter((row) => row.item.id !== itemId && row.item.id !== pairedErrorId);
     this.echoOtids.delete(itemId);
-    this.unacknowledgedOtids.delete(itemId);
     this.pendingAttachments.delete(itemId);
     this.queuedRecoveryTurns = this.queuedRecoveryTurns.filter((item) => item.otid !== itemId);
     const projected = this.project(this.snapshot);
@@ -603,7 +598,7 @@ export class ChatSession {
   /** Explicitly discard a failed local send; server history is untouched. */
   async removeFailedSend(itemId: string): Promise<void> {
     const item = this.snapshot.transcript.find((entry) => entry.id === itemId);
-    if (!item || item.kind !== "user" || !item.failed) return;
+    if (!item || item.kind !== "user" || (!item.failed && !item.deliveryUnknown)) return;
     await removeDurableOutbox(this.conn.profile.id, this.conversationId, itemId);
     this.dropLocalOutgoing(itemId);
   }
@@ -613,15 +608,15 @@ export class ChatSession {
     const items = this.snapshot.transcript;
     const index = items.findIndex((t) => t.id === itemId);
     const item = items[index];
-    if (!item || item.kind !== "user" || !item.failed) return;
+    if (!item || item.kind !== "user" || (!item.failed && !item.deliveryUnknown)) return;
     // The error row committed alongside the failure sits right after it. Remove
     // it from local source state as well so project() cannot resurrect it.
     const next = items[index + 1];
     if (next?.kind === "error") {
       this.localRows = this.localRows.filter((row) => row.item.id !== next.id);
     }
-    const durable = await loadDurableConversation(this.conn.profile.id, this.conversationId).catch(() => null);
-    const saved = durable?.outbox.find((entry) => entry.otid === itemId);
+    const outbox = await loadDurableOutbox(this.conn.profile.id, this.conversationId).catch(() => []);
+    const saved = outbox.find((entry) => entry.otid === itemId);
     const images = saved?.attachments ?? this.pendingAttachments.get(itemId) ?? [];
     this.pendingAttachments.delete(itemId);
     await this.submitDurableTurn(saved
@@ -995,11 +990,7 @@ export class ChatSession {
     await session.removeQueuedMessage(itemId);
   }
 
-  /**
-   * Foreground resume / retry: re-hydrate authoritative history over REST and
-   * clear the offline banner if it succeeds. A live session keeps its own
-   * socket; if it died, the next send() lazily opens a fresh one.
-   */
+  /** Foreground/transport recovery for a retained live session. */
   private scheduleReconnectRetry(): void {
     if (this.closed || this.snapshot.connection === "auth_failed" || this.reconnectRetryTimer) return;
     const delay = Math.min(
@@ -1055,9 +1046,7 @@ export class ChatSession {
       }, RECONNECT_BANNER_DELAY_MS);
     }
 
-    // A dead or background-suspended SDK session must be discarded BEFORE
-    // hydrate(): remote history hydration itself uses ensureSession(), so
-    // hydrating first would route recovery through the stale socket.
+    // A dead or explicitly-reset SDK transport is discarded before probing runtime state.
     if (this.sessionDead || options?.forceNewTransport) {
       this.cancelAuthoritativeCatchUp();
       const stale = this.session;
@@ -1067,19 +1056,9 @@ export class ChatSession {
       stale?.close();
     }
 
-    // Keep the live accumulator intact until device status proves the turn is
-    // idle. SDK rebase merges anonymous content-block deltas with persisted
-    // UUID rows rather than replacing the former.
-    const ok = await this.hydrate({ reconcileDevice: false, applyHistory: false, generation });
-    if (!ok || !this.reconciliationIsCurrent(generation, "reconnect_hydrate")) {
-      if (pending) clearTimeout(pending);
-      if (!this.closed && this.snapshot.connection !== "auth_failed") this.scheduleReconnectRetry();
-      return;
-    }
-
-    // Recovery is atomic from the UI's point of view: history first, then the
-    // executing device's live state, then approvals. Do not advertise a healthy
-    // connection while any of those still reflect the pre-drop client snapshot.
+    // Reconnect repairs transport/runtime state only. It never reruns cold-start
+    // history or delivery-journal hydration. The live accumulator stays intact
+    // while Milo is active; idle catch-up below performs one canonical handoff.
     try {
       const session = this.ensureSession();
       const status = await session.getDeviceStatus();
@@ -1139,55 +1118,27 @@ export class ChatSession {
     });
   }
 
-  private hasUnacknowledgedLocalEcho(): boolean {
-    return this.unacknowledgedOtids.size > 0;
-  }
-
-  private async markAmbiguousOutboxFailed(generation: number): Promise<void> {
-    if (!this.reconciliationIsCurrent(generation, "outbox_unknown_before")) return;
-    const durable = await loadDurableConversation(this.conn.profile.id, this.conversationId).catch(() => null);
-    if (!durable || !this.reconciliationIsCurrent(generation, "outbox_unknown_load")) return;
-    const ambiguous = durable.outbox.filter((item) => outboxRecoveryAction(item.state) === "converge");
-    for (const item of ambiguous) {
-      if (!this.reconciliationIsCurrent(generation, "outbox_unknown_update")) return;
-      await updateDurableOutboxState(
-        this.conn.profile.id,
-        this.conversationId,
-        item.otid,
-        "failed",
-        "Server became idle without a persisted acknowledgement for this OTID.",
-      ).catch(() => {});
-      this.unacknowledgedOtids.delete(item.otid);
-      this.markEcho(item.otid, { pending: false, failed: true });
-    }
-    if (ambiguous.length > 0 && this.reconciliationIsCurrent(generation, "outbox_unknown_commit")) {
-      this.commit(this.project(this.snapshot));
-    }
-  }
-
   /**
-   * Reconnect persistence convergence is evidence-based: first exhaust the
-   * forward `after` cursor immediately, then require canonical history to cover
-   * the live accumulator and every submitted OTID to have a persisted user UUID.
-   * Backoff controls polling load only; elapsed time is never treated as proof.
+   * After a transport rebuild, preserve the live transcript while Milo is still
+   * processing. Once the device is genuinely idle, poll only until the newest
+   * persisted turn covers the newest live turn, then replace the accumulator with
+   * a fresh canonical server window. No SQLite cursors or delivery OTIDs take part.
    */
   private async catchUpAfterReconnect(
     session: LettaCodeSession,
     catchUpGeneration: number,
     reconciliationGeneration: number,
   ): Promise<void> {
-    // Active server work can outlive the viewer socket that initiated it. Do not
-    // consume the persistence deadline while Milo is still working; keep this
-    // watcher alive until the server reports idle, even if the replacement
-    // viewer never receives the original run's terminal `result` event.
     let deadline: number | null = null;
     let attempt = 0;
     try {
       while (this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) {
         const status = await session.getDeviceStatus();
         if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
-        this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
-        if (shouldWaitForAuthoritativeIdle(status.isProcessing, this.snapshot.run)) {
+        const next = this.applyDeviceStatus(this.project(this.snapshot), status);
+        this.commit(next);
+        const hasPendingApprovals = (status.pendingControlRequests?.length ?? 0) > 0 || next.approvals.length > 0;
+        if (status.isProcessing || hasPendingApprovals || next.run !== "idle") {
           const delay = Math.min(
             AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS,
             Math.max(1000, AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** Math.min(attempt, 4)),
@@ -1196,38 +1147,22 @@ export class ChatSession {
           await this.waitForAuthoritativeCatchUp(delay, catchUpGeneration);
           continue;
         }
+
         if (deadline === null) {
           deadline = Date.now() + AUTHORITATIVE_CATCHUP_MAX_MS;
           attempt = 0;
         }
 
-        if (!(await this.syncForwardHistory(reconciliationGeneration))) return;
+        const page = await this.fetchInitialHistory();
         if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
-
-        let reconciled = await this.reconcileAuthoritativeHistoryIfStillIdle(
-          session,
-          this.loadedHistoryMessages,
-          reconciliationGeneration,
-        );
-        if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
-
-        // Some backends may finalize the newest persisted object in place rather
-        // than append a new UUID. The forward cursor remains primary; this tail
-        // refresh is only a verification fallback when coverage has not converged.
-        if (!reconciled) {
-          const latest = await this.fetchAuthoritativeTail();
-          if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
-          this.observePersistedHistory(latest, reconciliationGeneration, "catchup_tail");
-          reconciled = await this.reconcileAuthoritativeHistoryIfStillIdle(
-            session,
-            latest,
-            reconciliationGeneration,
-          );
-        }
-
-        if (this.snapshot.run !== "idle") return;
-        const convergence = syncConvergenceState(reconciled, this.hasUnacknowledgedLocalEcho());
-        if (convergence.converged) {
+        this.observePersistedHistory(page.messages, reconciliationGeneration, "catchup");
+        const canonical = rebuildAuthoritativeTranscript(page.messages);
+        if (authoritativeLatestTurnCoversCurrent(this.accumulator.rows(), canonical.rows())) {
+          this.loadedHistoryMessages = [...page.messages];
+          this.nextBefore = page.nextBefore;
+          this.accumulator = canonical;
+          this.captureHistoryTimestamps(page.messages);
+          this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
           emitSyncTelemetry({
             kind: "sync_converged",
             conversationId: this.conversationId,
@@ -1236,30 +1171,27 @@ export class ChatSession {
           });
           return;
         }
+
         if (deadline !== null && Date.now() >= deadline) {
-          if (convergence.reason === "awaiting_otid_ack") {
-            await this.markAmbiguousOutboxFailed(reconciliationGeneration);
-          }
           emitSyncTelemetry({
             kind: "sync_retry",
             conversationId: this.conversationId,
             generation: reconciliationGeneration,
             attempt,
-            reason: convergence.reason === "awaiting_otid_ack" ? "otid_ack_timeout" : "persistence_timeout",
+            reason: "persistence_timeout",
           });
           return;
         }
-
         emitSyncTelemetry({
           kind: "sync_retry",
           conversationId: this.conversationId,
           generation: reconciliationGeneration,
           attempt,
-          reason: convergence.reason,
+          reason: "awaiting_persisted_rows",
         });
         const delay = Math.min(
           AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS,
-          AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** attempt,
+          AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** Math.min(attempt, 4),
         );
         attempt += 1;
         await this.waitForAuthoritativeCatchUp(delay, catchUpGeneration);
@@ -1359,7 +1291,6 @@ export class ChatSession {
     this.accumulator.reset();
     this.localRows = [];
     this.echoOtids.clear();
-    this.unacknowledgedOtids.clear();
     this.cancelledLocalOtids.clear();
     publishActivity(this.conversationId, null);
     this.settleActivityWaiters(new Error("Session closed"));
@@ -1434,90 +1365,66 @@ export class ChatSession {
     return `${prefix}-${this.counter++}`;
   }
 
-  private async hydrateDurableCache(generation: number): Promise<boolean> {
-    if (this.durableHydrated) return this.reconciliationIsCurrent(generation, "durable_cache_existing");
+  private async loadDeliveryJournal(generation: number): Promise<boolean> {
+    if (this.deliveryJournalLoaded) return this.reconciliationIsCurrent(generation, "delivery_journal_existing");
     try {
-      const cached = await loadDurableConversation(this.conn.profile.id, this.conversationId);
-      if (!this.reconciliationIsCurrent(generation, "durable_cache_load")) return false;
-      this.durableHydrated = true;
-
-      // SQLite is a journal/cache, never a source of visible conversation truth on
-      // normal open. In particular, do NOT seed loadedHistoryMessages, cursors, or
-      // the accumulator from cached history here. The server's newest page below
-      // is the only history allowed to leave the hydrating state.
-      const persistedOtids = new Set(persistedUserOtids(cached.messages));
-      this.queuedRecoveryTurns = cached.outbox.filter((item) => outboxRecoveryAction(item.state) === "replay");
-      for (const item of cached.outbox) {
-        if (persistedOtids.has(item.otid)) {
-          this.unacknowledgedOtids.delete(item.otid);
-          void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
-          continue;
-        }
-
-        const recovery = outboxRecoveryAction(item.state);
-        if (recovery === "converge") {
-          // Old versions kept sending/awaiting_echo rows after handoff. They are
-          // ambiguous after a restart and must never become fake "Not sent" rows.
-          // Keep no visible/local echo; authoritative server history decides.
-          emitSyncTelemetry({
-            kind: "sync_retry",
-            conversationId: this.conversationId,
-            generation,
-            reason: "discarded_legacy_ambiguous_outbox",
-          });
-          void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
-          continue;
-        }
-
-        if (item.attachments.length > 0) this.pendingAttachments.set(item.otid, item.attachments);
-        this.echoOtids.add(item.otid);
-        this.localRows.push({
-          // Project after whatever authoritative newest page is fetched below.
-          anchor: Number.MAX_SAFE_INTEGER,
-          item: {
-            kind: "user",
-            id: item.otid,
-            text: item.text,
-            occurredAt: item.createdAt,
-            ...(item.attachments.length > 0 ? { images: item.attachments.map((attachment) => attachment.uri) } : {}),
-            ...(item.state === "failed" ? { failed: true } : { pending: true, cancelable: true }),
-          },
-        });
-      }
-      // Do not commit cache-derived rows yet. The first visible transcript commit
-      // happens only after authoritative newest history has been fetched. Local
-      // queued/failed rows are projected on top of that server page afterward.
+      this.startupOutbox = await loadDurableOutbox(this.conn.profile.id, this.conversationId);
+      if (!this.reconciliationIsCurrent(generation, "delivery_journal_load")) return false;
+      this.deliveryJournalLoaded = true;
       return true;
     } catch {
-      // Cache failure must not block server hydration; the network path repairs it.
-      return this.reconciliationIsCurrent(generation, "durable_cache_error");
+      // Journal failure must not block server history. A new send will surface its
+      // own journal error before any network handoff occurs.
+      return this.reconciliationIsCurrent(generation, "delivery_journal_error");
     }
   }
 
-  private async persistCanonicalWindow(generation: number): Promise<boolean> {
-    if (!this.reconciliationIsCurrent(generation, "persist_before")) return false;
-    const forwardAfter = newestDurableMessageId(this.loadedHistoryMessages);
-    await saveDurableCanonicalWindow(
-      this.conn.profile.id,
-      this.conversationId,
-      this.loadedHistoryMessages,
-      { nextBefore: this.nextBefore, forwardAfter },
-      () => !this.closed && isGenerationCurrent(generation, this.reconciliationGeneration),
-    );
-    if (!this.reconciliationIsCurrent(generation, "persist_after")) return false;
-    this.forwardAfter = forwardAfter;
-    const retired = await retirePersistedOutboxEchoes(
-      this.conn.profile.id,
-      this.conversationId,
-      this.loadedHistoryMessages,
-    );
-    if (!this.reconciliationIsCurrent(generation, "persist_retire")) return false;
-    for (const otid of retired) {
-      this.pendingAttachments.delete(otid);
-      this.unacknowledgedOtids.delete(otid);
+  /**
+   * Overlay only genuinely local delivery state after authoritative history is
+   * built. v2 never treats SQLite transcript cache as visible history.
+   */
+  private applyStartupOutbox(authoritativeMessages: readonly unknown[], generation: number): void {
+    if (this.startupOutbox.length === 0) return;
+    const persisted = new Set(persistedUserOtids(authoritativeMessages));
+    const anchor = this.accumulator.rows().length;
+    for (const item of this.startupOutbox) {
+      if (persisted.has(item.otid)) {
+        void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
+        continue;
+      }
+      const recovery = deliveryRecoveryAction(item.state);
+      if (recovery === "delivery_unknown") {
+        // A crash/transport break during handoff is ambiguous without a server
+        // idempotency guarantee. Never auto-replay and never call it Not sent.
+        emitSyncTelemetry({
+          kind: "sync_retry",
+          conversationId: this.conversationId,
+          generation,
+          reason: "delivery_unknown_after_restart",
+        });
+      }
+      this.echoOtids.add(item.otid);
+      if (item.attachments.length > 0) this.pendingAttachments.set(item.otid, item.attachments);
+      if (recovery === "replay") this.queuedRecoveryTurns.push(item);
+      this.localRows.push({
+        anchor,
+        item: {
+          kind: "user",
+          id: item.otid,
+          text: item.text,
+          occurredAt: item.createdAt,
+          ...(item.attachments.length > 0 ? { images: item.attachments.map((attachment) => attachment.uri) } : {}),
+          ...(item.state === "failed"
+            ? { failed: true }
+            : item.state === "sending" || item.state === "awaiting_echo"
+              ? { deliveryUnknown: true }
+              : { pending: true, cancelable: true }),
+        },
+      });
     }
-    return true;
+    this.startupOutbox = [];
   }
+
 
   /**
    * Load existing history before any turn runs.
@@ -1527,57 +1434,41 @@ export class ChatSession {
    * history cannot race stream mutation. Cloud execution stays lazy; remote
    * runtime attachment happens only after the authoritative page is painted.
    */
-  private async hydrate(options?: { reconcileDevice?: boolean; applyHistory?: boolean; generation?: number }): Promise<boolean> {
-    const generation = options?.generation ?? this.reconciliationGeneration;
+  private async hydrate(): Promise<boolean> {
+    const generation = this.reconciliationGeneration;
     try {
-      if (!(await this.hydrateDurableCache(generation))) return false;
-      if (this.conn.profile.type === "remote" && options?.applyHistory !== false) {
-        // Initial React dev double-mount protection only. Reconnect/reattach uses
-        // pure management history and should revalidate immediately.
+      if (!(await this.loadDeliveryJournal(generation))) return false;
+      if (this.conn.profile.type === "remote") {
+        // Initial React dev double-mount protection only. No runtime is created yet.
         await new Promise((resolve) => setTimeout(resolve, 400));
         if (!this.reconciliationIsCurrent(generation, "hydrate_remote_delay")) return false;
       }
-      // Opening/reopening is always latest-first and server-authoritative. Do not
-      // forward-sync from a cache cursor or merge an older local window into the
-      // newest page: those operations made result order depend on which async path
-      // completed first. Older history is a viewport concern and can be paged again.
+
+      // Cold open has exactly one transcript source: the newest canonical server
+      // window. SQLite and retained snapshots never participate in this decision.
       const page = await this.fetchInitialHistory();
       if (!this.reconciliationIsCurrent(generation, "hydrate_initial_history")) return false;
       this.observePersistedHistory(page.messages, generation, "hydrate");
       this.loadedHistoryMessages = [...page.messages];
       this.nextBefore = page.nextBefore;
-      this.forwardAfter = newestDurableMessageId(page.messages);
-      if (!(await this.persistCanonicalWindow(generation))) return false;
-      // Initial hydration has no live row. Reconnect hydration deliberately
-      // defers this until device status says idle (see performReconnect()).
-      if (options?.applyHistory !== false) {
-        this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
-      }
+      this.accumulator = rebuildAuthoritativeTranscript(page.messages);
+      this.applyStartupOutbox(page.messages, generation);
       this.captureHistoryTimestamps(page.messages);
 
-      // Paint authoritative persisted history before attaching any live runtime.
-      // A stream callback must never race this operation and then be overwritten
-      // by a snapshot captured before that callback ran.
-      if (options?.applyHistory !== false) {
-        if (!this.reconciliationIsCurrent(generation, "hydrate_history_commit")) return false;
-        this.commit(patch(this.project(patch(this.snapshot, { hasMore: page.hasMore })), { hydrating: false }));
-      }
+      if (!this.reconciliationIsCurrent(generation, "hydrate_history_commit")) return false;
+      this.commit(patch(this.project(patch(this.snapshot, { hasMore: page.hasMore })), { hydrating: false }));
 
-      if (options?.reconcileDevice !== false) {
-        // Remote runtimes are cheap; attach only after persisted history is on
-        // screen. Cloud remains lazy to avoid provisioning execution just to read.
-        if (this.conn.profile.type === "remote" && !this.session) this.ensureSession();
-        const session = this.session;
-        if (session) {
-          await session.recoverPendingApprovals().catch(() => {});
-          if (!this.reconciliationIsCurrent(generation, "hydrate_approvals") || this.session !== session) return false;
-          const status = await session.getDeviceStatus().catch(() => null);
-          if (!this.reconciliationIsCurrent(generation, "hydrate_device_status") || this.session !== session) return false;
-          if (status) this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
-        }
+      // Remote runtime/viewer attachment happens only after canonical history is
+      // visible, so stream callbacks cannot race and be overwritten by hydration.
+      if (this.conn.profile.type === "remote" && !this.session) this.ensureSession();
+      const session = this.session;
+      if (session) {
+        await session.recoverPendingApprovals().catch(() => {});
+        if (!this.reconciliationIsCurrent(generation, "hydrate_approvals") || this.session !== session) return false;
+        const status = await session.getDeviceStatus().catch(() => null);
+        if (!this.reconciliationIsCurrent(generation, "hydrate_device_status") || this.session !== session) return false;
+        if (status) this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
       }
-
-      if (options?.applyHistory === false && !this.reconciliationIsCurrent(generation, "hydrate_reconnect_complete")) return false;
 
       const queued = this.queuedRecoveryTurns.filter((item) =>
         this.localRows.some((row) => row.item.kind === "user" && row.item.id === item.otid),
@@ -1592,17 +1483,15 @@ export class ChatSession {
             }
           })();
         });
-      } else if (this.session && this.hasUnacknowledgedLocalEcho()) {
-        this.startAuthoritativeCatchUp(this.session, generation);
       }
       return true;
     } catch (e) {
       if (!this.reconciliationIsCurrent(generation, "hydrate_error")) return false;
       const detail = e instanceof Error ? e.message : "Couldn't load history.";
       const transportFailure = isTransportError(detail);
-      // Connection failures are UI transport state, never transcript content.
-      // Keep any in-flight run intact while a replacement socket is retried.
-      const base = transportFailure ? this.scrubTransportErrors(this.snapshot) : this.appendError(this.snapshot, detail, true);
+      const base = transportFailure
+        ? this.scrubTransportErrors(this.snapshot)
+        : this.appendError(this.snapshot, detail, true);
       this.commit(
         patch(base, {
           hydrating: false,
@@ -1620,6 +1509,9 @@ export class ChatSession {
    */
   async loadOlder(): Promise<void> {
     if (this.snapshot.hydrating || this.snapshot.loadingOlder) return;
+    // Backward pagination is viewport-only. Never rebase historical pages through
+    // a live turn; wait until the session is genuinely idle.
+    if (this.deviceIsProcessing || this.snapshot.run !== "idle") return;
     if (!this.snapshot.hasMore || !this.nextBefore) return;
     const generation = this.reconciliationGeneration;
     const before = this.nextBefore;
@@ -1630,10 +1522,9 @@ export class ChatSession {
       this.observePersistedHistory(page.messages, generation, "older");
       this.nextBefore = page.nextBefore;
       this.mergeOlderHistory(page.messages);
-      if (!(await this.persistCanonicalWindow(generation))) return;
-      // Rebase the complete loaded history window so later authoritative newest-
-      // turn repairs cannot reorder an older page behind the live edge.
-      this.accumulator.rebase({ messages: this.loadedHistoryMessages as never }, { order: "asc" });
+      // Idle-only pagination can rebuild from persisted history directly. A fresh
+      // accumulator avoids synthetic-live identities surviving a merge rebase.
+      this.accumulator = rebuildAuthoritativeTranscript(this.loadedHistoryMessages);
       this.captureHistoryTimestamps(page.messages);
       this.commit(
         this.project(patch(this.snapshot, { hasMore: page.hasMore, loadingOlder: false })),
@@ -1645,43 +1536,6 @@ export class ChatSession {
         this.commit(patch(this.snapshot, { loadingOlder: false }));
       }
     }
-  }
-
-  private async fetchForwardPage(
-    after: string,
-    limit = AUTHORITATIVE_PAGE_SIZE,
-  ): Promise<{ messages: unknown[]; hasMore: boolean }> {
-    const result = await listConversationMessages(this.conn, this.conversationId, { after, order: "asc", limit });
-    return { messages: result.messages, hasMore: result.hasMore };
-  }
-
-  /** Fill only the missing newer suffix; never reuse the backward paging cursor. */
-  private async syncForwardHistory(generation: number): Promise<boolean> {
-    let cursor = this.forwardAfter ?? newestDurableMessageId(this.loadedHistoryMessages);
-    if (!cursor) return this.reconciliationIsCurrent(generation, "forward_no_cursor");
-    for (let count = 0; count < FORWARD_SYNC_MAX_PAGES; count += 1) {
-      const page = await this.fetchForwardPage(cursor);
-      if (!this.reconciliationIsCurrent(generation, "forward_fetch")) return false;
-      this.observePersistedHistory(page.messages, generation, "forward");
-      if (page.messages.length === 0) break;
-      const next = newestDurableMessageId(page.messages);
-      if (!next || next === cursor) {
-        if (page.hasMore) {
-          emitSyncTelemetry({
-            kind: "protocol_gap",
-            conversationId: this.conversationId,
-            generation,
-            reason: "forward_cursor_no_progress",
-          });
-        }
-        break;
-      }
-      this.loadedHistoryMessages = mergeForwardMessages(this.loadedHistoryMessages, page.messages);
-      cursor = next;
-      this.forwardAfter = next;
-      if (!page.hasMore) break;
-    }
-    return this.reconciliationIsCurrent(generation, "forward_complete");
   }
 
   /** One page of history, oldest-first, with the cursor to the next older page. */
@@ -1722,53 +1576,6 @@ export class ChatSession {
     return { messages, nextBefore, hasMore };
   }
 
-  /**
-   * Fetch the complete newest turn rather than trusting an arbitrary page cut.
-   * Tool-heavy turns can exceed 50 wire messages; a fixed tail can therefore
-   * begin after the user instruction or between a tool call and its return.
-   */
-  private async fetchAuthoritativeTail(): Promise<unknown[]> {
-    let page = await this.fetchHistoryPage();
-    let combined = page.messages;
-    let cursor = page.nextBefore;
-
-    for (let count = 1; count < AUTHORITATIVE_MAX_PAGES && !containsUserMessage(combined) && page.hasMore && cursor; count++) {
-      page = await this.fetchHistoryPage(cursor);
-      combined = [...page.messages, ...combined];
-      cursor = page.nextBefore;
-    }
-
-    for (let i = combined.length - 1; i >= 0; i--) {
-      if (isUserHistoryMessage(combined[i])) return combined.slice(i);
-    }
-    return combined;
-  }
-
-  /** Replace the newest persisted suffix while preserving all older loaded rows. */
-  private mergeLatestHistory(messages: readonly unknown[]): void {
-    if (messages.length === 0) return;
-    if (this.loadedHistoryMessages.length === 0) {
-      this.loadedHistoryMessages = [...messages];
-      return;
-    }
-
-    const firstId = historyMessageId(messages[0]);
-    if (firstId) {
-      const overlap = this.loadedHistoryMessages.findIndex((message) => historyMessageId(message) === firstId);
-      if (overlap >= 0) {
-        this.loadedHistoryMessages = [...this.loadedHistoryMessages.slice(0, overlap), ...messages];
-        return;
-      }
-    }
-
-    const existing = new Set(this.loadedHistoryMessages.map(historyMessageId).filter(Boolean));
-    const additions = messages.filter((message) => {
-      const id = historyMessageId(message);
-      return !id || !existing.has(id);
-    });
-    this.loadedHistoryMessages = [...this.loadedHistoryMessages, ...additions];
-  }
-
   /** Prepend an older cursor page without duplicating its overlap boundary. */
   private mergeOlderHistory(messages: readonly unknown[]): void {
     if (messages.length === 0) return;
@@ -1779,52 +1586,6 @@ export class ChatSession {
     });
     this.loadedHistoryMessages = [...additions, ...this.loadedHistoryMessages];
   }
-
-  /**
-   * Reconnect/catch-up only: replace ephemeral stream state with the server's
-   * canonical history after device status has reported idle. Local optimistic
-   * rows are deliberately outside the accumulator, so project() retains them
-   * and retires echoed users by OTID.
-   */
-  private reconcileAuthoritativeHistory(messages: readonly unknown[], generation: number): boolean {
-    if (!this.reconciliationIsCurrent(generation, "authoritative_reconcile_before")) return false;
-    this.mergeLatestHistory(messages);
-    const authoritative = rebuildAuthoritativeTranscript(this.loadedHistoryMessages);
-    if (!authoritativeRowsCoverCurrent(this.accumulator.rows(), authoritative.rows())) return false;
-    if (!this.reconciliationIsCurrent(generation, "authoritative_reconcile_apply")) return false;
-    this.accumulator = authoritative;
-    this.captureHistoryTimestamps(this.loadedHistoryMessages);
-    this.commit(this.project(this.snapshot));
-    return true;
-  }
-
-  /**
-   * A turn can start while the REST history tail is in flight. Recheck the
-   * same live session immediately before replacing the accumulator, or that
-   * fresh queued/live state could be erased by an already-stale idle snapshot.
-   */
-  private async reconcileAuthoritativeHistoryIfStillIdle(
-    session: LettaCodeSession,
-    messages: readonly unknown[],
-    generation: number,
-  ): Promise<boolean> {
-    if (!this.reconciliationIsCurrent(generation, "authoritative_status_before") || this.session !== session) return false;
-    const status = await session.getDeviceStatus();
-    if (!this.reconciliationIsCurrent(generation, "authoritative_status_after") || this.session !== session) return false;
-
-    const next = this.applyDeviceStatus(this.project(this.snapshot), status);
-    this.commit(next);
-    const hasPendingApprovals = (status.pendingControlRequests?.length ?? 0) > 0 || next.approvals.length > 0;
-    if (status.isProcessing || hasPendingApprovals || next.run !== "idle") return false;
-
-    if (!this.reconcileAuthoritativeHistory(messages, generation)) return false;
-    return this.persistCanonicalWindow(generation);
-  }
-
-  // A healthy live turn is never rebuilt or merge-rebased from persisted
-  // history. Fresh-accumulator replacement is contained to reconnect catch-up,
-  // after the executing device reports idle; bounded retries cover persistence
-  // lag without perturbing a healthy live result.
 
   private async consume(session: LettaCodeSession, streamGeneration: number): Promise<void> {
     try {
@@ -1986,12 +1747,11 @@ export class ChatSession {
     });
     for (const otid of acknowledgedEchoes) {
       this.echoOtids.delete(otid);
-      this.unacknowledgedOtids.delete(otid);
       this.pendingAttachments.delete(otid);
       this.queuedRecoveryTurns = this.queuedRecoveryTurns.filter((item) => item.otid !== otid);
-      // The live persisted USER row is definitive acknowledgement. Retire the
-      // durable outbox immediately; waiting for a later canonical-window save
-      // is unsafe once old user rows can age out of the bounded hot cache.
+      // A persisted USER row is definitive acknowledgement. Retire any remaining
+      // journal row immediately; transcript persistence and delivery ownership are
+      // intentionally separate concerns.
       void removeDurableOutbox(this.conn.profile.id, this.conversationId, otid).catch(() => {});
     }
 
