@@ -5,6 +5,7 @@ import { durableMessageOtid, durableMessageStorageIdentity, newestDurableMessage
 
 const DB_NAME = "bloop-chat.db";
 const SCHEMA_VERSION = 1;
+export const DURABLE_HOT_WINDOW_MESSAGES = 100;
 
 export type DurableOutboxState = "queued" | "sending" | "awaiting_echo" | "failed";
 
@@ -33,6 +34,7 @@ interface ConversationRow {
 }
 
 interface MessageRow {
+  message_id: string;
   raw_json: string;
 }
 
@@ -166,9 +168,12 @@ export async function loadDurableConversation(
       conversationId,
     ),
     db.getAllAsync<MessageRow>(
-      "SELECT raw_json FROM durable_messages WHERE profile_id = ? AND conversation_id = ? ORDER BY sequence ASC",
+      `SELECT message_id, raw_json FROM durable_messages
+       WHERE profile_id = ? AND conversation_id = ?
+       ORDER BY sequence DESC LIMIT ?`,
       profileId,
       conversationId,
+      DURABLE_HOT_WINDOW_MESSAGES,
     ),
     db.getAllAsync<OutboxRow>(
       "SELECT profile_id, conversation_id, otid, text, attachments_json, state, error, created_at, updated_at FROM durable_outbox WHERE profile_id = ? AND conversation_id = ? ORDER BY created_at ASC",
@@ -176,6 +181,10 @@ export async function loadDurableConversation(
       conversationId,
     ),
   ]);
+  // SQLite reads newest-first so it can stop after the hot window; reverse once
+  // in JS to restore canonical transcript order. The full archive remains on
+  // the App Server and is paged backward only when the reader scrolls up.
+  rows.reverse();
   const messages: unknown[] = [];
   for (const row of rows) {
     try {
@@ -186,7 +195,13 @@ export async function loadDurableConversation(
   }
   return {
     messages,
-    nextBefore: conversation?.next_before ?? null,
+    // If the durable table held a larger historical window, its stored
+    // next_before cursor points before rows we intentionally did not hydrate.
+    // The oldest loaded UUID is the correct server cursor for the next page.
+    nextBefore:
+      rows.length >= DURABLE_HOT_WINDOW_MESSAGES
+        ? rows[0]?.message_id ?? null
+        : conversation?.next_before ?? null,
     forwardAfter: conversation?.forward_after ?? newestDurableMessageId(messages),
     outbox: outbox.map(decodeOutbox),
   };
@@ -208,10 +223,17 @@ export async function saveDurableCanonicalWindow(
     if (isCurrent && !isCurrent()) return;
     const db = await database();
     if (isCurrent && !isCurrent()) return;
-    const normalizedMessages = normalizeDurableMessages(messages);
+    const normalizedAll = normalizeDurableMessages(messages);
+    const trimmed = normalizedAll.length > DURABLE_HOT_WINDOW_MESSAGES;
+    const normalizedMessages = trimmed
+      ? normalizedAll.slice(-DURABLE_HOT_WINDOW_MESSAGES)
+      : normalizedAll;
     const forwardAfter = cursors.forwardAfter === undefined
       ? newestDurableMessageId(normalizedMessages)
       : cursors.forwardAfter;
+    const nextBefore = trimmed
+      ? durableMessageStorageIdentity(normalizedMessages[0]) ?? cursors.nextBefore
+      : cursors.nextBefore;
     const stale = Symbol("stale-durable-write");
     try {
       await db.withTransactionAsync(async () => {
@@ -225,7 +247,7 @@ export async function saveDurableCanonicalWindow(
            updated_at = excluded.updated_at`,
         profileId,
         conversationId,
-        cursors.nextBefore,
+        nextBefore,
         forwardAfter,
         Date.now(),
       );

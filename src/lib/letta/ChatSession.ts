@@ -77,6 +77,7 @@ const ABORT_CONFIRM_TIMEOUT_MS = 5000;
 const ABORT_CONFIRM_INTERVAL_MS = 250;
 const AUTHORITATIVE_PAGE_SIZE = 50;
 const AUTHORITATIVE_MAX_PAGES = 8;
+const INITIAL_HISTORY_MAX_PAGES = 2;
 const FORWARD_SYNC_MAX_PAGES = 100;
 const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
@@ -1527,16 +1528,27 @@ export class ChatSession {
         await new Promise((resolve) => setTimeout(resolve, 400));
         if (!this.reconciliationIsCurrent(generation, "hydrate_remote_delay")) return false;
       }
+      const initialOpen = options?.applyHistory !== false && this.snapshot.hydrating;
       const hadDurableHistory = this.loadedHistoryMessages.length > 0;
       const durableBefore = this.nextBefore;
-      if (hadDurableHistory && this.forwardAfter) {
+      // A cold open is a viewport operation, not a full-history convergence job.
+      // Fetch the newest bounded server window immediately and paint it. Reconnect
+      // recovery keeps the exhaustive forward-sync path because delivery/OTID
+      // convergence matters there; ordinary navigation must never page through a
+      // huge backlog before the user can interact with the chat.
+      if (!initialOpen && hadDurableHistory && this.forwardAfter) {
         if (!(await this.syncForwardHistory(generation))) return false;
       }
       const page = await this.fetchInitialHistory();
       if (!this.reconciliationIsCurrent(generation, "hydrate_initial_history")) return false;
       this.observePersistedHistory(page.messages, generation, "hydrate");
-      this.nextBefore = hadDurableHistory ? durableBefore : page.nextBefore;
-      this.mergeLatestHistory(page.messages);
+      if (initialOpen) {
+        this.loadedHistoryMessages = [...page.messages];
+        this.nextBefore = page.nextBefore;
+      } else {
+        this.nextBefore = hadDurableHistory ? durableBefore : page.nextBefore;
+        this.mergeLatestHistory(page.messages);
+      }
       if (!(await this.persistCanonicalWindow(generation))) return false;
       // Initial hydration has no live row. Reconnect hydration deliberately
       // defers this until device status says idle (see performReconnect()).
@@ -1706,7 +1718,7 @@ export class ChatSession {
 
     for (
       let count = 1;
-      count < AUTHORITATIVE_MAX_PAGES && !containsUserMessage(messages) && hasMore && nextBefore;
+      count < INITIAL_HISTORY_MAX_PAGES && !containsUserMessage(messages) && hasMore && nextBefore;
       count++
     ) {
       page = await this.fetchHistoryPage(nextBefore);
