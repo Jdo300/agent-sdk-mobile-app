@@ -407,23 +407,44 @@ export class ChatSession {
     if (this.sendActivityTimer) clearTimeout(this.sendActivityTimer);
     this.sendActivityTimer = setTimeout(() => {
       this.sendActivityTimer = null;
+      void this.verifySilentSend(serialBeforeSend);
+    }, SEND_STREAM_ACTIVITY_TIMEOUT_MS);
+  }
+
+  private async verifySilentSend(serialBeforeSend: number): Promise<void> {
+    if (this.closed || serialBeforeSend !== this.streamActivitySerial) return;
+    const session = this.session;
+    if (!session || this.sessionDead) {
+      void this.reconnect({ forceNewTransport: true });
+      return;
+    }
+
+    try {
+      // First-token latency is not a transport-health signal. A large local-model
+      // prefill can legitimately be quiet for well over five seconds. Ask the
+      // authoritative device before tearing down a healthy viewer socket.
+      const status = await session.getDeviceStatus();
+      if (this.closed || this.session !== session || serialBeforeSend !== this.streamActivitySerial) return;
+      this.commit(this.applyDeviceStatus(this.project(this.snapshot), status));
       if (!shouldReconnectSilentSend({
         closed: this.closed,
         serialBeforeSend,
         currentSerial: this.streamActivitySerial,
         run: this.snapshot.run,
         connection: this.snapshot.connection,
+        serverProcessing: status.isProcessing,
       })) return;
-      // The control path accepted the send but the viewer stream stayed silent.
-      // Rebuild the transport so the user is not left staring at a frozen echo;
-      // authoritative catch-up will converge whatever the server already did.
       void this.reconnect({ forceNewTransport: true });
-    }, SEND_STREAM_ACTIVITY_TIMEOUT_MS);
+    } catch {
+      if (!this.closed && this.session === session && serialBeforeSend === this.streamActivitySerial) {
+        void this.reconnect({ forceNewTransport: true });
+      }
+    }
   }
 
-  async send(text: string, attachments: Attachment[] = []): Promise<void> {
+  async send(text: string, attachments: Attachment[] = []): Promise<boolean> {
     const otid = `echo-${this.conversationId}-${Date.now()}-${this.counter++}`;
-    await this.submitDurableTurn({
+    return this.submitDurableTurn({
       profileId: this.conn.profile.id,
       conversationId: this.conversationId,
       otid,
@@ -437,7 +458,7 @@ export class ChatSession {
   }
 
   /** Persist first, then submit the exact same OTID on every retry. */
-  private async submitDurableTurn(item: DurableOutboxItem): Promise<void> {
+  private async submitDurableTurn(item: DurableOutboxItem): Promise<boolean> {
     this.advanceReconciliationGeneration();
     this.cancelAuthoritativeCatchUp();
     if (this.snapshot.loadingOlder) this.commit(patch(this.snapshot, { loadingOlder: false }));
@@ -446,7 +467,7 @@ export class ChatSession {
     } catch (e) {
       const detail = e instanceof Error ? e.message : "Could not journal message locally.";
       this.commit(this.appendError(this.snapshot, detail));
-      return;
+      return false;
     }
 
     const { otid, text, attachments } = item;
@@ -476,7 +497,7 @@ export class ChatSession {
       // exposes no abort primitive, so remove the Cancel affordance before handoff.
       if (this.cancelledLocalOtids.has(otid)) {
         this.cancelledLocalOtids.delete(otid);
-        return;
+        return false;
       }
       this.markEcho(otid, { cancelable: false });
       this.commit(this.project(this.snapshot));
@@ -484,7 +505,7 @@ export class ChatSession {
       if (this.cancelledLocalOtids.has(otid)) {
         this.cancelledLocalOtids.delete(otid);
         await removeDurableOutbox(this.conn.profile.id, this.conversationId, otid).catch(() => {});
-        return;
+        return false;
       }
       const activityBeforeSend = this.streamActivitySerial;
       await this.ensureSession().send(
@@ -508,11 +529,12 @@ export class ChatSession {
       });
       this.commit(transportFailure ? this.scrubTransportErrors(next) : this.appendError(next, detail));
       if (transportFailure && !isAuthError(e)) this.scheduleReconnectRetry();
-      return;
+      return false;
     }
     this.pendingAttachments.delete(otid);
     this.markEcho(otid, { pending: false });
     this.commit(this.project(this.snapshot));
+    return true;
   }
 
   /** Update an in-flight echo in place (pending -> sent, or failed). */

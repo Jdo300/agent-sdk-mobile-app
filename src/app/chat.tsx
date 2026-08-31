@@ -454,7 +454,10 @@ export default function ChatScreen() {
         followLiveRef.current = true;
         nearBottomRef.current = true;
         setNearBottom(true);
-        await session.send(text);
+        const sent = await session.send(text);
+        if (!sent) {
+          throw new Error("Transcription completed, but the chat send failed. Your transcript is preserved as an unsent message below; tap Retry to send it again.");
+        }
         requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: false }));
       } else {
         setDraft(text);
