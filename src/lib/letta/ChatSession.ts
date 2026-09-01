@@ -204,8 +204,6 @@ export class ChatSession {
   private historyRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private historyRefreshInFlight = false;
   private historyRefreshPending = false;
-  /** Fingerprint of the newest authoritative server window currently rendered. */
-  private authoritativeTailFingerprint: string | null = null;
   /** Brief post-idle persistence-settle polling; elapsed time never decides truth. */
   private historyRefreshSettleUntil = 0;
   /** Foreground, stream-failure and Retry triggers all join one recovery. */
@@ -1111,15 +1109,15 @@ export class ChatSession {
       const page = await this.fetchInitialHistory();
       if (!this.reconciliationIsCurrent(generation, "live_history_refresh")) return;
       this.observePersistedHistory(page.messages, generation, "live_refresh");
-      const fingerprint = persistedHistoryFingerprint(page.messages);
-      if (fingerprint !== this.authoritativeTailFingerprint) {
-        this.authoritativeTailFingerprint = fingerprint;
-        this.loadedHistoryMessages = [...page.messages];
-        this.nextBefore = page.nextBefore;
-        this.accumulator = rebuildAuthoritativeTranscript(page.messages);
-        this.captureHistoryTimestamps(page.messages);
-        this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
-      }
+      // Do not short-circuit on message IDs alone: App Server messages do not
+      // expose a revision/update cursor, so content/status may theoretically
+      // change in place under a stable ID. Rebuild from every authoritative
+      // response; projected row identity caching keeps unchanged UI rows cheap.
+      this.loadedHistoryMessages = [...page.messages];
+      this.nextBefore = page.nextBefore;
+      this.accumulator = rebuildAuthoritativeTranscript(page.messages);
+      this.captureHistoryTimestamps(page.messages);
+      this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
     } catch {
       // The viewer/control transport remains responsible for connection UI. A
       // missed history refresh must not create a transcript error row.
@@ -1212,7 +1210,6 @@ export class ChatSession {
       retainedChatSessions.delete(this.retainedKey);
     }
     this.accumulator.reset();
-    this.authoritativeTailFingerprint = null;
     this.historyRefreshSettleUntil = 0;
     this.localRows = [];
     this.echoOtids.clear();
@@ -1375,7 +1372,6 @@ export class ChatSession {
       const page = await this.fetchInitialHistory();
       if (!this.reconciliationIsCurrent(generation, "hydrate_initial_history")) return false;
       this.observePersistedHistory(page.messages, generation, "hydrate");
-      this.authoritativeTailFingerprint = persistedHistoryFingerprint(page.messages);
       this.loadedHistoryMessages = [...page.messages];
       this.nextBefore = page.nextBefore;
       this.accumulator = rebuildAuthoritativeTranscript(page.messages);
