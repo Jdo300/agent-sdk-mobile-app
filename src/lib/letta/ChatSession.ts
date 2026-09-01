@@ -26,11 +26,12 @@ import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
 import { liveTextKeyAtEdge, newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
-import { authoritativeLatestTurnCoversCurrent, rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
-import { isAuthoritativeCatchUpCurrent, shouldReconnectSilentSend } from "./authoritativeCatchUp";
+import { rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
+import { shouldReconnectSilentSend } from "./authoritativeCatchUp";
 import {
   emitSyncTelemetry,
   inspectPersistedHistory,
+  persistedHistoryFingerprint,
   isGenerationCurrent,
   ProtocolObserver,
 } from "./protocolHardening";
@@ -42,16 +43,9 @@ import {
   type DurableOutboxItem,
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
+import { streamDisposition } from "./streamDisposition";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
-
-/**
- * Steady-state delta flush interval. Wire chunks arrive far faster than the
- * UI can usefully paint them; committing each one re-renders every visible
- * row. The references coalesce the same way (remodex 80ms steady tier,
- * paseo 48ms) — the first delta of a burst still commits immediately.
- */
-const STREAM_FLUSH_MS = 80;
 
 /**
  * How long a resolved approval waits for evidence the decision reached the
@@ -75,9 +69,7 @@ const AUTHORITATIVE_PAGE_SIZE = 50;
 const INITIAL_HISTORY_MAX_PAGES = 20;
 const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
-const AUTHORITATIVE_CATCHUP_MAX_MS = 30000;
-const AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS = 250;
-const AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS = 4000;
+const AUTHORITATIVE_LIVE_REFRESH_MS = 500;
 const SEND_STREAM_ACTIVITY_TIMEOUT_MS = 5000;
 
 /** A transport loss does not imply the server-side run stopped. */
@@ -159,9 +151,10 @@ export class ChatSession {
   /** Set when the stream errored terminally; reconnect() replaces the session. */
   private sessionDead = false;
   /**
-   * Row identity, delta accumulation, replay suppression and backfill merging
-   * all belong to the SDK's accumulator (letta-agent-sdk#274). What stays here
-   * is presentation: which row is live, how long a think took, tool statuses the
+   * Persisted App Server history owns transcript identity and ordering. The SDK
+   * viewer stream is control/status only because resume may replay historical
+   * deltas without reliable sequence ids. This accumulator is rebuilt from
+   * authoritative history; what stays here is presentation: which row is live, how long a think took, tool statuses the
    * approval flow owns, and rows the server has never seen.
    */
   private accumulator: TranscriptAccumulator = createTranscriptAccumulator();
@@ -207,15 +200,19 @@ export class ChatSession {
   /** Startup delivery journal is read once; it never supplies transcript history. */
   private deliveryJournalLoaded = false;
   private startupOutbox: DurableOutboxItem[] = [];
-  private pendingStream: SDKMessage[] = [];
-  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Coalesced management-history refresh; SDK transcript replay is never rendered directly. */
+  private historyRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private historyRefreshInFlight = false;
+  private historyRefreshPending = false;
+  /** Fingerprint of the newest authoritative server window currently rendered. */
+  private authoritativeTailFingerprint: string | null = null;
+  /** Brief post-idle persistence-settle polling; elapsed time never decides truth. */
+  private historyRefreshSettleUntil = 0;
   /** Foreground, stream-failure and Retry triggers all join one recovery. */
   private reconnectInFlight: Promise<void> | null = null;
   /** Quiet background retry after a transient socket-open failure. */
   private reconnectRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectRetryAttempt = 0;
-  /** Cancellation gate for persistence-lag retries after an idle reconnect. */
-  private authoritativeCatchUpGeneration = 0;
   /** Lifecycle epoch for every async hydration/paging/reconciliation callback. */
   private reconciliationGeneration = 0;
   private readonly protocolObserver = new ProtocolObserver();
@@ -223,8 +220,6 @@ export class ChatSession {
   /** Incremented for every message observed on the live viewer stream. */
   private streamActivitySerial = 0;
   private sendActivityTimer: ReturnType<typeof setTimeout> | null = null;
-  private authoritativeCatchUpTimer: ReturnType<typeof setTimeout> | null = null;
-  private authoritativeCatchUpWake: (() => void) | null = null;
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
@@ -236,8 +231,6 @@ export class ChatSession {
     string,
     (response: { behavior: "allow" } | { behavior: "deny"; message: string }) => void
   >();
-  /** Resolved approvals waiting for post-decision stream traffic. */
-  private activityWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
 
   private constructor(
     conn: { profile: Profile; secret: string },
@@ -454,7 +447,6 @@ export class ChatSession {
   /** Persist first, then submit the exact same OTID on every retry. */
   private async submitDurableTurn(item: DurableOutboxItem): Promise<boolean> {
     this.advanceReconciliationGeneration();
-    this.cancelAuthoritativeCatchUp();
     if (this.snapshot.loadingOlder) this.commit(patch(this.snapshot, { loadingOlder: false }));
     try {
       await putDurableOutbox(item);
@@ -515,6 +507,7 @@ export class ChatSession {
       // `awaiting_echo` is delivery state only; it never participates in transcript
       // ordering or history synchronization.
       await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "awaiting_echo").catch(() => {});
+      this.scheduleAuthoritativeHistoryRefresh(0);
     } catch (e) {
       const detail = e instanceof Error ? e.message : "Send failed.";
       const transportFailure = isTransportError(detail);
@@ -719,7 +712,7 @@ export class ChatSession {
     }
     let delivered = true;
     try {
-      await this.awaitStreamActivity(APPROVAL_CONFIRM_TIMEOUT_MS);
+      await this.awaitApprovalResolution(requestId, APPROVAL_CONFIRM_TIMEOUT_MS);
     } catch {
       delivered = false;
     }
@@ -752,38 +745,21 @@ export class ChatSession {
   }
 
   /**
-   * Settles on the next ingested stream message — any traffic after the
-   * decision hand-off proves the socket is alive, the closest confirmation a
-   * fire-and-forget approval_response allows. A silent-but-healthy stream
-   * (long tool run) settles at the timeout; only a stream error rejects.
+   * Confirm an approval through authoritative device status. The resumed viewer
+   * stream can replay historical traffic, so arbitrary stream activity is not
+   * proof that this specific approval response reached the server.
    */
-  private awaitStreamActivity(timeoutMs: number): Promise<void> {
-    if (this.sessionDead || !this.session) return Promise.reject(new Error("Session unavailable"));
-    return new Promise<void>((resolve, reject) => {
-      const waiter = {
-        resolve: () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        reject: (error: Error) => {
-          clearTimeout(timer);
-          reject(error);
-        },
-      };
-      const timer = setTimeout(() => {
-        this.activityWaiters.delete(waiter);
-        resolve();
-      }, timeoutMs);
-      this.activityWaiters.add(waiter);
-    });
-  }
-
-  private settleActivityWaiters(error?: Error): void {
-    const waiters = [...this.activityWaiters];
-    this.activityWaiters.clear();
-    for (const waiter of waiters) {
-      if (error) waiter.reject(error);
-      else waiter.resolve();
+  private async awaitApprovalResolution(requestId: string, timeoutMs: number): Promise<void> {
+    const session = this.session;
+    if (this.sessionDead || !session) throw new Error("Session unavailable");
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const status = await session.getDeviceStatus();
+      if (this.closed || this.session !== session) throw new Error("Session changed while confirming approval");
+      this.commit(this.applyDeviceStatus(this.snapshot, status));
+      if (!(status.pendingControlRequests ?? []).some((request) => request.requestId === requestId)) return;
+      if (Date.now() >= deadline) throw new Error("Timed out confirming approval");
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }
 
@@ -920,8 +896,29 @@ export class ChatSession {
 
   /** Mirror live device status (permission mode, cwd) into the snapshot. */
   private watchDeviceStatus(session: LettaCodeSession): void {
-    session.onDeviceStatus((status) => this.commit(this.applyDeviceStatus(this.snapshot, status)));
-    void session.getDeviceStatus().catch(() => {
+    session.onDeviceStatus((status) => {
+      const wasProcessing = this.deviceIsProcessing;
+      this.commit(this.applyDeviceStatus(this.snapshot, status));
+      if (status.isProcessing) {
+        this.historyRefreshSettleUntil = 0;
+        this.scheduleAuthoritativeHistoryRefresh(0);
+      } else if (wasProcessing) {
+        this.historyRefreshSettleUntil = Date.now() + 5000;
+        this.scheduleAuthoritativeHistoryRefresh(0);
+      }
+    });
+    void session.getDeviceStatus().then((status) => {
+      if (this.closed || this.session !== session) return;
+      const wasProcessing = this.deviceIsProcessing;
+      this.commit(this.applyDeviceStatus(this.snapshot, status));
+      if (status.isProcessing) {
+        this.historyRefreshSettleUntil = 0;
+        this.scheduleAuthoritativeHistoryRefresh(0);
+      } else if (wasProcessing) {
+        this.historyRefreshSettleUntil = Date.now() + 5000;
+        this.scheduleAuthoritativeHistoryRefresh(0);
+      }
+    }).catch(() => {
       // Best-effort: some transports may not replay status until a turn runs.
     });
   }
@@ -1049,8 +1046,7 @@ export class ChatSession {
 
     // A dead or explicitly-reset SDK transport is discarded before probing runtime state.
     if (this.sessionDead || options?.forceNewTransport) {
-      this.cancelAuthoritativeCatchUp();
-      const stale = this.session;
+        const stale = this.session;
       this.session = null;
       this.streamGeneration += 1;
       this.sessionDead = false;
@@ -1075,7 +1071,7 @@ export class ChatSession {
       if (pending) clearTimeout(pending);
       this.clearReconnectRetry();
       this.commit(patch(this.project(this.snapshot), { connection: "connected" }));
-      this.startAuthoritativeCatchUp(session, generation);
+      this.scheduleAuthoritativeHistoryRefresh(0);
     } catch (e) {
       if (pending) clearTimeout(pending);
       if (!this.reconciliationIsCurrent(generation, "reconnect_error")) return;
@@ -1091,132 +1087,54 @@ export class ChatSession {
     }
   }
 
-  private startAuthoritativeCatchUp(session: LettaCodeSession, reconciliationGeneration: number): void {
-    this.cancelAuthoritativeCatchUp();
-    const catchUpGeneration = this.authoritativeCatchUpGeneration;
-    void this.catchUpAfterReconnect(session, catchUpGeneration, reconciliationGeneration);
-  }
-
-  private cancelAuthoritativeCatchUp(): void {
-    this.authoritativeCatchUpGeneration += 1;
-    if (this.authoritativeCatchUpTimer) clearTimeout(this.authoritativeCatchUpTimer);
-    this.authoritativeCatchUpTimer = null;
-    this.authoritativeCatchUpWake?.();
-    this.authoritativeCatchUpWake = null;
-  }
-
-  private waitForAuthoritativeCatchUp(delay: number, catchUpGeneration: number): Promise<void> {
-    return new Promise((resolve) => {
-      const wake = () => {
-        if (this.authoritativeCatchUpTimer) clearTimeout(this.authoritativeCatchUpTimer);
-        this.authoritativeCatchUpTimer = null;
-        if (this.authoritativeCatchUpWake === wake) this.authoritativeCatchUpWake = null;
-        resolve();
-      };
-      if (this.closed || catchUpGeneration !== this.authoritativeCatchUpGeneration) return wake();
-      this.authoritativeCatchUpWake = wake;
-      this.authoritativeCatchUpTimer = setTimeout(wake, delay);
-    });
-  }
-
   /**
-   * After a transport rebuild, preserve the live transcript while Milo is still
-   * processing. Once the device is genuinely idle, poll only until the newest
-   * persisted turn covers the newest live turn, then replace the accumulator with
-   * a fresh canonical server window. No SQLite cursors or delivery OTIDs take part.
+   * Coalesce viewer-stream activity into a pure management-history refresh.
+   * The App Server may replay arbitrary old runs when a viewer resumes; only
+   * listMessages() is allowed to replace transcript-bearing rows.
    */
-  private async catchUpAfterReconnect(
-    session: LettaCodeSession,
-    catchUpGeneration: number,
-    reconciliationGeneration: number,
-  ): Promise<void> {
-    let deadline: number | null = null;
-    let attempt = 0;
+  private scheduleAuthoritativeHistoryRefresh(delay = AUTHORITATIVE_LIVE_REFRESH_MS): void {
+    if (this.closed) return;
+    this.historyRefreshPending = true;
+    if (this.historyRefreshInFlight || this.historyRefreshTimer) return;
+    this.historyRefreshTimer = setTimeout(() => {
+      this.historyRefreshTimer = null;
+      void this.refreshAuthoritativeHistory();
+    }, Math.max(0, delay));
+  }
+
+  private async refreshAuthoritativeHistory(): Promise<void> {
+    if (this.closed || this.historyRefreshInFlight) return;
+    this.historyRefreshInFlight = true;
+    this.historyRefreshPending = false;
+    const generation = this.reconciliationGeneration;
     try {
-      while (this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) {
-        const status = await session.getDeviceStatus();
-        if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
-        const next = this.applyDeviceStatus(this.project(this.snapshot), status);
-        this.commit(next);
-        const hasPendingApprovals = (status.pendingControlRequests?.length ?? 0) > 0 || next.approvals.length > 0;
-        if (status.isProcessing || hasPendingApprovals || next.run !== "idle") {
-          const delay = Math.min(
-            AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS,
-            Math.max(1000, AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** Math.min(attempt, 4)),
-          );
-          attempt += 1;
-          await this.waitForAuthoritativeCatchUp(delay, catchUpGeneration);
-          continue;
-        }
-
-        if (deadline === null) {
-          deadline = Date.now() + AUTHORITATIVE_CATCHUP_MAX_MS;
-          attempt = 0;
-        }
-
-        const page = await this.fetchInitialHistory();
-        if (!this.isAuthoritativeCatchUpCurrent(session, catchUpGeneration, reconciliationGeneration)) return;
-        this.observePersistedHistory(page.messages, reconciliationGeneration, "catchup");
-        const canonical = rebuildAuthoritativeTranscript(page.messages);
-        if (authoritativeLatestTurnCoversCurrent(this.accumulator.rows(), canonical.rows())) {
-          this.loadedHistoryMessages = [...page.messages];
-          this.nextBefore = page.nextBefore;
-          this.accumulator = canonical;
-          this.captureHistoryTimestamps(page.messages);
-          this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
-          emitSyncTelemetry({
-            kind: "sync_converged",
-            conversationId: this.conversationId,
-            generation: reconciliationGeneration,
-            attempt,
-          });
-          return;
-        }
-
-        if (deadline !== null && Date.now() >= deadline) {
-          emitSyncTelemetry({
-            kind: "sync_retry",
-            conversationId: this.conversationId,
-            generation: reconciliationGeneration,
-            attempt,
-            reason: "persistence_timeout",
-          });
-          return;
-        }
-        emitSyncTelemetry({
-          kind: "sync_retry",
-          conversationId: this.conversationId,
-          generation: reconciliationGeneration,
-          attempt,
-          reason: "awaiting_persisted_rows",
-        });
-        const delay = Math.min(
-          AUTHORITATIVE_CATCHUP_BACKOFF_MAX_MS,
-          AUTHORITATIVE_CATCHUP_BACKOFF_BASE_MS * 2 ** Math.min(attempt, 4),
-        );
-        attempt += 1;
-        await this.waitForAuthoritativeCatchUp(delay, catchUpGeneration);
+      const page = await this.fetchInitialHistory();
+      if (!this.reconciliationIsCurrent(generation, "live_history_refresh")) return;
+      this.observePersistedHistory(page.messages, generation, "live_refresh");
+      const fingerprint = persistedHistoryFingerprint(page.messages);
+      if (fingerprint !== this.authoritativeTailFingerprint) {
+        this.authoritativeTailFingerprint = fingerprint;
+        this.loadedHistoryMessages = [...page.messages];
+        this.nextBefore = page.nextBefore;
+        this.accumulator = rebuildAuthoritativeTranscript(page.messages);
+        this.captureHistoryTimestamps(page.messages);
+        this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
       }
     } catch {
-      // consume() owns transport recovery; a later reconnect starts a fresh pass.
+      // The viewer/control transport remains responsible for connection UI. A
+      // missed history refresh must not create a transcript error row.
+    } finally {
+      this.historyRefreshInFlight = false;
+      if (this.closed) return;
+      if (
+        this.historyRefreshPending ||
+        this.deviceIsProcessing ||
+        this.snapshot.run === "running" ||
+        Date.now() < this.historyRefreshSettleUntil
+      ) {
+        this.scheduleAuthoritativeHistoryRefresh(AUTHORITATIVE_LIVE_REFRESH_MS);
+      }
     }
-  }
-
-  private isAuthoritativeCatchUpCurrent(
-    session: LettaCodeSession,
-    catchUpGeneration: number,
-    reconciliationGeneration: number,
-  ): boolean {
-    return (
-      isAuthoritativeCatchUpCurrent(
-        this.closed,
-        this.session,
-        session,
-        catchUpGeneration,
-        this.authoritativeCatchUpGeneration,
-      ) &&
-      isGenerationCurrent(reconciliationGeneration, this.reconciliationGeneration)
-    );
   }
 
   /**
@@ -1281,25 +1199,25 @@ export class ChatSession {
     this.reconciliationGeneration += 1;
     this.streamGeneration += 1;
     this.clearReconnectRetry();
-    this.cancelAuthoritativeCatchUp();
     if (this.sendActivityTimer) {
       clearTimeout(this.sendActivityTimer);
       this.sendActivityTimer = null;
     }
+    if (this.historyRefreshTimer) {
+      clearTimeout(this.historyRefreshTimer);
+      this.historyRefreshTimer = null;
+    }
+    this.historyRefreshPending = false;
     if (retainedChatSessions.get(this.retainedKey) === this) {
       retainedChatSessions.delete(this.retainedKey);
     }
     this.accumulator.reset();
+    this.authoritativeTailFingerprint = null;
+    this.historyRefreshSettleUntil = 0;
     this.localRows = [];
     this.echoOtids.clear();
     this.cancelledLocalOtids.clear();
     publishActivity(this.conversationId, null);
-    this.settleActivityWaiters(new Error("Session closed"));
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this.pendingStream = [];
     this.session?.close();
     this.listeners.clear();
   }
@@ -1341,6 +1259,13 @@ export class ChatSession {
   }
 
   private observePersistedHistory(messages: readonly unknown[], generation: number, source: string): void {
+    emitSyncTelemetry({
+      kind: "history_snapshot",
+      conversationId: this.conversationId,
+      generation,
+      count: messages.length,
+      reason: `${source}:${persistedHistoryFingerprint(messages)}`,
+    });
     const observation = inspectPersistedHistory(messages);
     if (observation.missingIdCount > 0) {
       emitSyncTelemetry({
@@ -1450,6 +1375,7 @@ export class ChatSession {
       const page = await this.fetchInitialHistory();
       if (!this.reconciliationIsCurrent(generation, "hydrate_initial_history")) return false;
       this.observePersistedHistory(page.messages, generation, "hydrate");
+      this.authoritativeTailFingerprint = persistedHistoryFingerprint(page.messages);
       this.loadedHistoryMessages = [...page.messages];
       this.nextBefore = page.nextBefore;
       this.accumulator = rebuildAuthoritativeTranscript(page.messages);
@@ -1510,6 +1436,7 @@ export class ChatSession {
    */
   async loadOlder(): Promise<void> {
     if (this.snapshot.hydrating || this.snapshot.loadingOlder) return;
+    if (this.historyRefreshInFlight || this.historyRefreshTimer) return;
     // Backward pagination is viewport-only. Never rebase historical pages through
     // a live turn; wait until the session is genuinely idle.
     if (this.deviceIsProcessing || this.snapshot.run !== "idle") return;
@@ -1612,14 +1539,13 @@ export class ChatSession {
       if (this.closed || this.session !== session || streamGeneration !== this.streamGeneration) return;
       this.sessionDead = true;
       const detail = e instanceof Error && e.message ? e.message : "Stream ended unexpectedly.";
-      this.settleActivityWaiters(e instanceof Error ? e : new Error(detail));
       const transportFailure = isTransportError(detail);
       // A viewer transport failure is not a run failure. Keep the run and the
       // live row intact until the replacement session asks the device what is
       // actually happening. Only a genuine non-transport stream error marks
       // the current text as interrupted.
       if (!transportFailure) this.interruptedKey = newestTextKey(this.accumulator.rows());
-      const swept = this.project(this.drainStreamBuffer(this.snapshot));
+      const swept = this.project(this.snapshot);
       this.commit(
         patch(transportFailure ? swept : this.appendError(swept, detail, true), {
           run: transportFailure ? preserveRunAcrossTransportLoss(this.snapshot.run) : "idle",
@@ -1636,68 +1562,43 @@ export class ChatSession {
   }
 
   /**
-   * Decouple wire cadence from render cadence: text deltas coalesce behind a
-   * short flush so a fast model doesn't force a full-list render per chunk,
-   * while everything discrete (tool cards, approvals, run phase, queue)
-   * commits immediately — interactivity must never wait on the buffer.
+   * Consume the SDK viewer as a control plane. Transcript-bearing deltas may be
+   * historical resume replay, so they only trigger a coalesced authoritative
+   * history refresh and never mutate the accumulator directly.
    */
   private ingest(message: SDKMessage): void {
+    const observation = this.protocolObserver.observe(message);
+    for (const event of observation.events) {
+      emitSyncTelemetry({ ...event, conversationId: this.conversationId });
+    }
+    if (streamDisposition(message) === "authoritative_history") {
+      // Resume streams can replay old runs without seq_id. Consuming them keeps
+      // the SDK queue healthy, but canonical transcript state comes only from
+      // App Server history. Idle replay is discarded without even refreshing;
+      // active work uses one serialized management-history refresh path.
+      if (
+        this.deviceIsProcessing ||
+        this.snapshot.run === "running" ||
+        this.snapshot.run === "awaiting_approval" ||
+        this.echoOtids.size > 0
+      ) {
+        this.scheduleAuthoritativeHistoryRefresh(0);
+      }
+      return;
+    }
     this.streamActivitySerial += 1;
     if (this.sendActivityTimer) {
       clearTimeout(this.sendActivityTimer);
       this.sendActivityTimer = null;
     }
-    this.settleActivityWaiters();
-    const observation = this.protocolObserver.observe(message);
-    for (const event of observation.events) {
-      emitSyncTelemetry({ ...event, conversationId: this.conversationId });
-    }
-    // The observer never replaces SDK replay/accumulation behavior.
-    if (message.type === "stream_event") {
-      this.pendingStream.push(message);
-      if (this.flushTimer) return;
-      // Leading edge: the first token after silence paints instantly.
-      this.flushStreamBuffer();
-      this.armFlushTimer();
-      return;
-    }
-    const next = this.reduce(this.drainStreamBuffer(this.snapshot), message);
+    // Control/status messages remain on the SDK stream.
+    const next = this.reduce(this.snapshot, message);
     this.commit(next);
-    // A terminal run result is the protocol-level signal to converge persisted
-    // history. Do not wait for a reconnect or a guessed persistence delay.
-    if (
-      message.type === "result" &&
-      !this.closed &&
-      this.session &&
-      next.run === "idle" &&
-      next.connection !== "reconnecting"
-    ) {
-      this.startAuthoritativeCatchUp(this.session, this.reconciliationGeneration);
+    if (message.type === "result" || message.type === "error") {
+      this.scheduleAuthoritativeHistoryRefresh(0);
     }
   }
 
-  private armFlushTimer(): void {
-    this.flushTimer = setTimeout(() => {
-      this.flushTimer = null;
-      if (this.pendingStream.length === 0) return;
-      this.flushStreamBuffer();
-      this.armFlushTimer();
-    }, STREAM_FLUSH_MS);
-  }
-
-  private flushStreamBuffer(): void {
-    if (this.pendingStream.length === 0) return;
-    this.commit(this.drainStreamBuffer(this.snapshot));
-  }
-
-  /** Reduce all held-back deltas onto `snapshot` without committing. */
-  private drainStreamBuffer(snapshot: ChatSnapshot): ChatSnapshot {
-    const events = this.pendingStream;
-    this.pendingStream = [];
-    let next = snapshot;
-    for (const event of events) next = this.reduce(next, event);
-    return next;
-  }
 
   /**
    * Build the transcript the UI renders: the accumulator's rows in order,
@@ -1863,10 +1764,6 @@ export class ChatSession {
   }
 
   /** Feed a message to the accumulator, then rebuild the transcript from it. */
-  private absorb(snapshot: ChatSnapshot, message: SDKMessage): ChatSnapshot {
-    this.accumulator.apply(message);
-    return this.project(snapshot);
-  }
 
   /** Add an app-only row (echo, error) anchored at the current live edge. */
   private appendLocal(snapshot: ChatSnapshot, item: TranscriptItem): ChatSnapshot {
@@ -1903,85 +1800,31 @@ export class ChatSession {
         // as "running" made a freshly-opened chat claim a turn was in flight.
         return snapshot;
 
-      // Identity, delta accumulation and replay suppression all live in the
-      // accumulator now — these cases only mark the run as active.
+      // Transcript-bearing SDK messages are rejected in ingest() before reduce().
+      // Keep this no-op as a structural backstop: only persisted history may
+      // mutate the transcript accumulator.
       case "stream_event":
-        return this.absorb(snapshot, message);
-
       case "assistant":
       case "reasoning":
-        return this.absorb(snapshot, message);
-
       case "tool_call":
-        this.toolStartedAt.set(message.toolCallId, Date.now());
-        return this.absorb(snapshot, message);
-
       case "tool_result":
-        return this.absorb(snapshot, message);
+        return snapshot;
 
       case "queue_update":
         return patch(snapshot, {
           queue: message.queue.map((item) => ({ id: item.id, text: contentToText(item.content) })),
         });
 
-      case "loop_status": {
-        // Server vocabulary is SCREAMING_SNAKE and grows over time. The
-        // WAITING_* family means the loop is parked — on the user, or on an
-        // approval — not working; treating any non-"idle" string as running is
-        // what used to make a freshly-opened chat show a phantom turn, since
-        // opening one reports WAITING_ON_INPUT.
-        const status = message.status.toUpperCase();
-        if (status === "WAITING_ON_APPROVAL") {
-          return this.project(patch(snapshot, { run: "awaiting_approval" }));
-        }
-        if (!status.startsWith("WAITING") && status !== "IDLE") {
-          return this.project(patch(snapshot, { run: snapshot.run === "idle" ? "running" : snapshot.run }));
-        }
-        // Device status is more authoritative than loop bookkeeping. A freshly
-        // reattached viewer can report WAITING_ON_INPUT while the executing
-        // device is still processing the pre-existing turn. Never let that
-        // transient viewer status erase a confirmed active run.
-        if (this.deviceIsProcessing) {
-          return this.project(patch(snapshot, { run: "running" }));
-        }
-        // Interruption is `result`'s call — a normal completion also lands here,
-        // and marking the last row "Stopped" from this path would libel it.
-        return this.project(patch(snapshot, { run: "idle" }));
-      }
+      case "loop_status":
+        // Viewer loop status is replayable bookkeeping, not transcript/run truth.
+        // Device status owns running/approval state.
+        return snapshot;
 
-      case "result": {
-        const detail = message.errorDetail ?? message.error ?? "The run failed.";
-        if (!message.success && isTransportError(detail)) {
-          return patch(this.project(snapshot), {
-            run: preserveRunAcrossTransportLoss(snapshot.run),
-            connection: "reconnecting",
-          });
-        }
-        this.deviceIsProcessing = false;
-        // An aborted turn completes as a result with stopReason "interrupted"
-        // and no settled assistant message, so the row it left behind is the
-        // only place "Stopped" can be shown.
-        const interrupted = !message.success || message.stopReason === "interrupted";
-        this.interruptedKey = interrupted ? newestTextKey(this.accumulator.rows()) : null;
-        const idle = this.project(patch(snapshot, { run: "idle" }));
-        return message.success ? idle : this.appendError(idle, detail);
-      }
-
-      case "error": {
-        const detail =
-          message.message ||
-          ((message as { code?: string }).code
-            ? `The server rejected the request (${(message as { code?: string }).code}).`
-            : "Something went wrong on the server.");
-        if (isTransportError(detail)) {
-          return patch(this.project(snapshot), {
-            run: preserveRunAcrossTransportLoss(snapshot.run),
-            connection: "reconnecting",
-          });
-        }
-        this.interruptedKey = newestTextKey(this.accumulator.rows());
-        return this.appendError(this.project(snapshot), detail);
-      }
+      case "result":
+      case "error":
+        // Result/error frames belong to the replayable viewer channel. Device
+        // status owns run state; persisted history owns visible error/content.
+        return snapshot;
 
       case "retry":
       default:

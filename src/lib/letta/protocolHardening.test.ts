@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { inspectPersistedHistory, ProtocolObserver, isGenerationCurrent } from "./protocolHardening";
+import { inspectPersistedHistory, persistedHistoryFingerprint, ProtocolObserver, isGenerationCurrent } from "./protocolHardening";
 
 describe("protocol hardening", () => {
   test("drops duplicate/out-of-order seq replay and reports gaps", () => {
@@ -51,4 +51,18 @@ describe("protocol hardening", () => {
     expect(isGenerationCurrent(4, 4)).toBe(true);
     expect(isGenerationCurrent(4, 5)).toBe(false);
   });
+  test("fingerprints persisted identity/order without reading content", () => {
+    const a = persistedHistoryFingerprint([
+      { id: "m1", content: "first secret" },
+      { id: "m2", content: "second secret" },
+    ]);
+    const sameIdsDifferentContent = persistedHistoryFingerprint([
+      { id: "m1", content: "changed" },
+      { id: "m2", content: "also changed" },
+    ]);
+    const reversed = persistedHistoryFingerprint([{ id: "m2" }, { id: "m1" }]);
+    expect(a).toBe(sameIdsDifferentContent);
+    expect(reversed).not.toBe(a);
+  });
+
 });

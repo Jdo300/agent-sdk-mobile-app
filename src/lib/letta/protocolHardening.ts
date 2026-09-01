@@ -6,7 +6,8 @@ export type SyncTelemetryKind =
   | "protocol_identity_missing"
   | "sync_stale_discard"
   | "sync_converged"
-  | "sync_retry";
+  | "sync_retry"
+  | "history_snapshot";
 
 export interface SyncTelemetryEvent {
   kind: SyncTelemetryKind;
@@ -31,9 +32,9 @@ export interface ProtocolObservation {
 }
 
 /**
- * Observes SDK ordering metadata without replacing the SDK accumulator. Replay
- * and gap observations are telemetry only: the SDK remains the sole owner of
- * replay suppression and transcript accumulation.
+ * Observes SDK ordering metadata without mutating transcript state. Replay and
+ * gap observations are telemetry only; persisted App Server history owns the
+ * visible transcript.
  */
 export class ProtocolObserver {
   private readonly highestSeqByRun = new Map<string, number>();
@@ -100,6 +101,26 @@ function protocolMeta(message: SDKMessage): {
   }
 }
 
+
+
+/** Stable non-content fingerprint of persisted message identity/order. */
+export function persistedHistoryFingerprint(messages: readonly unknown[]): string {
+  let hash = 2166136261;
+  let count = 0;
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const id = (message as { id?: unknown }).id;
+    if (typeof id !== "string" || id.length === 0) continue;
+    count += 1;
+    for (let i = 0; i < id.length; i += 1) {
+      hash ^= id.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    hash ^= 0xff;
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${count}:${(hash >>> 0).toString(36)}`;
+}
 
 export interface PersistedHistoryObservation {
   visibleCount: number;
