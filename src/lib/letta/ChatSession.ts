@@ -72,7 +72,7 @@ const ABORT_ACK_TIMEOUT_MS = 2000;
 const ABORT_CONFIRM_TIMEOUT_MS = 5000;
 const ABORT_CONFIRM_INTERVAL_MS = 250;
 const AUTHORITATIVE_PAGE_SIZE = 50;
-const INITIAL_HISTORY_MAX_PAGES = 2;
+const INITIAL_HISTORY_MAX_PAGES = 20;
 const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
 const AUTHORITATIVE_CATCHUP_MAX_MS = 30000;
@@ -508,12 +508,13 @@ export class ChatSession {
         { otid },
       );
       this.armSendActivityWatch(activityBeforeSend);
-      // The durable outbox owns the message only until the App Server accepts the
-      // SDK handoff. After send() resolves, replaying or later labelling it unsent
-      // would risk duplicates and false failures. The live optimistic row may stay
-      // visible until its persisted user echo arrives, but process-restart truth is
-      // now server history, not a lingering awaiting_echo journal record.
-      await removeDurableOutbox(this.conn.profile.id, this.conversationId, otid).catch(() => {});
+      // Handoff succeeded, but persistence can lag the transport acknowledgement.
+      // Keep a narrow delivery-journal record until a persisted USER row with the
+      // same OTID is observed. This closes the crash/restart gap where deleting the
+      // journal immediately could make an accepted message temporarily disappear.
+      // `awaiting_echo` is delivery state only; it never participates in transcript
+      // ordering or history synchronization.
+      await updateDurableOutboxState(this.conn.profile.id, this.conversationId, otid, "awaiting_echo").catch(() => {});
     } catch (e) {
       const detail = e instanceof Error ? e.message : "Send failed.";
       const transportFailure = isTransportError(detail);
@@ -1552,7 +1553,9 @@ export class ChatSession {
   /**
    * Initial paint with a complete latest turn and a valid older-history cursor.
    * If the newest page is entirely inside one very tool-heavy turn, page back
-   * until its user-message boundary is included. Unlike the lightweight
+   * until its user-message boundary is included. The safety cap is deliberately
+   * generous (20 pages / 1000 wire events) so tool-heavy agent turns do not lose
+   * their user/OTID boundary on restart. Unlike the lightweight
    * reconciliation tail, keep all fetched rows so scrolling can continue from
    * the oldest page's cursor without a gap.
    */

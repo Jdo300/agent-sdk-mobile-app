@@ -5,7 +5,7 @@ export type DeliveryRecoveryAction = "replay" | "delivery_unknown" | "manual_ret
 
 /**
  * A queued row is known not to have begun server handoff and can be replayed.
- * A sending/legacy awaiting_echo row crossed the handoff boundary and is
+ * A sending/awaiting_echo row crossed the handoff boundary and is
  * ambiguous without server idempotency. A failed row waits for explicit retry.
  */
 export function deliveryRecoveryAction(state: DeliveryJournalState): DeliveryRecoveryAction {
