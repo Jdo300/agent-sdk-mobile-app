@@ -19,6 +19,7 @@ import {
   StyleSheet,
   TextInput,
   View,
+  useWindowDimensions,
 } from "react-native";
 
 const SheetTextInput = Platform.OS === "web" ? TextInput : NativeBottomSheetTextInput;
@@ -32,7 +33,7 @@ import {
   useAudioRecorderState,
   type AudioPlayer,
 } from "expo-audio";
-import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
+import Animated, { FadeIn, FadeOut, FadeInDown, FadeOutDown } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import Svg, { Path } from "react-native-svg";
@@ -58,18 +59,23 @@ import { Header, Screen } from "../components/ui/Screen";
 import { Sheet } from "../components/ui/Sheet";
 import { SkeletonList } from "../components/ui/Skeleton";
 import { StatusDot } from "../components/ui/StatusDot";
-import { Text } from "../components/ui/Text";
+import { Text, TextScaleProvider } from "../components/ui/Text";
 import { Touchable } from "../components/ui/Touchable";
 import { haptic } from "../lib/haptics";
 import { ChatSession } from "../lib/letta/ChatSession";
 import { isSecretSlashCommand } from "../lib/letta/secretCommands";
 import {
   getConversationModel,
+  deleteConversation,
+  createConversation,
+  listConversations,
   isAuthError,
   listModels,
   renameConversation,
+  setConversationArchived,
   updateConversationModel,
   type ConversationDiagnostics,
+  type ConversationSummary,
   type ModelOption,
   type ReasoningEffort,
 } from "../lib/letta/api";
@@ -89,6 +95,7 @@ import {
   nextVoiceMode,
   setVoiceMode as persistVoiceMode,
   speechSource,
+  officeBrowserSpeechSource,
   transcribeVoice,
   KOKORO_PLAYBACK_RATE,
   prepareSpeechText,
@@ -105,6 +112,31 @@ import { motion, radius, space } from "../theme/tokens";
 const RUNTIME_PERMISSION_KEY_PREFIX = "milo.runtime.permission.v1:";
 const RUNTIME_EFFORT_KEY_PREFIX = "milo.runtime.reasoning.v1:";
 const VOICE_AUTO_SEND_KEY = "milo.voice.autoSend.v1";
+const DESKTOP_SIDEBAR_KEY = "bloop.desktop.sidebar.open.v1";
+const DESKTOP_TEXT_SCALE_KEY = "bloop.desktop.textScale.v1";
+const DESKTOP_TEXT_SCALE_MIN = 0.8;
+const DESKTOP_TEXT_SCALE_MAX = 1.5;
+const DESKTOP_TEXT_SCALE_STEP = 0.1;
+
+function storedDesktopBoolean(key: string, fallback: boolean): boolean {
+  if (Platform.OS !== "web") return fallback;
+  try {
+    const value = globalThis.localStorage?.getItem(key);
+    return value == null ? fallback : value === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function storedDesktopScale(): number {
+  if (Platform.OS !== "web") return 1;
+  try {
+    const value = Number(globalThis.localStorage?.getItem(DESKTOP_TEXT_SCALE_KEY));
+    return Number.isFinite(value) && value >= DESKTOP_TEXT_SCALE_MIN && value <= DESKTOP_TEXT_SCALE_MAX ? value : 1;
+  } catch {
+    return 1;
+  }
+}
 const REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const VOICE_RECORDING_LIMIT_SECONDS = 10 * 60;
 
@@ -132,6 +164,15 @@ function savedReasoningEffort(value: string | null): ReasoningEffort | null {
 function formatTokens(value: number | null | undefined): string {
   if (value == null) return "—";
   return new Intl.NumberFormat("en-US").format(Math.round(value));
+}
+
+function PhotoIcon({ color, size = 21 }: { color: string; size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d="M4.5 6.5h15a1.5 1.5 0 0 1 1.5 1.5v10a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18V8a1.5 1.5 0 0 1 1.5-1.5Z" stroke={color} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+      <Path d="m6 17 3.8-4 2.8 2.8 1.7-1.8 3.7 3.9M16.7 10.4h.01" stroke={color} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
 }
 
 function MicrophoneIcon({ color, size = 21 }: { color: string; size?: number }) {
@@ -261,16 +302,238 @@ function statusFor(
   return { label: "Connected", tone: "run" };
 }
 
+
+function DesktopConversationSidebar({
+  visible,
+  onClose,
+  agentId,
+  agentName,
+  currentConversationId,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  agentId: string;
+  agentName: string;
+  currentConversationId: string;
+}) {
+  const { colors } = useTheme();
+  const { activeProfile } = useProfiles();
+  const [rows, setRows] = useState<ConversationSummary[] | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ conversation: ConversationSummary; x: number; y: number } | null>(null);
+
+  const renameFromMenu = useCallback(async (conversation: ConversationSummary) => {
+    if (!activeProfile || Platform.OS !== "web") return;
+    const next = globalThis.prompt?.("Rename conversation", conversation.title)?.trim();
+    if (!next || next === conversation.title) return;
+    try {
+      const secret = (await getSecret(activeProfile.id)) ?? "";
+      await renameConversation({ profile: activeProfile, secret }, conversation.id, next);
+      setRows((current) => (current ?? []).map((row) => row.id === conversation.id ? { ...row, title: next } : row));
+    } catch (e) {
+      globalThis.alert?.(e instanceof Error ? e.message : "Couldn't rename conversation.");
+    }
+  }, [activeProfile]);
+
+  const setArchivedFromMenu = useCallback(async (conversation: ConversationSummary, archived: boolean) => {
+    if (!activeProfile || Platform.OS !== "web") return;
+    try {
+      const secret = (await getSecret(activeProfile.id)) ?? "";
+      await setConversationArchived({ profile: activeProfile, secret }, conversation.id, archived);
+      setRows((current) => (current ?? []).filter((row) => row.id !== conversation.id));
+      if (archived && conversation.id === currentConversationId) {
+        const id = await createConversation({ profile: activeProfile, secret }, agentId);
+        router.replace({ pathname: "/chat", params: { conversationId: id, agentId, agentName, title: "New conversation" } });
+      }
+    } catch (e) {
+      globalThis.alert?.(e instanceof Error ? e.message : archived ? "Couldn't archive conversation." : "Couldn't unarchive conversation.");
+    }
+  }, [activeProfile, currentConversationId, agentId, agentName]);
+
+  const deleteFromMenu = useCallback(async (conversation: ConversationSummary) => {
+    if (!activeProfile || Platform.OS !== "web") return;
+    if (!globalThis.confirm?.(`Delete “${conversation.title}”?`)) return;
+    try {
+      const secret = (await getSecret(activeProfile.id)) ?? "";
+      await deleteConversation({ profile: activeProfile, secret }, conversation.id);
+      setRows((current) => (current ?? []).filter((row) => row.id !== conversation.id));
+    } catch (e) {
+      globalThis.alert?.(e instanceof Error ? e.message : "Couldn't delete conversation.");
+    }
+  }, [activeProfile]);
+
+  const createNewConversation = useCallback(async () => {
+    if (!activeProfile) return;
+    try {
+      const secret = (await getSecret(activeProfile.id)) ?? "";
+      const id = await createConversation({ profile: activeProfile, secret }, agentId);
+      setContextMenu(null);
+      router.replace({ pathname: "/chat", params: { conversationId: id, agentId, agentName, title: "New conversation" } });
+    } catch (e) {
+      if (Platform.OS === "web") globalThis.alert?.(e instanceof Error ? e.message : "Couldn't start a conversation.");
+    }
+  }, [activeProfile, agentId, agentName]);
+
+  useEffect(() => {
+    if (!contextMenu || Platform.OS !== "web") return;
+    const close = (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.('[data-conversation-context="true"]')) return;
+      setContextMenu(null);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setContextMenu(null);
+    };
+    document.addEventListener("click", close);
+    document.addEventListener("contextmenu", close);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (!visible || !activeProfile || !agentId) return;
+    let cancelled = false;
+    setError(null);
+    void (async () => {
+      try {
+        const secret = (await getSecret(activeProfile.id)) ?? "";
+        const next = await listConversations({ profile: activeProfile, secret }, agentId, { limit: 50, archiveStatus: showArchived ? "archived" : "unarchived" });
+        if (!cancelled) setRows(next);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : "Couldn't load conversations.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [visible, activeProfile, agentId, currentConversationId, showArchived]);
+
+  if (!visible) return null;
+  return (
+    <View style={[styles.desktopSidebar, { backgroundColor: colors.bg, borderColor: colors.surfaceEdge }]}>
+      <View style={[styles.desktopSidebarHeader, { borderColor: colors.surfaceEdge }]}>
+        <View style={styles.desktopSidebarTitle}>
+          <Text role="bodyEm">{showArchived ? "Archived" : "Conversations"}</Text>
+          <Touchable accessibilityRole="button" accessibilityLabel={showArchived ? "Show active conversations" : "Show archived conversations"} onPress={() => { setContextMenu(null); setRows(null); setShowArchived((value) => !value); }} scaleOnPress={false}>
+            <Text role="sub" tone="accent">{showArchived ? "Back to conversations" : "View archived"}</Text>
+          </Touchable>
+          <Text role="sub" ink={3}>{agentName}</Text>
+        </View>
+        <View style={styles.desktopSidebarActions}>
+          <Touchable accessibilityRole="button" accessibilityLabel="New conversation" onPress={() => void createNewConversation()} style={styles.desktopSidebarClose}>
+            <Text role="title" tone="accent">＋</Text>
+          </Touchable>
+          <Touchable accessibilityRole="button" accessibilityLabel="Hide conversations" onPress={onClose} style={styles.desktopSidebarClose}>
+            <Text role="title" ink={2}>×</Text>
+          </Touchable>
+        </View>
+      </View>
+      {error ? <Text role="sub" tone="danger" style={styles.desktopSidebarMessage}>{error}</Text> : null}
+      {rows === null && !error ? (
+        <View style={styles.desktopSidebarLoading}><ActivityIndicator size="small" color={colors.ink3} /></View>
+      ) : (
+        <FlatList
+          data={rows ?? []}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={styles.desktopSidebarList}
+          renderItem={({ item }) => {
+            const selected = item.id === currentConversationId;
+            return (
+              <Touchable
+                accessibilityRole="button"
+                accessibilityLabel={`Open ${item.title}`}
+                onPress={() => {
+                  setContextMenu(null);
+                  if (!selected) router.replace({ pathname: "/chat", params: { conversationId: item.id, agentId, agentName, title: item.title } });
+                }}
+                {...({
+                  onContextMenu: (event: any) => {
+                    event.preventDefault?.();
+                    event.stopPropagation?.();
+                    event.nativeEvent?.stopPropagation?.();
+                    const native = event.nativeEvent ?? event;
+                    setContextMenu({ conversation: item, x: native.clientX ?? native.pageX ?? 16, y: native.clientY ?? native.pageY ?? 16 });
+                  },
+                } as any)}
+                scaleOnPress={false}
+                style={[styles.desktopSidebarRow, selected && { backgroundColor: colors.surface }]}
+              >
+                <Text role={selected ? "bodyEm" : "body"} numberOfLines={2}>{item.title}</Text>
+              </Touchable>
+            );
+          }}
+        />
+      )}
+      {contextMenu ? (
+        <>
+          <View
+            {...({ dataSet: { conversationContext: "true" } } as any)}
+            onLayout={(event) => {
+              if (Platform.OS !== "web") return;
+              const { width, height } = event.nativeEvent.layout;
+              const gutter = 8;
+              const viewportWidth = globalThis.innerWidth ?? width + gutter * 2;
+              const viewportHeight = globalThis.innerHeight ?? height + gutter * 2;
+              const nextX = Math.max(gutter, Math.min(contextMenu.x, viewportWidth - width - gutter));
+              const nextY = Math.max(gutter, Math.min(contextMenu.y, viewportHeight - height - gutter));
+              if (Math.abs(nextX - contextMenu.x) > 0.5 || Math.abs(nextY - contextMenu.y) > 0.5) {
+                setContextMenu((current) => current ? { ...current, x: nextX, y: nextY } : current);
+              }
+            }}
+            style={[styles.desktopContextMenu, { left: contextMenu.x, top: contextMenu.y, backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
+          >
+            <Touchable accessibilityRole="button" accessibilityLabel="Rename conversation" onPress={() => { const conversation = contextMenu.conversation; setContextMenu(null); void renameFromMenu(conversation); }} scaleOnPress={false} style={styles.desktopContextItem}>
+              <Text role="body">Rename</Text>
+            </Touchable>
+            <Touchable accessibilityRole="button" accessibilityLabel={showArchived ? "Unarchive conversation" : "Archive conversation"} onPress={() => { const conversation = contextMenu.conversation; setContextMenu(null); void setArchivedFromMenu(conversation, !showArchived); }} scaleOnPress={false} style={styles.desktopContextItem}>
+              <Text role="body">{showArchived ? "Unarchive" : "Archive"}</Text>
+            </Touchable>
+            <Touchable accessibilityRole="button" accessibilityLabel="Delete conversation" onPress={() => { const conversation = contextMenu.conversation; setContextMenu(null); void deleteFromMenu(conversation); }} scaleOnPress={false} style={styles.desktopContextItem}>
+              <Text role="body" tone="danger">Delete</Text>
+            </Touchable>
+          </View>
+        </>
+      ) : null}
+    </View>
+  );
+}
+
 export default function ChatScreen() {
   const params = useLocalSearchParams<{ conversationId: string; agentId: string; agentName?: string; title?: string; autosend?: string }>();
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
+  const { width: windowWidth } = useWindowDimensions();
+  const isDesktopWeb = Platform.OS === "web" && windowWidth >= 1000;
+  const [desktopDrawerOpen, setDesktopDrawerOpen] = useState(() => storedDesktopBoolean(DESKTOP_SIDEBAR_KEY, false));
+  const [desktopTextScale, setDesktopTextScale] = useState(() => storedDesktopScale());
+  const [desktopComposerHeight, setDesktopComposerHeight] = useState(128);
   const { activeProfile } = useProfiles();
+
+  useEffect(() => {
+    if (!isDesktopWeb) return;
+    try { globalThis.localStorage?.setItem(DESKTOP_SIDEBAR_KEY, String(desktopDrawerOpen)); } catch { /* storage unavailable */ }
+  }, [isDesktopWeb, desktopDrawerOpen]);
+
+  useEffect(() => {
+    if (!isDesktopWeb) return;
+    try { globalThis.localStorage?.setItem(DESKTOP_TEXT_SCALE_KEY, desktopTextScale.toFixed(2)); } catch { /* storage unavailable */ }
+  }, [isDesktopWeb, desktopTextScale]);
+
+  const adjustDesktopTextScale = useCallback((delta: number) => {
+    setDesktopTextScale((current) => {
+      const next = Math.round((current + delta) * 10) / 10;
+      return Math.max(DESKTOP_TEXT_SCALE_MIN, Math.min(DESKTOP_TEXT_SCALE_MAX, next));
+    });
+  }, []);
 
   const sessionRef = useRef<ChatSession | null>(null);
   const listRef = useRef<FlatList<TranscriptRowItem>>(null);
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ ...emptyChat, hydrating: true });
   const [draft, setDraft] = useState("");
+  const [desktopInputContentHeight, setDesktopInputContentHeight] = useState(21);
   // The nav param is only the title as it was when this screen was opened; a
   // rename (here or elsewhere) makes the server's value the truth.
   const [serverTitle, setServerTitle] = useState<string | null>(null);
@@ -292,11 +555,17 @@ export default function ChatScreen() {
   const [voiceReply, setVoiceReply] = useState<{ id: string; text: string } | null>(null);
   const [voicePlaying, setVoicePlaying] = useState(false);
   const [voiceProgress, setVoiceProgress] = useState({ current: 0, duration: 0 });
+  const [browserVoiceLevel, setBrowserVoiceLevel] = useState(0);
+  const browserMeterRef = useRef<{ stream?: MediaStream; context?: AudioContext; frame?: number } | null>(null);
   const finishingVoiceRef = useRef(false);
   const voiceTraceIdRef = useRef<string | null>(null);
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
   const voicePlayRequestRef = useRef(0);
+  const voiceAutoQueueRef = useRef<string[]>([]);
+  const voiceInputActiveRef = useRef(false);
+  const voicePausedForInputRef = useRef(false);
+  const playVoiceTextRef = useRef<((text: string) => Promise<void>) | null>(null);
   const voiceHandledAssistantIdsRef = useRef(new Set<string>());
   const voiceHistorySeededRef = useRef(false);
   const voiceTimestampWatermarkRef = useRef(0);
@@ -337,6 +606,7 @@ export default function ChatScreen() {
     return () => {
       if (voiceDismissTimerRef.current) clearTimeout(voiceDismissTimerRef.current);
       voicePlayRequestRef.current += 1;
+      voiceAutoQueueRef.current = [];
       voicePlayerSubRef.current?.remove();
       try { voicePlayerRef.current?.pause(); } catch { /* already released */ }
       try { voicePlayerRef.current?.remove(); } catch { /* already released */ }
@@ -398,6 +668,48 @@ export default function ChatScreen() {
     haptic.tap();
   }, [voiceAutoSend]);
 
+  const stopBrowserVoiceMeter = useCallback(() => {
+    const meter = browserMeterRef.current;
+    browserMeterRef.current = null;
+    if (meter?.frame != null) cancelAnimationFrame(meter.frame);
+    meter?.stream?.getTracks().forEach((track) => track.stop());
+    if (meter?.context) void meter.context.close().catch(() => undefined);
+    setBrowserVoiceLevel(0);
+  }, []);
+
+  const startBrowserVoiceMeter = useCallback(async () => {
+    if (Platform.OS !== "web" || !globalThis.navigator?.mediaDevices?.getUserMedia) return;
+    stopBrowserVoiceMeter();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const AudioContextCtor = globalThis.AudioContext ?? (globalThis as any).webkitAudioContext;
+      if (!AudioContextCtor) { stream.getTracks().forEach((track) => track.stop()); return; }
+      const context = new AudioContextCtor();
+      const source = context.createMediaStreamSource(stream);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.72;
+      source.connect(analyser);
+      const samples = new Uint8Array(analyser.fftSize);
+      const meter: { stream?: MediaStream; context?: AudioContext; frame?: number } = { stream, context };
+      browserMeterRef.current = meter;
+      const tick = () => {
+        if (browserMeterRef.current !== meter) return;
+        analyser.getByteTimeDomainData(samples);
+        let sum = 0;
+        for (const sample of samples) { const normalized = (sample - 128) / 128; sum += normalized * normalized; }
+        const rms = Math.sqrt(sum / samples.length);
+        setBrowserVoiceLevel(Math.min(1, rms * 8));
+        meter.frame = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch {
+      // Recording still works through expo-audio; the meter is best-effort browser UI.
+    }
+  }, [stopBrowserVoiceMeter]);
+
+  useEffect(() => () => stopBrowserVoiceMeter(), [stopBrowserVoiceMeter]);
+
   const startVoiceRecording = useCallback(async () => {
     if (!activeProfile || voiceRecording || transcribingVoice) return;
     const traceId = newVoiceTraceId();
@@ -410,6 +722,16 @@ export default function ChatScreen() {
       setVoiceError("Microphone permission is required for voice messages.");
       return;
     }
+    // Voice input owns the audio session while the recorder/transcription box is
+    // active. Pause any Milo speech immediately so the microphone cannot record
+    // the app's own TTS, and hold subsequent assistant clips in the auto queue.
+    voiceInputActiveRef.current = true;
+    const activeVoicePlayer = voicePlayerRef.current;
+    if (activeVoicePlayer?.playing) {
+      activeVoicePlayer.pause();
+      voicePausedForInputRef.current = true;
+      setVoicePlaying(false);
+    }
     await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
     voiceTrace(traceId, "recorder_prepare_begin");
     await recorder.prepareToRecordAsync();
@@ -417,18 +739,21 @@ export default function ChatScreen() {
     recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
     voiceTrace(traceId, "recorder_record_called");
     setVoiceRecording(true);
+    if (Platform.OS === "web") void startBrowserVoiceMeter();
     haptic.tap();
-  }, [activeProfile, voiceRecording, transcribingVoice, recorder]);
+  }, [activeProfile, voiceRecording, transcribingVoice, recorder, startBrowserVoiceMeter]);
 
   const cancelVoiceRecording = useCallback(async () => {
     try {
       if (recorderState.isRecording) await recorder.stop();
     } finally {
+      stopBrowserVoiceMeter();
+      voiceInputActiveRef.current = false;
       setVoiceRecording(false);
       setVoiceError(null);
       await setAudioModeAsync({ allowsRecording: false });
     }
-  }, [recorder, recorderState.isRecording]);
+  }, [recorder, recorderState.isRecording, stopBrowserVoiceMeter]);
 
   const finishVoiceRecording = useCallback(async () => {
     if (!activeProfile || finishingVoiceRef.current) return;
@@ -440,6 +765,8 @@ export default function ChatScreen() {
     const durationSeconds = Math.max(0, recorderState.durationMillis / 1000);
     // Flip the UI immediately, before native audio finalization. Long recordings
     // can take noticeable time to close/write, and previously looked frozen here.
+    stopBrowserVoiceMeter();
+    voiceInputActiveRef.current = true;
     setVoiceRecording(false);
     setTranscribingVoice(true);
     setTranscriptionProgress({
@@ -474,7 +801,7 @@ export default function ChatScreen() {
       voiceTrace(traceId, "recording_uri", { available: Boolean(uri) });
       if (!uri) throw new Error("The recording could not be saved.");
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
-      if (!token) throw new Error("The Local Milo capability token is unavailable.");
+      if (!token && !isDesktopWeb) throw new Error("The Local Milo capability token is unavailable.");
       // Do not read the recorder's growing .m4a from a second FileHandle while
       // AVAudioRecorder owns it. That optimization proved unsafe on physical iOS
       // devices: a background read could overlap stop()/container finalization and
@@ -504,6 +831,11 @@ export default function ChatScreen() {
         }
         requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: false }));
       } else {
+        // Programmatic transcription replacement can otherwise briefly retain
+        // the previous textarea measurement. Reset to one line first; the
+        // browser's onContentSizeChange immediately expands it again if the
+        // inserted transcript actually wraps.
+        if (isDesktopWeb) setDesktopInputContentHeight(21 * desktopTextScale);
         setDraft(text);
       }
     } catch (error) {
@@ -512,13 +844,14 @@ export default function ChatScreen() {
     } finally {
       if (preparingTicker) clearInterval(preparingTicker);
       finishingVoiceRef.current = false;
+      voiceInputActiveRef.current = false;
       setTranscribingVoice(false);
       setTranscriptionProgress(null);
       await setAudioModeAsync({ allowsRecording: false });
       voiceTrace(traceId, "voice_flow_finally");
       voiceTraceIdRef.current = null;
     }
-  }, [activeProfile, recorder, recorderState.isRecording, recorderState.durationMillis, voiceAutoSend]);
+  }, [activeProfile, recorder, recorderState.isRecording, recorderState.durationMillis, voiceAutoSend, isDesktopWeb, desktopTextScale, stopBrowserVoiceMeter]);
 
   // `forDuration` enforces the ten-minute ceiling in native audio code. Once
   // that automatic stop is reflected back into recorder state, finalize it just
@@ -553,8 +886,10 @@ export default function ChatScreen() {
       await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (requestId !== voicePlayRequestRef.current) return;
-      if (!token) throw new Error("The Local Milo capability token is unavailable.");
-      const player = createAudioPlayer(speechSource(text, token, activeProfile.url), { updateInterval: 150 });
+      const officeBrowser = Platform.OS === "web" && activeProfile.id === "profile-local-milo-office";
+      if (!token && !officeBrowser) throw new Error("The Local Milo capability token is unavailable.");
+      const source = officeBrowser ? officeBrowserSpeechSource(text) : speechSource(text, token, activeProfile.url);
+      const player = createAudioPlayer(source, { updateInterval: 150 });
       if (requestId !== voicePlayRequestRef.current) {
         player.remove();
         return;
@@ -567,7 +902,24 @@ export default function ChatScreen() {
         }
         if (status.didJustFinish) {
           setVoicePlaying(false);
-          scheduleVoiceReplyCollapse(0);
+          voicePlayerSubRef.current?.remove();
+          voicePlayerSubRef.current = null;
+          try { voicePlayerRef.current?.remove(); } catch { /* already released */ }
+          voicePlayerRef.current = null;
+          setVoiceProgress({ current: 0, duration: 0 });
+          const next = voiceAutoQueueRef.current[0];
+          if (next) {
+            // Assistant prose can finish in several blocks while Milo continues
+            // thinking or running tools. Never replace a clip that is already
+            // being spoken; and while voice input owns the mic, leave the next
+            // clip queued until recording/transcription has fully closed.
+            if (!voiceInputActiveRef.current) {
+              voiceAutoQueueRef.current.shift();
+              setTimeout(() => { void playVoiceTextRef.current?.(next); }, 60);
+            }
+          } else {
+            scheduleVoiceReplyCollapse(0);
+          }
         }
       });
       player.play();
@@ -578,6 +930,43 @@ export default function ChatScreen() {
       setVoiceError(error instanceof Error ? error.message : "Voice playback failed.");
     }
   }, [activeProfile, retireVoicePlayer, clearVoiceDismissTimer, scheduleVoiceReplyCollapse]);
+  playVoiceTextRef.current = playVoiceText;
+
+  const enqueueAutoVoiceText = useCallback((text: string) => {
+    if (!text.trim()) return;
+    // The transcript projection already tells us when an assistant block has
+    // stopped being the live/streaming edge (cursor disappears because a tool,
+    // reasoning block, or another row took over).  Queue those completed blocks
+    // in order instead of interrupting whatever TTS is currently playing.
+    if (voiceInputActiveRef.current || voicePlayerRef.current || voicePlaying || voiceAutoQueueRef.current.length > 0) {
+      voiceAutoQueueRef.current.push(text);
+      return;
+    }
+    void playVoiceText(text);
+  }, [playVoiceText, voicePlaying]);
+
+  useEffect(() => {
+    const inputActive = voiceRecording || transcribingVoice;
+    voiceInputActiveRef.current = inputActive;
+    if (inputActive) return;
+
+    // The voice-input sheet has fully closed. Resume a clip that was paused
+    // specifically for recording; otherwise drain the assistant TTS queue.
+    if (voicePausedForInputRef.current && voicePlayerRef.current) {
+      voicePausedForInputRef.current = false;
+      void setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).then(() => {
+        if (voiceInputActiveRef.current || !voicePlayerRef.current) return;
+        voicePlayerRef.current.play();
+        setVoicePlaying(true);
+      });
+      return;
+    }
+    voicePausedForInputRef.current = false;
+    if (!voicePlayerRef.current) {
+      const next = voiceAutoQueueRef.current.shift();
+      if (next) void playVoiceTextRef.current?.(next);
+    }
+  }, [voiceRecording, transcribingVoice]);
 
   const toggleVoicePlayback = useCallback(() => {
     clearVoiceDismissTimer();
@@ -700,6 +1089,8 @@ const attachImage = useCallback(async () => {
   // this, the browser/iOS can report an intermediate non-zero offset and make
   // a programmatic pin look like reader intent.
   const programmaticScrollUntilRef = useRef(0);
+  const lastScrollOffsetRef = useRef(0);
+  const wheelIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollToLatest = useCallback((animated: boolean) => {
     programmaticScrollUntilRef.current = Date.now() + 180;
     listRef.current?.scrollToOffset({ offset: 0, animated });
@@ -1217,6 +1608,7 @@ const attachImage = useCallback(async () => {
           voiceHandledAssistantIdsRef.current.add(item.id);
         }
       }
+
       return;
     }
     voiceHandledAssistantIdsRef.current.add(reply.id);
@@ -1227,7 +1619,10 @@ const attachImage = useCallback(async () => {
     if (voiceMode === "off") return;
     const speakableText = prepareSpeechText(reply.text);
     clearVoiceDismissTimer();
-    retireVoicePlayer();
+    // Auto voice is serialized: a newly completed assistant block must never
+    // cut off a block that is already speaking. Tap/replay mode can still
+    // replace the current clip because that is an explicit user action.
+    if (voiceMode !== "auto") retireVoicePlayer();
     if (!speakableText) {
       setVoiceReply(null);
       return;
@@ -1235,7 +1630,7 @@ const attachImage = useCallback(async () => {
 
     setVoiceReply({ id: reply.id, text: speakableText });
     if (voiceMode === "auto") {
-      void playVoiceText(speakableText);
+      enqueueAutoVoiceText(speakableText);
     } else {
       scheduleVoiceReplyCollapse(15000);
     }
@@ -1245,6 +1640,7 @@ const attachImage = useCallback(async () => {
     voiceMode,
     voiceModeLoaded,
     playVoiceText,
+    enqueueAutoVoiceText,
     retireVoicePlayer,
     clearVoiceDismissTimer,
     scheduleVoiceReplyCollapse,
@@ -1330,6 +1726,12 @@ const attachImage = useCallback(async () => {
   }, [draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const canSend = draft.trim().length > 0 || attachments.length > 0;
+  const desktopComposerExpanded = isDesktopWeb && draft.trim().length > 0 && desktopInputContentHeight > (38 * desktopTextScale);
+
+  useEffect(() => {
+    if (!isDesktopWeb || draft.length > 0) return;
+    setDesktopInputContentHeight(21 * desktopTextScale);
+  }, [isDesktopWeb, draft, desktopTextScale]);
   const onComposerKeyPress = useCallback((event: any) => {
     if (Platform.OS !== "web" || event?.nativeEvent?.key !== "Enter") return;
     const native = event.nativeEvent ?? {};
@@ -1474,7 +1876,11 @@ const attachImage = useCallback(async () => {
                   inverted
                   keyExtractor={(item) => item.id}
                   renderItem={renderItem}
-                  contentContainerStyle={styles.transcript}
+                  contentContainerStyle={[
+                    styles.transcript,
+                    isDesktopWeb && styles.transcriptDesktop,
+                    isDesktopWeb ? { paddingTop: Math.max(170, desktopComposerHeight + 22) } : undefined,
+                  ]}
                   // Virtualization tuned like paseo's native strategy: enough rows
                   // up front that a fast scroll into history doesn't blank, and a
                   // wide window so streaming flushes never evict nearby cells.
@@ -1560,8 +1966,24 @@ const attachImage = useCallback(async () => {
                     userScrollingRef.current = false;
                     if (atLiveEdge) scrollToLatest(false);
                   }}
+                  {...(isDesktopWeb ? ({
+                    onWheel: () => {
+                      // RN Web's inverted list can receive content-size updates in
+                      // the same frame as a wheel event. Freeze follow mode before
+                      // the browser applies the wheel delta so streaming growth can
+                      // never fight the reader and appear to scroll backwards.
+                      userScrollingRef.current = true;
+                      followLiveRef.current = false;
+                      if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
+                      wheelIdleTimerRef.current = setTimeout(() => {
+                        userScrollingRef.current = false;
+                        if (lastScrollOffsetRef.current <= 2) followLiveRef.current = true;
+                      }, 140);
+                    },
+                  } as any) : {})}
                   onScroll={(e) => {
                     const offset = Math.max(0, e.nativeEvent.contentOffset.y);
+                    lastScrollOffsetRef.current = offset;
                     const nearBottom = offset < 80;
                     if (nearBottomRef.current !== nearBottom) {
                       nearBottomRef.current = nearBottom;
@@ -1597,6 +2019,8 @@ const attachImage = useCallback(async () => {
       agentName,
       colors.ink3,
       scrollToLatest,
+      isDesktopWeb,
+      desktopComposerHeight,
     ],
   );
 
@@ -1606,38 +2030,103 @@ const attachImage = useCallback(async () => {
 
   return (
     <Screen>
-      <Header
-        title={title}
-        back
-        subtitle={
-          <View style={styles.statusRow}>
-            <Text role="sub" ink={2}>
-              {agentName} · {status.label}
-            </Text>
-            <StatusDot tone={status.tone} />
-          </View>
-        }
-        onTitlePress={openConversationStatus}
-        titleAccessibilityLabel="Conversation status and context usage"
-        trailing={
+      <View style={styles.desktopShell}>
+        {isDesktopWeb ? (
+          <DesktopConversationSidebar
+            visible={desktopDrawerOpen}
+            onClose={() => setDesktopDrawerOpen(false)}
+            agentId={params.agentId}
+            agentName={agentName}
+            currentConversationId={params.conversationId}
+          />
+        ) : null}
+        <View style={styles.desktopMain}>
+      {isDesktopWeb ? (
+        <View style={[styles.desktopTopBar, { backgroundColor: colors.bg, borderColor: colors.surfaceEdge }]}>
+          {!desktopDrawerOpen ? (
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Show conversations"
+              onPress={() => setDesktopDrawerOpen(true)}
+              style={[styles.desktopMenuButton, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
+            >
+              <Text role="title" ink={2}>☰</Text>
+            </Touchable>
+          ) : null}
           <Touchable
             accessibilityRole="button"
-            accessibilityLabel={`Voice output: ${voiceMode}. Tap to change`}
-            onPress={cycleVoiceMode}
-            style={[styles.voiceModePill, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
+            accessibilityLabel="Conversation status and context usage"
+            onPress={openConversationStatus}
+            style={styles.desktopTitleLine}
           >
-            <View style={styles.voiceModeContent}>
-              <SpeakerIcon
-                color={voiceMode === "auto" ? colors.accent : colors.ink2}
-                muted={voiceMode === "off"}
-              />
-              <Text role="sub" tone={voiceMode === "auto" ? "accent" : undefined}>
-                {voiceModeLabel(voiceMode)}
-              </Text>
+            <Text role="bodyEm" numberOfLines={1} style={styles.desktopTitleText}>{title}</Text>
+            <View style={styles.desktopInlineStatus}>
+              <StatusDot tone={status.tone} />
+              <Text role="micro" ink={3} numberOfLines={1}>{agentName} · {status.label}</Text>
             </View>
           </Touchable>
-        }
-      />
+          <View style={styles.desktopFontControlsInline}>
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Decrease chat font size"
+              disabled={desktopTextScale <= DESKTOP_TEXT_SCALE_MIN}
+              onPress={() => adjustDesktopTextScale(-DESKTOP_TEXT_SCALE_STEP)}
+              style={styles.desktopFontButton}
+            >
+              <Text role="bodyEm" ink={desktopTextScale <= DESKTOP_TEXT_SCALE_MIN ? 3 : 2}>A−</Text>
+            </Touchable>
+            <Text role="micro" ink={3}>{Math.round(desktopTextScale * 100)}%</Text>
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel="Increase chat font size"
+              disabled={desktopTextScale >= DESKTOP_TEXT_SCALE_MAX}
+              onPress={() => adjustDesktopTextScale(DESKTOP_TEXT_SCALE_STEP)}
+              style={styles.desktopFontButton}
+            >
+              <Text role="bodyEm" ink={desktopTextScale >= DESKTOP_TEXT_SCALE_MAX ? 3 : 2}>A+</Text>
+            </Touchable>
+          </View>
+          <Touchable
+            accessibilityRole="button"
+            accessibilityLabel={`Voice output: ${voiceMode}. Click to change`}
+            onPress={cycleVoiceMode}
+            style={styles.desktopVoiceLink}
+          >
+            <View style={styles.voiceModeContent}>
+              <SpeakerIcon color={voiceMode === "auto" ? colors.accent : colors.ink2} muted={voiceMode === "off"} />
+              <Text role="sub" tone={voiceMode === "auto" ? "accent" : undefined}>{voiceMode === "tap" ? "Click" : voiceModeLabel(voiceMode)}</Text>
+            </View>
+          </Touchable>
+        </View>
+      ) : (
+        <Header
+          title={title}
+          back
+          subtitle={
+            <View style={styles.statusRow}>
+              <Text role="sub" ink={2}>{agentName} · {status.label}</Text>
+              <StatusDot tone={status.tone} />
+            </View>
+          }
+          onTitlePress={openConversationStatus}
+          titleAccessibilityLabel="Conversation status and context usage"
+          trailing={
+            <Touchable
+              accessibilityRole="button"
+              accessibilityLabel={`Voice output: ${voiceMode}. Tap to change`}
+              onPress={cycleVoiceMode}
+              style={[styles.voiceModePill, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
+            >
+              <View style={styles.voiceModeContent}>
+                <SpeakerIcon color={voiceMode === "auto" ? colors.accent : colors.ink2} muted={voiceMode === "off"} />
+                <Text role="sub" tone={voiceMode === "auto" ? "accent" : undefined}>{voiceModeLabel(voiceMode)}</Text>
+              </View>
+            </Touchable>
+          }
+        />
+      )}
+      <View style={styles.desktopChatFrame}>
+      <TextScaleProvider scale={isDesktopWeb ? desktopTextScale : 1}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.flex}>
         <View style={styles.flex}>
           {transcriptList}
@@ -1664,10 +2153,31 @@ const attachImage = useCallback(async () => {
           ) : null}
         </View>
 
+        {isDesktopWeb ? (
+          <View
+            pointerEvents="none"
+            style={[
+              styles.desktopComposerFade,
+              { height: Math.max(150, desktopComposerHeight + 18) },
+              { backgroundImage: `linear-gradient(to bottom, transparent 0%, ${colors.bg} 55%, ${colors.bg} 100%)` } as never,
+            ]}
+          />
+        ) : null}
+
         <View
+          onLayout={isDesktopWeb ? (event) => {
+            const next = Math.ceil(event.nativeEvent.layout.height);
+            setDesktopComposerHeight((current) => Math.abs(current - next) > 1 ? next : current);
+          } : undefined}
           style={[
             styles.composerWrap,
-            { borderColor: colors.surfaceEdge, paddingBottom: Math.max(insets.bottom, space.md) },
+            isDesktopWeb && styles.composerWrapDesktop,
+            {
+              borderColor: colors.surfaceEdge,
+              paddingTop: isDesktopWeb ? 2 : space.md,
+              paddingBottom: isDesktopWeb ? 1 : Math.max(insets.bottom, space.md),
+              gap: isDesktopWeb ? 1 : space.sm,
+            },
           ]}
         >
           {snapshot.connection !== "connected" ? (
@@ -1752,7 +2262,15 @@ const attachImage = useCallback(async () => {
             </View>
           ) : null}
           {voiceRecording || transcribingVoice ? (
-            <View style={[styles.voiceRecorderPanel, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}>
+            <Animated.View
+              entering={FadeInDown.duration(190)}
+              exiting={FadeOutDown.duration(150)}
+              style={[
+                styles.voiceRecorderPanel,
+                isDesktopWeb && styles.voicePanelDesktop,
+                { backgroundColor: colors.surface, borderColor: colors.surfaceEdge },
+              ]}
+            >
               {transcribingVoice ? (
                 <>
                   <Text role="bodyEm" tone="accent">
@@ -1815,7 +2333,9 @@ const attachImage = useCallback(async () => {
                   </Touchable>
                   <View style={styles.waveform}>
                     {Array.from({ length: 24 }, (_, index) => {
-                      const level = Math.max(0.15, Math.min(1, ((recorderState.metering ?? -52) + 60) / 42));
+                      const level = Platform.OS === "web"
+                        ? Math.max(0.15, browserVoiceLevel)
+                        : Math.max(0.15, Math.min(1, ((recorderState.metering ?? -52) + 60) / 42));
                       const shape = 0.35 + ((index * 7) % 11) / 16;
                       return <View key={index} style={[styles.waveBar, { backgroundColor: colors.accent, height: 8 + 30 * level * shape }]} />;
                     })}
@@ -1840,10 +2360,18 @@ const attachImage = useCallback(async () => {
                   </View>
                 </>
               )}
-            </View>
+            </Animated.View>
           ) : null}
           {voiceMode !== "off" && voiceReply && !voiceRecording ? (
-            <View style={[styles.voiceReplyCard, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}>
+            <Animated.View
+              entering={FadeInDown.duration(190)}
+              exiting={FadeOutDown.duration(150)}
+              style={[
+                styles.voiceReplyCard,
+                isDesktopWeb && styles.voicePanelDesktop,
+                { backgroundColor: colors.surface, borderColor: colors.surfaceEdge },
+              ]}
+            >
               <View style={styles.voiceReplyTop}>
                 <View>
                   <Text role="bodyEm">Milo’s reply</Text>
@@ -1906,12 +2434,14 @@ const attachImage = useCallback(async () => {
                 />
               </View>
               <Text role="micro" ink={2}>{Math.floor(voiceProgress.current / 60)}:{Math.floor(voiceProgress.current % 60).toString().padStart(2, "0")}{voiceProgress.duration > 0 ? ` / ${Math.floor(voiceProgress.duration / 60)}:${Math.floor(voiceProgress.duration % 60).toString().padStart(2, "0")}` : ""}</Text>
-            </View>
+            </Animated.View>
           ) : null}
           {voiceError ? <Text role="sub" tone="danger">{voiceError}</Text> : null}
           <View
             style={[
               styles.composer,
+              isDesktopWeb && styles.composerDesktop,
+              desktopComposerExpanded && styles.composerDesktopExpanded,
               { backgroundColor: colors.surface, borderColor: colors.surfaceEdge },
               snapshot.approvals.length > 0 && styles.hidden,
             ]}
@@ -1921,9 +2451,17 @@ const attachImage = useCallback(async () => {
               accessibilityLabel="Attach a photo or audio"
               onPress={() => attach()}
               disabled={snapshot.hydrating || (attachments.length + audioQueue.length) >= 4 || transcribingAudio}
-              style={styles.attachButton}
+              style={[
+                styles.attachButton,
+                isDesktopWeb && styles.composerAttachDesktop,
+                desktopComposerExpanded && styles.composerAttachDesktopExpanded,
+              ]}
             >
-              <Text role="title" ink={(attachments.length + audioQueue.length) >= 4 || transcribingAudio ? 3 : 2}>
+              <Text
+                role="title"
+                ink={(attachments.length + audioQueue.length) >= 4 || transcribingAudio ? 3 : 2}
+                style={isDesktopWeb ? styles.composerPlusGlyphDesktop : undefined}
+              >
                 ＋
               </Text>
             </Touchable>
@@ -1932,43 +2470,74 @@ const attachImage = useCallback(async () => {
               onChangeText={editDraft}
               placeholder={running ? "Add a follow-up…" : `Message ${agentName}…`}
               placeholderTextColor={colors.ink3}
-              // Past the growth cap the field scrolls instead of freezing the
-              // caret out of view — long pastes stay navigable.
-              style={[styles.input, { color: colors.ink }]}
+              style={[
+                styles.input,
+                { color: colors.ink },
+                isDesktopWeb ? {
+                  fontSize: 16 * desktopTextScale,
+                  lineHeight: 21 * desktopTextScale,
+                  outlineStyle: "none" as never,
+                  paddingTop: desktopComposerExpanded ? 10 : 8,
+                  paddingBottom: desktopComposerExpanded ? 10 : 7,
+                  paddingLeft: desktopComposerExpanded ? 5 : 4,
+                  paddingRight: desktopComposerExpanded ? 5 : 4,
+                  height: desktopComposerExpanded ? undefined : 40,
+                  minHeight: desktopComposerExpanded ? Math.min(126, Math.max(54, desktopInputContentHeight + 20)) : 40,
+                  maxHeight: desktopComposerExpanded ? 126 : 40,
+                  boxSizing: "border-box" as never,
+                } : undefined,
+                desktopComposerExpanded && styles.inputDesktopExpanded,
+              ]}
               multiline
               scrollEnabled
               editable={!snapshot.hydrating}
+              onContentSizeChange={isDesktopWeb ? (event) => {
+                const next = Math.ceil(event.nativeEvent.contentSize.height);
+                setDesktopInputContentHeight((current) => Math.abs(current - next) > 1 ? next : current);
+              } : undefined}
               onKeyPress={onComposerKeyPress}
             />
-            <Touchable
-              accessibilityRole="button"
-              accessibilityLabel="Record voice message"
-              disabled={snapshot.hydrating || transcribingVoice}
-              onPress={() => void startVoiceRecording()}
-              style={[styles.micButton, { backgroundColor: voiceRecording ? colors.accent : colors.bubble, borderColor: voiceRecording ? colors.accent : colors.surfaceEdge }]}
-            >
-              <MicrophoneIcon color={voiceRecording ? "#FFFFFF" : colors.ink2} />
-            </Touchable>
-            <Touchable
-              accessibilityRole="button"
-              accessibilityLabel={running ? "Stop" : "Send"}
-              disabled={aborting || (!running && !canSend)}
-              onPress={onPrimaryAction}
-              style={styles.composerSendTouch}
-            >
-              <Animated.View
+            <View style={[
+              styles.composerRightActions,
+              isDesktopWeb && styles.composerRightActionsDesktop,
+              desktopComposerExpanded && styles.composerRightActionsDesktopExpanded,
+            ]}>
+              <Touchable
+                accessibilityRole="button"
+                accessibilityLabel="Record voice message"
+                disabled={snapshot.hydrating || transcribingVoice}
+                onPress={() => void startVoiceRecording()}
                 style={[
-                  styles.send,
-                  { backgroundColor: running || aborting ? colors.danger : colors.accent, opacity: !running && !canSend ? 0.4 : 1 },
+                  styles.micButton,
+                  isDesktopWeb && styles.composerIconDesktop,
+                  isDesktopWeb && styles.micButtonDesktop,
+                  { backgroundColor: voiceRecording ? colors.accent : colors.bubble, borderColor: voiceRecording ? colors.accent : colors.surfaceEdge },
                 ]}
               >
-                {running || aborting ? (
-                  <View style={styles.stopGlyph} />
-                ) : (
-                  <SendIcon />
-                )}
-              </Animated.View>
-            </Touchable>
+                <View style={isDesktopWeb ? styles.micGlyphDesktop : undefined}><MicrophoneIcon color={voiceRecording ? "#FFFFFF" : colors.ink2} /></View>
+              </Touchable>
+              <Touchable
+                accessibilityRole="button"
+                accessibilityLabel={running ? "Stop" : "Send"}
+                disabled={aborting || (!running && !canSend)}
+                onPress={onPrimaryAction}
+                style={[styles.composerSendTouch, isDesktopWeb && styles.composerSendTouchDesktop]}
+              >
+                <Animated.View
+                  style={[
+                    styles.send,
+                    isDesktopWeb && styles.composerIconDesktop,
+                    { backgroundColor: running || aborting ? colors.danger : colors.accent, opacity: !running && !canSend ? 0.4 : 1 },
+                  ]}
+                >
+                  {running || aborting ? (
+                    <View style={styles.stopGlyph} />
+                  ) : (
+                    <SendIcon />
+                  )}
+                </Animated.View>
+              </Touchable>
+            </View>
           </View>
           <View style={styles.chipRow}>
             <Touchable
@@ -1977,29 +2546,38 @@ const attachImage = useCallback(async () => {
               onPress={openModelSheet}
               style={styles.modelChip}
             >
-              <Text role="sub" ink={2} mono numberOfLines={1}>
-                {modelSaving ? "Saving…" : model ? model.split("/").pop() : "model"}
-                {!modelSaving && effort ? ` · ${effort}` : ""}
-              </Text>
+              <View style={styles.controlLabelInline}>
+                <Text role="sub" ink={2} mono numberOfLines={1}>
+                  {modelSaving ? "Saving…" : model ? model.split("/").pop() : "model"}
+                  {!modelSaving && effort ? ` · ${effort}` : ""}
+                </Text>
+                <Text role="micro" ink={3}>⌄</Text>
+              </View>
             </Touchable>
             {snapshot.device ? (
-              <Touchable
-                accessibilityRole="button"
-                accessibilityLabel={`Permission mode: ${snapshot.device.permissionMode}. Change controls`}
-                onPress={() => {
-                  dismissChatKeyboard();
-                  controlsSheetRef.current?.present();
-                }}
-                style={styles.modelChip}
-              >
-                <Text role="sub" ink={2}>
-                  {snapshot.device.permissionMode === "acceptEdits"
-                    ? "Accept edits"
-                    : snapshot.device.permissionMode === "unrestricted"
-                      ? "Unrestricted"
-                      : "Standard"}
-                </Text>
-              </Touchable>
+              <>
+                <Text role="micro" ink={3} style={styles.controlSeparator}>|</Text>
+                <Touchable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Permission mode: ${snapshot.device.permissionMode}. Change controls`}
+                  onPress={() => {
+                    dismissChatKeyboard();
+                    controlsSheetRef.current?.present();
+                  }}
+                  style={styles.modelChip}
+                >
+                  <View style={styles.controlLabelInline}>
+                    <Text role="sub" ink={2} mono>
+                      {snapshot.device.permissionMode === "acceptEdits"
+                        ? "Accept edits"
+                        : snapshot.device.permissionMode === "unrestricted"
+                          ? "Unrestricted"
+                          : "Standard"}
+                    </Text>
+                    <Text role="micro" ink={3}>⌄</Text>
+                  </View>
+                </Touchable>
+              </>
             ) : null}
             <View style={styles.spacer} />
             {running && canSend ? (
@@ -2012,6 +2590,10 @@ const attachImage = useCallback(async () => {
           </View>
         </View>
       </KeyboardAvoidingView>
+      </TextScaleProvider>
+      </View>
+        </View>
+      </View>
       <QueueSheet
         ref={queueSheetRef}
         queue={snapshot.queue}
@@ -2023,17 +2605,17 @@ const attachImage = useCallback(async () => {
           queueSheetRef.current?.dismiss();
         }}
       />
-<Sheet ref={attachMenuSheetRef} title="Attach">
+<Sheet ref={attachMenuSheetRef} title="Attach" compact>
         <Touchable
           accessibilityRole="button"
           accessibilityLabel="Attach a photo"
           onPress={() => void attachImage()}
           style={styles.attachMenuRow}
         >
-          <View style={styles.attachMenuIcon}><Text role="body" ink={1} style={{ fontSize: 20 }}>📷</Text></View>
-          <View>
-            <Text role="title">Photo</Text>
-            <Text role="micro" ink={3}>From your library</Text>
+          <View style={styles.attachMenuIcon}><PhotoIcon color={colors.ink2} size={21} /></View>
+          <View style={styles.attachMenuText}>
+            <Text role="bodyEm">Photo</Text>
+            <Text role="sub" ink={3}>From your library</Text>
           </View>
         </Touchable>
         <Touchable
@@ -2042,10 +2624,10 @@ const attachImage = useCallback(async () => {
           onPress={() => void attachAudio()}
           style={styles.attachMenuRow}
         >
-          <View style={styles.attachMenuIcon}><Text role="body" ink={1} style={{ fontSize: 20 }}>🎙</Text></View>
-          <View>
-            <Text role="title">Audio</Text>
-            <Text role="micro" ink={3}>Pick a recording to transcribe</Text>
+          <View style={styles.attachMenuIcon}><MicrophoneIcon color={colors.ink2} size={21} /></View>
+          <View style={styles.attachMenuText}>
+            <Text role="bodyEm">Audio</Text>
+            <Text role="sub" ink={3}>Pick a recording to transcribe</Text>
           </View>
         </Touchable>
       </Sheet>
@@ -2112,7 +2694,7 @@ const attachImage = useCallback(async () => {
         {diagnosticsLoading && !conversationDiagnostics ? (
           <View style={styles.diagnosticsLoading}>
             <ActivityIndicator size="small" color={colors.ink3} />
-            <Text role="sub" ink={3}>Reading Milo's current context…</Text>
+            <Text role="sub" ink={3}>Reading Milo&apos;s current context…</Text>
           </View>
         ) : null}
         {conversationDiagnostics ? (() => {
@@ -2289,10 +2871,50 @@ const attachImage = useCallback(async () => {
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
+  desktopShell: { flex: 1, width: "100%", flexDirection: "row" },
+  desktopMain: { flex: 1, minWidth: 0, position: "relative" },
+  desktopChatFrame: { flex: 1, width: "100%" },
+  desktopTopBar: {
+    minHeight: 32,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 8,
+    paddingVertical: 0,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    zIndex: 4,
+  },
+  desktopTitleLine: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 10 },
+  desktopTitleText: { flexShrink: 1, minWidth: 0 },
+  desktopInlineStatus: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 5, opacity: 0.82 },
+  desktopVoiceLink: { flexShrink: 0, paddingHorizontal: 4, paddingVertical: 2 },
+  desktopFontControlsInline: { flexShrink: 0, height: 26, flexDirection: "row", alignItems: "center", gap: 0, opacity: 0.66 },
+  desktopFontButton: { minWidth: 27, minHeight: 26, alignItems: "center", justifyContent: "center" },
+  desktopMenuButton: { minWidth: 30, minHeight: 30, alignItems: "center", justifyContent: "center", borderRadius: radius.chip },
+  desktopSidebar: { width: 320, flexShrink: 0, borderRightWidth: StyleSheet.hairlineWidth },
+  desktopSidebarHeader: { flexDirection: "row", alignItems: "center", paddingHorizontal: space.lg, paddingVertical: space.lg, borderBottomWidth: StyleSheet.hairlineWidth },
+  desktopSidebarTitle: { flex: 1, gap: 2 },
+  desktopSidebarActions: { flexDirection: "row", alignItems: "center", gap: 2 },
+  desktopSidebarClose: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
+  desktopSidebarMessage: { padding: space.lg },
+  desktopSidebarLoading: { padding: space.xl, alignItems: "center" },
+  desktopSidebarList: { paddingVertical: space.sm },
+  desktopSidebarRow: { paddingHorizontal: space.lg, paddingVertical: space.md, marginHorizontal: space.sm, borderRadius: radius.row },
+  desktopContextMenu: { position: "fixed" as never, minWidth: 180, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, paddingVertical: space.xs, zIndex: 21, shadowColor: "#000", shadowOpacity: 0.16, shadowRadius: 12, shadowOffset: { width: 0, height: 5 } },
+  desktopContextItem: { minHeight: 40, paddingHorizontal: space.md, justifyContent: "center" },
   statusRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   // Inverted list: style paddingTop renders at the VISUAL bottom (above the
   // composer), paddingBottom at the visual top.
   transcript: { paddingHorizontal: space.gutter, paddingTop: space.xl, paddingBottom: space.md, gap: space.md },
+  transcriptDesktop: {
+    width: "100%",
+    maxWidth: 900,
+    alignSelf: "center",
+    // Inverted list: paddingTop is the visual bottom. This keeps the live edge
+    // readable while still allowing older content to scroll beneath the fade.
+    paddingTop: 170,
+    paddingBottom: 118,
+  },
   // FlatList does not counter-rotate ListEmptyComponent when `inverted` is set.
   invertedEmpty: { transform: [{ scaleY: -1 }] },
   latestWrap: { position: "absolute", left: 0, right: 0, bottom: space.md, alignItems: "center" },
@@ -2315,15 +2937,19 @@ const styles = StyleSheet.create({
   attachMenuRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: space.md,
-    paddingVertical: space.md,
+    gap: 12,
+    minHeight: 58,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
     borderRadius: radius.row,
   },
   attachMenuIcon: {
-    width: 28,
+    width: 30,
+    height: 30,
     alignItems: "center",
     justifyContent: "center",
   },
+  attachMenuText: { flex: 1, gap: 1 },
   attachSend: {
     flexDirection: "row",
     alignItems: "center",
@@ -2339,10 +2965,27 @@ const styles = StyleSheet.create({
     minHeight: 32,
   },
   composerWrap: {
-    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopWidth: 0,
     paddingHorizontal: space.gutter,
     paddingTop: space.md,
     gap: space.sm,
+  },
+  desktopComposerFade: {
+    position: "absolute",
+    left: 0,
+    right: 18,
+    bottom: 0,
+    height: 150,
+    zIndex: 1,
+  },
+  composerWrapDesktop: {
+    position: "absolute",
+    left: "50%",
+    bottom: 0,
+    width: "100%",
+    maxWidth: 900,
+    transform: [{ translateX: "-50%" as never }],
+    zIndex: 2,
   },
   composer: {
     flexDirection: "row",
@@ -2352,14 +2995,28 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.lg,
     paddingVertical: 6,
   },
+  composerDesktop: { minHeight: 52, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 4, alignItems: "center" },
+  composerDesktopExpanded: { minHeight: 92, borderRadius: 24, alignItems: "stretch", paddingTop: 7, paddingBottom: 43, position: "relative" },
   // ~7 lines before it scrolls: references cap growth near a third of the
   // screen so the transcript never disappears behind the composer.
   input: { flex: 1, minHeight: 38, fontSize: 16, lineHeight: 21, maxHeight: 168, paddingHorizontal: 0, paddingVertical: 8 },
-  chipRow: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  inputDesktopExpanded: { width: "100%", paddingHorizontal: 5, paddingRight: 5 },
+  composerRightActions: { flexDirection: "row", alignItems: "center" },
+  composerRightActionsDesktop: { gap: 6, alignItems: "center", marginRight: -5 },
+  composerRightActionsDesktopExpanded: { position: "absolute", right: 8, bottom: 6, marginRight: 0 },
+  composerAttachDesktop: { width: 40, height: 40, minHeight: 40, paddingRight: 0, alignItems: "center", justifyContent: "center", flexShrink: 0, marginLeft: -6 },
+  composerAttachDesktopExpanded: { position: "absolute", left: 9, bottom: 6, paddingRight: 0, width: 34, height: 34, alignItems: "center", justifyContent: "center", zIndex: 2, marginLeft: 0 },
+  composerPlusGlyphDesktop: { fontSize: 20, lineHeight: 22, textAlign: "center", transform: [{ translateY: 1 }] },
+  composerIconDesktop: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },
+  micButtonDesktop: { width: 40, height: 40, minWidth: 40, minHeight: 40, maxWidth: 40, maxHeight: 40, borderRadius: 20, marginLeft: 0, padding: 0, aspectRatio: 1 },
+  micGlyphDesktop: { transform: [{ translateX: 1.5 }] },
+  composerSendTouchDesktop: { width: 40, height: 40, marginLeft: 0, alignItems: "center", justifyContent: "center" },
+  chipRow: { flexDirection: "row", alignItems: "center", gap: 4, minHeight: 16 },
   voiceModePill: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.chip, paddingHorizontal: space.md, paddingVertical: 7 },
   voiceModeContent: { flexDirection: "row", alignItems: "center", gap: 7 },
   micButton: { width: 44, height: 44, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", marginLeft: space.sm },
   voiceRecorderPanel: { borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.sheet, paddingHorizontal: space.lg, paddingVertical: space.md, gap: space.sm, alignItems: "center" },
+  voicePanelDesktop: { width: "74%", maxWidth: 660, alignSelf: "center" },
   transcriptionTrack: { width: "100%", height: 8, borderRadius: 4, overflow: "hidden" },
   transcriptionFill: { height: "100%", borderRadius: 4 },
   waveform: { height: 48, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3, width: "100%" },
@@ -2380,7 +3037,9 @@ const styles = StyleSheet.create({
   hidden: { display: "none" },
   spacer: { flex: 1 },
   queueSend: { paddingHorizontal: space.sm },
-  modelChip: { maxWidth: 220, paddingVertical: 4 },
+  modelChip: { maxWidth: 240, paddingVertical: 0 },
+  controlLabelInline: { flexDirection: "row", alignItems: "center", gap: 4 },
+  controlSeparator: { paddingHorizontal: 2, opacity: 0.55 },
   diagnosticsLoading: { minHeight: 90, alignItems: "center", justifyContent: "center", gap: space.sm },
   diagnosticsHero: { gap: space.sm },
   diagnosticsHeroTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },

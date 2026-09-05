@@ -1,5 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as LegacyFileSystem from "expo-file-system/legacy";
+import { Platform } from "react-native";
 
 import { voiceTrace } from "./voiceDiagnostics";
 
@@ -19,34 +20,10 @@ export type TranscriptionProgress = {
 const MODE_KEY = "milo.voice.mode.v1";
 export const WHISPER_MODEL = "Systran/faster-whisper-medium.en";
 export const KOKORO_VOICE = "bm_george";
-export const KOKORO_PLAYBACK_RATE = 1.1;
+export const KOKORO_PLAYBACK_RATE = 1.0;
 
 
-/**
- * Reduce assistant markdown to text that is actually useful to hear aloud.
- * A turn containing only code, images, embeds, or bare URLs should not produce
- * a voice-reply card at all.
- */
-export function prepareSpeechText(markdown: string): string {
-  return markdown
-    // Code is visual reference material, not prose. Strip fenced blocks first
-    // so their backticks cannot be mistaken for inline code below.
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/~~~[\s\S]*?~~~/g, " ")
-    .replace(/`[^`\n]*`/g, " ")
-    // Images should not create a voice card by themselves. Ordinary links keep
-    // their human-readable label but discard the URL.
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-    // HTML-ish embeds/tags and standalone URLs are non-speakable chrome.
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, " ")
-    // Remove common Markdown structure while preserving the words.
-    .replace(/^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s?)/gm, " ")
-    .replace(/[*_~]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+export { prepareSpeechText, speechMarkdownReady } from "./voiceSpeechText";
 
 export async function getVoiceMode(): Promise<VoiceMode> {
   const saved = await AsyncStorage.getItem(MODE_KEY);
@@ -221,12 +198,36 @@ async function uploadVoiceNative(
   }
 }
 
-async function transcriptionText(response: Response): Promise<string> {
-  if (!response.ok) throw new Error(`Voice transcription failed (${response.status})`);
-  const payload = (await response.json()) as { text?: string } | string;
+function transcriptionText(status: number, body: string): string {
+  if (status < 200 || status >= 300) throw new Error(`Voice transcription failed (${status})`);
+  const payload = JSON.parse(body) as { text?: string } | string;
   const text = typeof payload === "string" ? payload : payload.text;
   if (!text?.trim()) throw new Error("Whisper returned an empty transcription.");
   return text.trim();
+}
+
+async function pollVoiceNative(
+  url: string,
+  headers: Record<string, string>,
+  traceId: string,
+): Promise<{ status: number; text: string }> {
+  const directory = LegacyFileSystem.cacheDirectory ?? LegacyFileSystem.documentDirectory;
+  if (!directory) throw new Error("A local directory for voice status polling is unavailable.");
+  const destination = `${directory}bloop-voice-poll-${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
+  voiceTrace(traceId, "native_poll_started");
+  try {
+    const result = await LegacyFileSystem.downloadAsync(url, destination, { headers });
+    const text = await LegacyFileSystem.readAsStringAsync(result.uri);
+    voiceTrace(traceId, "native_poll_completed", { status: result.status });
+    return { status: result.status, text };
+  } catch (error) {
+    voiceTrace(traceId, "native_poll_failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    await LegacyFileSystem.deleteAsync(destination, { idempotent: true }).catch(() => {});
+  }
 }
 
 export async function transcribeVoice(
@@ -235,21 +236,32 @@ export async function transcribeVoice(
   serverUrl: string,
   options?: { durationSeconds?: number; onProgress?: (progress: TranscriptionProgress) => void; traceId?: string },
 ): Promise<string> {
-  const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
+  // The office browser intentionally never receives the Local Milo capability
+  // token. Its same-origin desktop proxy injects that secret host-side.
+  const officeBrowser = Platform.OS === "web" && !token;
+  const voiceBaseUrl = officeBrowser ? "/__bloop/local-milo" : voiceHttpBaseUrl(serverUrl);
   const traceId = options?.traceId ?? `voice-${Date.now().toString(36)}`;
-  voiceTrace(traceId, "transcribe_begin", { durationSeconds: options?.durationSeconds ?? null });
-  const makeBody = () => {
+  voiceTrace(traceId, "transcribe_begin", { durationSeconds: options?.durationSeconds ?? null, officeBrowser });
+  const makeBody = async () => {
     const body = new FormData();
     body.append("model", WHISPER_MODEL);
     // Speaches can stream completed Whisper segments over SSE. The voice gateway
     // consumes those milestones server-side for real progress/ETA updates while
     // preserving Bloop's simple asynchronous job API.
     body.append("stream", "true");
-    body.append("file", { uri, name: "milo-voice.m4a", type: "audio/mp4" } as never);
+    if (officeBrowser) {
+      const audioResponse = await fetch(uri);
+      if (!audioResponse.ok) throw new Error("The browser recording could not be read.");
+      const blob = await audioResponse.blob();
+      const extension = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "m4a";
+      body.append("file", blob, `milo-voice.${extension}`);
+    } else {
+      body.append("file", { uri, name: "milo-voice.m4a", type: "audio/mp4" } as never);
+    }
     return body;
   };
-  const headers = {
-    Authorization: `Bearer ${token}`,
+  const headers: Record<string, string> = {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(options?.durationSeconds && options.durationSeconds > 0
       ? { "X-Audio-Duration-Seconds": String(options.durationSeconds) }
       : {}),
@@ -264,20 +276,22 @@ export async function transcribeVoice(
     estimated: true,
   });
   let upload: { status: number; text: string };
+  let useNativePolling = false;
   try {
     upload = await uploadVoice(
       `${voiceBaseUrl}/voice/transcribe`,
       headers,
-      makeBody(),
+      await makeBody(),
       audioDurationSeconds,
       1,
       traceId,
       options?.onProgress,
     );
   } catch (error) {
-    if (!(error instanceof VoiceUploadRetryableError)) throw error;
+    if (officeBrowser || !(error instanceof VoiceUploadRetryableError)) throw error;
     // RN XHR occasionally wedges before transmitting byte zero on physical iOS.
     // Switch transports instead of retrying the same stuck networking layer.
+    useNativePolling = true;
     voiceTrace(traceId, "fallback_to_native", { reason: error.message });
     options?.onProgress?.({ phase: "uploading", progress: 0, etaSeconds: null, elapsedSeconds: 0, audioDurationSeconds, estimated: true });
     upload = await uploadVoiceNative(
@@ -301,17 +315,19 @@ export async function transcribeVoice(
     return text.trim();
   }
   const accepted = JSON.parse(upload.text) as AcceptedTranscriptionJob;
-  return pollAcceptedTranscription(accepted, token, serverUrl, options);
+  return pollAcceptedTranscription(accepted, token, serverUrl, options, voiceBaseUrl, useNativePolling);
 }
 
 export async function pollAcceptedTranscription(
   accepted: AcceptedTranscriptionJob,
   token: string,
   serverUrl: string,
-  options?: { durationSeconds?: number; onProgress?: (progress: TranscriptionProgress) => void },
+  options?: { durationSeconds?: number; onProgress?: (progress: TranscriptionProgress) => void; traceId?: string },
+  voiceBaseOverride?: string,
+  useNativePolling = false,
 ): Promise<string> {
-  const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
-  const headers = { Authorization: `Bearer ${token}` };
+  const voiceBaseUrl = voiceBaseOverride ?? voiceHttpBaseUrl(serverUrl);
+  const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
   if (!accepted.job_id) throw new Error("Voice transcription job was not created.");
   let progressAnchor: TranscriptionProgress = {
     phase: "transcribing",
@@ -357,12 +373,35 @@ export async function pollAcceptedTranscription(
     : null;
 
   const deadline = Date.now() + 15 * 60 * 1000;
+  let consecutivePollFailures = 0;
   try {
     while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 700));
-    const poll = await fetch(`${voiceBaseUrl}/voice/transcribe/${encodeURIComponent(accepted.job_id)}`, { headers });
+    const pollUrl = `${voiceBaseUrl}/voice/transcribe/${encodeURIComponent(accepted.job_id)}`;
+    let poll: { status: number; text: string };
+    try {
+      poll = useNativePolling
+        ? await pollVoiceNative(pollUrl, headers, options?.traceId ?? accepted.job_id)
+        : await fetch(pollUrl, { headers }).then(async (response) => ({ status: response.status, text: await response.text() }));
+      consecutivePollFailures = 0;
+    } catch (error) {
+      consecutivePollFailures += 1;
+      voiceTrace(options?.traceId ?? accepted.job_id, "poll_transient_failure", {
+        attempt: consecutivePollFailures,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // The transcription job continues on the server even if one status poll
+      // is lost (cell handoff, brief Cloudflare/LAN interruption, iOS socket
+      // reset, etc.). Do not throw away a healthy in-flight job because of a
+      // transient polling failure.
+      if (consecutivePollFailures >= 8) {
+        throw new Error("Voice transcription status checks failed repeatedly. Please retry.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(4000, 500 * consecutivePollFailures)));
+      continue;
+    }
     if (poll.status === 202) {
-      const status = (await poll.json()) as {
+      const status = JSON.parse(poll.text) as {
         progress?: number;
         eta_seconds?: number;
         elapsed_seconds?: number;
@@ -381,7 +420,7 @@ export async function pollAcceptedTranscription(
       emitProgress(progressAnchor);
       continue;
     }
-    const text = await transcriptionText(poll);
+    const text = transcriptionText(poll.status, poll.text);
     completed = true;
     if (progressTicker) clearInterval(progressTicker);
     emitProgress({
@@ -401,6 +440,12 @@ export async function pollAcceptedTranscription(
   } finally {
     if (progressTicker) clearInterval(progressTicker);
   }
+}
+
+export function officeBrowserSpeechSource(text: string) {
+  const clipped = text.slice(0, 12000);
+  const query = new URLSearchParams({ text: clipped, voice: KOKORO_VOICE });
+  return { uri: `/__bloop/local-milo/voice/speech?${query.toString()}` };
 }
 
 export function speechSource(text: string, token: string, serverUrl: string) {

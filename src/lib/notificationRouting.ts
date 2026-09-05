@@ -21,8 +21,8 @@ function optionalString(value: unknown): string | undefined {
 }
 
 /** Strictly translate our own push payload into a Bloop route. */
-export function routeForMiloNotification(data: MiloNotificationData): ChatNotificationRoute | null {
-  if (data.type !== "milo_turn_complete") return null;
+export function routeForMiloNotification(data: MiloNotificationData | undefined): ChatNotificationRoute | null {
+  if (!data || data.type !== "milo_turn_complete") return null;
   const conversationId = optionalString(data.conversationId);
   const agentId = optionalString(data.agentId);
   if (!conversationId || !agentId) return null;

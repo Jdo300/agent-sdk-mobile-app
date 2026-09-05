@@ -530,10 +530,10 @@ const styles = StyleSheet.create({
   userRow: { alignItems: "flex-end", gap: 4 },
   userImages: { flexDirection: "row", flexWrap: "wrap", gap: 4, marginBottom: 6 },
   userImage: { width: 96, height: 96, borderRadius: 10 },
-  userTouch: { borderRadius: radius.bubble },
+  userTouch: { maxWidth: "82%", borderRadius: radius.bubble, alignItems: "flex-end" },
   thinkingRow: { flexDirection: "row", alignItems: "center", gap: space.sm, minHeight: 24 },
   userBubble: {
-    maxWidth: "82%",
+    maxWidth: "100%",
     borderRadius: radius.bubble,
     borderBottomRightRadius: radius.bubbleTail,
     paddingHorizontal: space.lg,

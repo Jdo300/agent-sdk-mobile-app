@@ -3,6 +3,7 @@ import { Text as RNText, Platform, type TextStyle } from "react-native";
 
 import { useTheme } from "../../theme/ThemeProvider";
 import { monoFamily } from "../../theme/tokens";
+import { useTextScale } from "../ui/Text";
 
 const languageKeywords: Record<string, Set<string>> = {
   javascript: new Set("async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof var void while with yield true false null undefined".split(" ")),
@@ -73,6 +74,7 @@ export const SyntaxCode = memo(function SyntaxCode({
   style?: TextStyle;
 }) {
   const { colors, name } = useTheme();
+  const scale = useTextScale();
   const parts = useMemo(() => highlight(code, language), [code, language]);
   const dark = name === "dark";
   const children: ReactNode[] = parts.map((part, index) => (
@@ -83,7 +85,7 @@ export const SyntaxCode = memo(function SyntaxCode({
     <RNText
       selectable={selectable}
       style={[
-        { color: colors.ink, fontFamily: Platform.select(monoFamily), fontSize: 13, lineHeight: 18 },
+        { color: colors.ink, fontFamily: Platform.select(monoFamily), fontSize: 13 * scale, lineHeight: 18 * scale },
         style,
       ]}
     >

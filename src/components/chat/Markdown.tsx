@@ -16,7 +16,7 @@ import { Image } from "expo-image";
 import { haptic } from "../../lib/haptics";
 import { useTheme } from "../../theme/ThemeProvider";
 import { radius, space, monoFamily, type as typeScale, type Palette } from "../../theme/tokens";
-import { Text } from "../ui/Text";
+import { Text, useTextScale } from "../ui/Text";
 import { Touchable } from "../ui/Touchable";
 import { SyntaxCode } from "./SyntaxCode";
 import { setViewerPayload } from "../../lib/viewerPayload";
@@ -309,17 +309,30 @@ const mono: TextStyle = {
   lineHeight: 18,
 };
 
+function scaleTextStyle(style: TextStyle, scale: number): TextStyle {
+  return {
+    ...style,
+    ...(typeof style.fontSize === "number" ? { fontSize: style.fontSize * scale } : {}),
+    ...(typeof style.lineHeight === "number" ? { lineHeight: style.lineHeight * scale } : {}),
+  };
+}
+
 /**
  * Map markdown elements onto the app's type scale and palette — headings
  * collapse to title/bodyEm so prose never invents new sizes.
  */
-function markdownStyles(colors: Palette) {
-  const heading: TextStyle = { ...typeScale.bodyEm, color: colors.ink, marginTop: space.xs };
+function markdownStyles(colors: Palette, scale: number) {
+  const body = scaleTextStyle(typeScale.body as TextStyle, scale);
+  const bodyEm = scaleTextStyle(typeScale.bodyEm as TextStyle, scale);
+  const title = scaleTextStyle(typeScale.title as TextStyle, scale);
+  const sub = scaleTextStyle(typeScale.sub as TextStyle, scale);
+  const scaledMono = scaleTextStyle(mono, scale);
+  const heading: TextStyle = { ...bodyEm, color: colors.ink, marginTop: space.xs };
   return {
-    body: { ...typeScale.body, color: colors.ink },
+    body: { ...body, color: colors.ink },
     paragraph: { marginTop: 0, marginBottom: 0 },
-    heading1: { ...typeScale.title, color: colors.ink, marginTop: space.xs },
-    heading2: { ...typeScale.title, color: colors.ink, marginTop: space.xs },
+    heading1: { ...title, color: colors.ink, marginTop: space.xs },
+    heading2: { ...title, color: colors.ink, marginTop: space.xs },
     heading3: heading,
     heading4: heading,
     heading5: heading,
@@ -330,7 +343,7 @@ function markdownStyles(colors: Palette) {
     link: { color: colors.accent },
     blocklink: { color: colors.accent, borderBottomWidth: 0 },
     code_inline: {
-      ...mono,
+      ...scaledMono,
       backgroundColor: colors.pressed,
       borderRadius: 4,
       paddingHorizontal: 3,
@@ -359,7 +372,7 @@ function markdownStyles(colors: Palette) {
     th: {
       paddingHorizontal: space.sm,
       paddingVertical: 7,
-      ...typeScale.sub,
+      ...sub,
       fontWeight: "700",
       color: colors.ink,
       borderRightWidth: StyleSheet.hairlineWidth,
@@ -373,7 +386,7 @@ function markdownStyles(colors: Palette) {
     td: {
       paddingHorizontal: space.sm,
       paddingVertical: 7,
-      ...typeScale.sub,
+      ...sub,
       color: colors.ink,
       borderRightWidth: StyleSheet.hairlineWidth,
       borderRightColor: colors.surfaceEdge,
@@ -384,7 +397,8 @@ function markdownStyles(colors: Palette) {
 /** One parsed block. Memoized on text: settled blocks skip streaming flushes. */
 const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
   const { colors } = useTheme();
-  const style = useMemo(() => markdownStyles(colors), [colors]);
+  const scale = useTextScale();
+  const style = useMemo(() => markdownStyles(colors, scale), [colors, scale]);
   return (
     <MarkdownDisplay markdownit={parser} style={style} rules={rules} onLinkPress={openLink}>
       {text}

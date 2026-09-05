@@ -25,7 +25,7 @@ import { getConversationModel, getConversationStaticDiagnostics, isAuthError, li
 import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode, type ToolStatus, type TranscriptItem } from "./model";
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
-import { liveTextKeyAtEdge, newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
+import { newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import { rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
 import { shouldReconnectSilentSend } from "./authoritativeCatchUp";
 import {
@@ -221,6 +221,10 @@ export class ChatSession {
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
+  /** Image URIs for turns sent in this session. Persisted App Server history does
+   * not currently round-trip image content into transcript rows, so keep this
+   * presentation overlay after the optimistic echo is acknowledged. */
+  private sentImageUris = new Map<string, string[]>();
   /** User cancellations accepted before the App Server handoff begins. */
   private cancelledLocalOtids = new Set<string>();
   /** Definitely-unsent journal rows recovered after a process restart. */
@@ -472,7 +476,10 @@ export class ChatSession {
       this.markEcho(otid, { pending: true, cancelable: true, failed: false, deliveryUnknown: false });
       this.commit(this.project(this.snapshot));
     }
-    if (attachments.length > 0) this.pendingAttachments.set(otid, attachments);
+    if (attachments.length > 0) {
+      this.pendingAttachments.set(otid, attachments);
+      this.sentImageUris.set(otid, attachments.map((attachment) => attachment.uri));
+    }
     if (this.snapshot.run === "idle") this.commit(patch(this.snapshot, { run: "running" }));
 
     try {
@@ -529,7 +536,6 @@ export class ChatSession {
       this.commit(patch(this.appendError(this.project(this.snapshot), detail), { run: "idle" }));
       return false;
     }
-    this.pendingAttachments.delete(otid);
     this.markEcho(otid, { pending: false });
     this.commit(this.project(this.snapshot));
     return true;
@@ -957,10 +963,12 @@ export class ChatSession {
         memoryDirectory: status.memoryDirectory,
       },
       approvals,
-      // Never downgrade a locally-known abort in flight; otherwise the device
-      // decides. An unanswered approval outranks "running" for the composer.
+      // Preserve a locally-known abort only while the device still reports work
+      // in flight. Once device status is idle, that is the authoritative abort
+      // confirmation and the composer must return to its normal send state.
+      // An unanswered approval still outranks "running" for the composer.
       run:
-        snapshot.run === "aborting"
+        snapshot.run === "aborting" && status.isProcessing
           ? "aborting"
           : approvals.length > 0
             ? "awaiting_approval"
@@ -1604,8 +1612,11 @@ export class ChatSession {
    */
   private project(snapshot: ChatSnapshot): ChatSnapshot {
     const rows = this.accumulator.rows();
-    const running = snapshot.run === "running" || snapshot.run === "awaiting_approval";
-    const liveKey = running ? liveTextKeyAtEdge(rows) : null;
+    // Transcript rows here come only from authoritative listMessages() history.
+    // Do not infer "streaming" from the overall run state: a persisted assistant
+    // message can be complete while the run continues into tool work. Marking it
+    // live until a later row arrived delayed TTS and forced heuristic timers.
+    const liveKey: string | null = null;
     this.recordTimings(rows, liveKey);
 
     const state: ProjectionState = {
@@ -1620,12 +1631,19 @@ export class ChatSession {
     };
     const projected = projectRows(rows, state);
     const liveIds = new Set<string>();
-    const items = projected.map((item) => {
-      liveIds.add(item.id);
-      const previous = this.projectedRowCache.get(item.id);
-      if (previous && sameTranscriptItem(previous, item)) return previous;
-      this.projectedRowCache.set(item.id, item);
-      return item;
+    const items = projected.map((item, index) => {
+      const sourceRow = rows[index];
+      const imageUris = item.kind === "user" && sourceRow?.kind === "user" && sourceRow.otid
+        ? this.sentImageUris.get(sourceRow.otid)
+        : undefined;
+      const withImages = imageUris?.length && item.kind === "user" && !item.images?.length
+        ? { ...item, images: imageUris }
+        : item;
+      liveIds.add(withImages.id);
+      const previous = this.projectedRowCache.get(withImages.id);
+      if (previous && sameTranscriptItem(previous, withImages)) return previous;
+      this.projectedRowCache.set(withImages.id, withImages);
+      return withImages;
     });
     // Keep the cache bounded to rows that still exist in the accumulator.
     for (const id of this.projectedRowCache.keys()) {

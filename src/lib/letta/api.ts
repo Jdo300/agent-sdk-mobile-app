@@ -230,7 +230,7 @@ function toConversation(record: LettaConversation): ConversationSummary {
 export async function listConversations(
   conn: Connection,
   agentId: string,
-  opts: { before?: string; limit?: number } = {},
+  opts: { before?: string; limit?: number; archiveStatus?: "unarchived" | "archived" | "all" } = {},
 ): Promise<ConversationSummary[]> {
   const limit = opts.limit ?? 30;
   const records = await sdkClient(conn).conversations.list({
@@ -245,6 +245,7 @@ export async function listConversations(
     // a chat app wants anyway.
     orderBy: "lastMessageAt",
     order: "desc",
+    archiveStatus: opts.archiveStatus ?? "unarchived",
     // The management API pages with an `after` cursor in sort order.
     ...(opts.before ? { after: opts.before } : {}),
   });
@@ -259,6 +260,10 @@ export async function createConversation(conn: Connection, agentId: string): Pro
 export async function renameConversation(conn: Connection, conversationId: string, title: string): Promise<void> {
   // The user-facing "title" is the conversation's `summary` field on the wire.
   await sdkClient(conn).conversations.update(conversationId, { summary: title });
+}
+
+export async function setConversationArchived(conn: Connection, conversationId: string, archived: boolean): Promise<void> {
+  await sdkClient(conn).conversations.update(conversationId, { archived });
 }
 
 /** Conversation deletion is supported by Cloud REST and our App Server control protocol. */

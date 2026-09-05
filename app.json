@@ -72,7 +72,9 @@
       ],
       "expo-asset",
       "expo-sqlite",
-      "expo-notifications"
+      "expo-notifications",
+      "expo-image",
+      "expo-status-bar"
     ],
     "experiments": {
       "typedRoutes": true

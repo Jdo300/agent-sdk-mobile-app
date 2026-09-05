@@ -18,6 +18,15 @@ const LOCAL_PROFILE_NAME = process.env.BLOOP_LOCAL_PROFILE_NAME ?? "Local Milo";
 const LOCAL_TARGET = process.env.BLOOP_LOCAL_TARGET ?? "ws://10.0.0.128:4610";
 const LOCAL_TOKEN_FILE = process.env.BLOOP_LOCAL_TOKEN_FILE ?? `${process.env.HOME}/.config/bloop/local-milo-token`;
 
+function localHttpTarget() {
+  const parsed = new URL(LOCAL_TARGET);
+  parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+  parsed.pathname = "/";
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.origin;
+}
+
 function isLoopbackOrigin(origin) {
   if (!origin) return false;
   try {
@@ -131,6 +140,21 @@ bridge.on("listening", () => {
   console.log(`Bloop desktop WebSocket bridge listening on ws://${BRIDGE_HOST}:${BRIDGE_PORT}`);
 });
 
+const LOCAL_VOICE_TARGET = process.env.BLOOP_LOCAL_VOICE_TARGET ?? localHttpTarget();
+const localVoiceProxy = httpProxy.createProxyServer({
+  target: LOCAL_VOICE_TARGET,
+  changeOrigin: false,
+});
+localVoiceProxy.on("proxyReq", (proxyRequest) => {
+  proxyRequest.setHeader("Authorization", `Bearer ${localCapabilityToken()}`);
+});
+localVoiceProxy.on("error", (_error, _req, response) => {
+  if (response && "writeHead" in response && !response.headersSent) {
+    response.writeHead(502, { "Content-Type": "text/plain" });
+    response.end("Local Milo voice service is unavailable");
+  }
+});
+
 const proxy = httpProxy.createProxyServer({
   target: `http://${WEB_HOST}:${EXPO_PORT}`,
   ws: true,
@@ -147,6 +171,13 @@ proxy.on("error", (_error, _req, response) => {
 });
 const web = http.createServer((request, response) => {
   const requestUrl = new URL(request.url ?? "/", `http://${WEB_HOST}:${WEB_PORT}`);
+  if (requestUrl.pathname.startsWith("/__bloop/local-milo/voice/")) {
+    // The browser never receives Local Milo's capability token. This loopback-only
+    // host proxy injects it server-side and forwards Range headers for seekable audio.
+    request.url = `${requestUrl.pathname.replace("/__bloop/local-milo", "")}${requestUrl.search}`;
+    localVoiceProxy.web(request, response);
+    return;
+  }
   if (requestUrl.pathname === "/__bloop/bootstrap") {
     response.writeHead(200, {
       "Content-Type": "application/json",
@@ -190,6 +221,7 @@ const expo = spawn(bunx, ["expo", "start", "--web", "--localhost", "--port", Str
 function shutdown(signal = "SIGTERM") {
   expo.kill(signal);
   proxy.close();
+  localVoiceProxy.close();
   web.close();
   bridge.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1500).unref();

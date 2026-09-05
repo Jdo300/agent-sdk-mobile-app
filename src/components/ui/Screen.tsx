@@ -30,6 +30,8 @@ interface HeaderProps {
   /** Sub-row under the title, e.g. agent identity + status. */
   subtitle?: ReactNode;
   back?: boolean;
+  /** Optional left-side action before the back button/title. */
+  leading?: ReactNode;
   /** Right-side actions. */
   trailing?: ReactNode;
   /** Optional tap target for compact chat headers (conversation details). */
@@ -37,10 +39,11 @@ interface HeaderProps {
   titleAccessibilityLabel?: string;
 }
 
-export function Header({ title, large, subtitle, back, trailing, onTitlePress, titleAccessibilityLabel }: HeaderProps) {
+export function Header({ title, large, subtitle, back, leading, trailing, onTitlePress, titleAccessibilityLabel }: HeaderProps) {
   return (
     <View style={[styles.header, large && styles.headerLarge]}>
       <View style={styles.headerRow}>
+        {leading ? <View style={styles.leading}>{leading}</View> : null}
         {back ? (
           <Touchable
             accessibilityLabel="Back"
@@ -84,6 +87,7 @@ const styles = StyleSheet.create({
   header: { paddingHorizontal: space.gutter, paddingVertical: space.md },
   headerLarge: { paddingTop: space.lg, paddingBottom: space.lg },
   headerRow: { flexDirection: "row", alignItems: "center", gap: space.md },
+  leading: { flexDirection: "row", alignItems: "center" },
   back: { paddingHorizontal: space.xs, minWidth: 32, alignItems: "flex-start" },
   titleBlock: { flex: 1, gap: 2 },
   trailing: { flexDirection: "row", alignItems: "center", gap: space.sm },
