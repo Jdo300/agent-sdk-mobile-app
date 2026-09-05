@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Bloop",
-    "slug": "bloop-agent-chat",
+    "name": "RG Link",
+    "slug": "rg-link",
     "version": "0.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -18,7 +18,7 @@
     ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.example.bloop",
+      "bundleIdentifier": "com.resonancegroup.rglink",
       "infoPlist": {
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true
@@ -72,9 +72,7 @@
       ],
       "expo-asset",
       "expo-sqlite",
-      "expo-notifications",
-      "expo-image",
-      "expo-status-bar"
+      "expo-notifications"
     ],
     "experiments": {
       "typedRoutes": true
