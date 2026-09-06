@@ -24,7 +24,8 @@
           "NSAllowsArbitraryLoads": true
         },
         "NSLocalNetworkUsageDescription": "Bloop connects directly to the local Milo server for chat and voice services."
-      }
+      },
+      "appleTeamId": "L6DX4VDCTF"
     },
     "android": {
       "adaptiveIcon": {
