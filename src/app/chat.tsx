@@ -88,7 +88,7 @@ import {
 } from "../lib/letta/model";
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
 import { pickImages, pickAudio, type Attachment, type AudioAttachment } from "../lib/letta/attachments";
-import { completedAssistantReplies, newestAssistantTimestamp, voiceReplyToAutoSpeak } from "../lib/voiceEligibility";
+import { completedAssistantReplies, newestAssistantTimestamp } from "../lib/voiceEligibility";
 import { getSecret } from "../lib/profiles/profiles";
 import {
   getVoiceMode,
@@ -571,6 +571,7 @@ export default function ChatScreen() {
   const voiceTimestampWatermarkRef = useRef(0);
   const voiceTrackWidthRef = useRef(0);
   const voiceDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 100);
 
@@ -1568,10 +1569,16 @@ const attachImage = useCallback(async () => {
   useEffect(() => {
     const completedAssistants = completedAssistantReplies(snapshot.transcript);
 
+    const cancelPendingVoiceSettle = () => {
+      if (voiceSettleTimerRef.current) clearTimeout(voiceSettleTimerRef.current);
+      voiceSettleTimerRef.current = null;
+    };
+
     // Hydration/catch-up replays historical transcript rows into a fresh screen.
     // Seed those stable ids before observing live completions so opening or
     // reconnecting a conversation can never make old replies speak again.
     if (snapshot.hydrating) {
+      cancelPendingVoiceSettle();
       for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
       voiceTimestampWatermarkRef.current = Math.max(
         voiceTimestampWatermarkRef.current,
@@ -1580,6 +1587,7 @@ const attachImage = useCallback(async () => {
       return;
     }
     if (!voiceHistorySeededRef.current) {
+      cancelPendingVoiceSettle();
       for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
       voiceTimestampWatermarkRef.current = Math.max(
         voiceTimestampWatermarkRef.current,
@@ -1590,56 +1598,76 @@ const attachImage = useCallback(async () => {
     }
     if (!voiceModeLoaded) return;
 
-    // Voice follows completed assistant prose, not the run lifecycle. Milo can
-    // emit a useful assistant message and then continue into more tool calls.
-    // Identity alone is not enough here: reconciliation can re-key an older row.
-    // Only the newest visible completed assistant, newer than our entry/catch-up
-    // watermark, is allowed to trigger automatic speech.
-    const reply = voiceReplyToAutoSpeak(
-      snapshot.transcript,
-      voiceHandledAssistantIdsRef.current,
-      voiceTimestampWatermarkRef.current,
-    );
-    if (!reply) {
-      // Still absorb any historical/re-keyed ids so they cannot become candidates
-      // on a later render after transcript shape changes.
+    // Authoritative history can expose an assistant row before that row has
+    // finished growing. The projection intentionally cannot call those rows
+    // "streaming", so `!item.streaming` alone is NOT proof that speech is final.
+    // Never consume an assistant row while the turn is active. Once device/run
+    // state settles, require one quiet window with an unchanged transcript;
+    // every late history refresh cancels and restarts this timer. This trades a
+    // small amount of latency for reading the complete Milo reply exactly once.
+    if (running || aborting) {
+      cancelPendingVoiceSettle();
+      return;
+    }
+
+    const candidates = completedAssistants.filter((item) => {
+      if (voiceHandledAssistantIdsRef.current.has(item.id)) return false;
+      if (
+        typeof item.occurredAt === "number" &&
+        Number.isFinite(item.occurredAt) &&
+        item.occurredAt <= voiceTimestampWatermarkRef.current
+      ) return false;
+      return true;
+    });
+
+    if (candidates.length === 0) {
+      cancelPendingVoiceSettle();
+      // Absorb historical/re-keyed ids so they cannot become candidates later.
       for (const item of completedAssistants) {
         if ((item.occurredAt ?? 0) <= voiceTimestampWatermarkRef.current) {
           voiceHandledAssistantIdsRef.current.add(item.id);
         }
       }
-
-      return;
-    }
-    voiceHandledAssistantIdsRef.current.add(reply.id);
-    if (typeof reply.occurredAt === "number" && Number.isFinite(reply.occurredAt)) {
-      voiceTimestampWatermarkRef.current = Math.max(voiceTimestampWatermarkRef.current, reply.occurredAt);
-    }
-
-    if (voiceMode === "off") return;
-    const speakableText = prepareSpeechText(reply.text);
-    clearVoiceDismissTimer();
-    // Auto voice is serialized: a newly completed assistant block must never
-    // cut off a block that is already speaking. Tap/replay mode can still
-    // replace the current clip because that is an explicit user action.
-    if (voiceMode !== "auto") retireVoicePlayer();
-    if (!speakableText) {
-      setVoiceReply(null);
       return;
     }
 
-    setVoiceReply({ id: reply.id, text: speakableText });
-    if (voiceMode === "auto") {
-      enqueueAutoVoiceText(speakableText);
-    } else {
-      scheduleVoiceReplyCollapse(15000);
-    }
+    cancelPendingVoiceSettle();
+    voiceSettleTimerRef.current = setTimeout(() => {
+      voiceSettleTimerRef.current = null;
+
+      // A single Milo turn may persist prose in more than one assistant row
+      // around tool calls. Speak all new prose in transcript order as one clip,
+      // rather than marking the first partial row handled and losing the rest.
+      for (const item of candidates) {
+        voiceHandledAssistantIdsRef.current.add(item.id);
+        if (typeof item.occurredAt === "number" && Number.isFinite(item.occurredAt)) {
+          voiceTimestampWatermarkRef.current = Math.max(voiceTimestampWatermarkRef.current, item.occurredAt);
+        }
+      }
+
+      if (voiceMode === "off") return;
+      const speakableText = prepareSpeechText(candidates.map((item) => item.text).join("\n\n"));
+      clearVoiceDismissTimer();
+      if (voiceMode !== "auto") retireVoicePlayer();
+      if (!speakableText) {
+        setVoiceReply(null);
+        return;
+      }
+
+      const replyId = candidates[candidates.length - 1]?.id ?? `voice-${Date.now()}`;
+      setVoiceReply({ id: replyId, text: speakableText });
+      if (voiceMode === "auto") enqueueAutoVoiceText(speakableText);
+      else scheduleVoiceReplyCollapse(15000);
+    }, 850);
+
+    return cancelPendingVoiceSettle;
   }, [
     snapshot.hydrating,
     snapshot.transcript,
+    running,
+    aborting,
     voiceMode,
     voiceModeLoaded,
-    playVoiceText,
     enqueueAutoVoiceText,
     retireVoicePlayer,
     clearVoiceDismissTimer,
@@ -2127,7 +2155,11 @@ const attachImage = useCallback(async () => {
       )}
       <View style={styles.desktopChatFrame}>
       <TextScaleProvider scale={isDesktopWeb ? desktopTextScale : 1}>
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.flex}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        keyboardVerticalOffset={Platform.OS === "ios" ? -insets.bottom : 0}
+        style={styles.flex}
+      >
         <View style={styles.flex}>
           {transcriptList}
           {/* Anchored to the list's own bottom edge, so it clears the composer
