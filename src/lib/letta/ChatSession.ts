@@ -47,6 +47,16 @@ import { streamDisposition } from "./streamDisposition";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
+export interface VoiceCompletion {
+  /** Stable for a completed SDK turn whenever Letta supplies run IDs. */
+  id: string;
+  /** Complete assistant prose accumulated by the SDK for that turn. */
+  text: string;
+  runIds: string[];
+}
+
+export type VoiceCompletionListener = (completion: VoiceCompletion) => void;
+
 /**
  * How long a resolved approval waits for evidence the decision reached the
  * server. The SDK sends the approval_response fire-and-forget, so subsequent
@@ -144,6 +154,12 @@ export class ChatSession {
   private session: LettaCodeSession | null = null;
   private snapshot: ChatSnapshot;
   private listeners = new Set<SnapshotListener>();
+  /**
+   * Ephemeral, protocol-final voice events. These are deliberately not part of
+   * ChatSnapshot: a newly-mounted/reconnected view must never replay old speech.
+   */
+  private voiceCompletionListeners = new Set<VoiceCompletionListener>();
+  private publishedVoiceCompletionIds = new Set<string>();
   private closed = false;
   /** Number of mounted ChatScreen views currently attached to this session. */
   private viewRefs = 0;
@@ -386,6 +402,16 @@ export class ChatSession {
     this.listeners.add(listener);
     listener(this.snapshot);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to assistant prose only when the Agent SDK has deterministically
+   * completed the turn (`stop_reason` -> SDK `result`). Unlike transcript
+   * subscriptions, this never replays the current/previous value to a new view.
+   */
+  subscribeVoiceCompletions(listener: VoiceCompletionListener): () => void {
+    this.voiceCompletionListeners.add(listener);
+    return () => this.voiceCompletionListeners.delete(listener);
   }
 
   current(): ChatSnapshot {
@@ -1225,6 +1251,8 @@ export class ChatSession {
     publishActivity(this.conversationId, null);
     this.session?.close();
     this.listeners.clear();
+    this.voiceCompletionListeners.clear();
+    this.publishedVoiceCompletionIds.clear();
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────
@@ -1598,9 +1626,36 @@ export class ChatSession {
     // Control/status messages remain on the SDK stream.
     const next = this.reduce(this.snapshot, message);
     this.commit(next);
-    if (message.type === "result" || message.type === "error") {
+    if (message.type === "result") {
+      this.publishVoiceCompletion(message);
+      this.scheduleAuthoritativeHistoryRefresh(0);
+    } else if (message.type === "error") {
       this.scheduleAuthoritativeHistoryRefresh(0);
     }
+  }
+
+  /**
+   * `SDKResultMessage.result` is built by the Agent SDK from every
+   * `assistant_message` observed for the active turn and is emitted only after
+   * the protocol's terminal stop/result transition. That is the speech boundary:
+   * no transcript quiet-window or network-latency timer is involved.
+   */
+  private publishVoiceCompletion(message: Extract<SDKMessage, { type: "result" }>): void {
+    if (!message.success || typeof message.result !== "string" || !message.result.trim()) return;
+    const runIds = message.runIds?.filter(Boolean) ?? [];
+    const id = runIds.length > 0
+      ? `voice-result:${this.conversationId}:${runIds.join(",")}`
+      : `voice-result:${this.conversationId}:${this.counter++}`;
+    // A resumed viewer can replay terminal protocol bookkeeping. Never speak the
+    // same completed run twice while this ChatSession is alive.
+    if (this.publishedVoiceCompletionIds.has(id)) return;
+    this.publishedVoiceCompletionIds.add(id);
+    if (this.publishedVoiceCompletionIds.size > 200) {
+      const oldest = this.publishedVoiceCompletionIds.values().next().value;
+      if (oldest) this.publishedVoiceCompletionIds.delete(oldest);
+    }
+    const completion: VoiceCompletion = { id, text: message.result, runIds };
+    for (const listener of this.voiceCompletionListeners) listener(completion);
   }
 
 

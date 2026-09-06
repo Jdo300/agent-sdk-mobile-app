@@ -88,7 +88,6 @@ import {
 } from "../lib/letta/model";
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
 import { pickImages, pickAudio, type Attachment, type AudioAttachment } from "../lib/letta/attachments";
-import { completedAssistantReplies, newestAssistantTimestamp } from "../lib/voiceEligibility";
 import { getSecret } from "../lib/profiles/profiles";
 import {
   getVoiceMode,
@@ -566,12 +565,12 @@ export default function ChatScreen() {
   const voiceInputActiveRef = useRef(false);
   const voicePausedForInputRef = useRef(false);
   const playVoiceTextRef = useRef<((text: string) => Promise<void>) | null>(null);
-  const voiceHandledAssistantIdsRef = useRef(new Set<string>());
-  const voiceHistorySeededRef = useRef(false);
-  const voiceTimestampWatermarkRef = useRef(0);
+  const voiceModeRef = useRef<VoiceMode>(voiceMode);
+  const voiceModeLoadedRef = useRef(voiceModeLoaded);
+  const pendingVoiceCompletionsRef = useRef<Array<{ id: string; text: string }>>([]);
+  const voiceCompletionHandlerRef = useRef<(completion: { id: string; text: string }) => void>(() => {});
   const voiceTrackWidthRef = useRef(0);
   const voiceDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const voiceSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 100);
 
@@ -935,16 +934,45 @@ export default function ChatScreen() {
 
   const enqueueAutoVoiceText = useCallback((text: string) => {
     if (!text.trim()) return;
-    // The transcript projection already tells us when an assistant block has
-    // stopped being the live/streaming edge (cursor disappears because a tool,
-    // reasoning block, or another row took over).  Queue those completed blocks
-    // in order instead of interrupting whatever TTS is currently playing.
+    // Only protocol-final assistant text reaches this queue. Playback ordering is
+    // driven by the native player's completion callback, never by network quiet
+    // periods or guessed message-boundary delays.
     if (voiceInputActiveRef.current || voicePlayerRef.current || voicePlaying || voiceAutoQueueRef.current.length > 0) {
       voiceAutoQueueRef.current.push(text);
       return;
     }
     void playVoiceText(text);
   }, [playVoiceText, voicePlaying]);
+
+  // Keep the completion listener stable across ChatSession lifetime changes. The
+  // Agent SDK emits this only after a terminal stop/result transition, so this
+  // path has no transcript-settle or network-latency timer.
+  voiceModeRef.current = voiceMode;
+  voiceModeLoadedRef.current = voiceModeLoaded;
+  voiceCompletionHandlerRef.current = (completion) => {
+    if (!voiceModeLoadedRef.current) {
+      pendingVoiceCompletionsRef.current.push(completion);
+      return;
+    }
+    const mode = voiceModeRef.current;
+    if (mode === "off") return;
+    const speakableText = prepareSpeechText(completion.text);
+    clearVoiceDismissTimer();
+    if (mode !== "auto") retireVoicePlayer();
+    if (!speakableText) {
+      setVoiceReply(null);
+      return;
+    }
+    setVoiceReply({ id: completion.id, text: speakableText });
+    if (mode === "auto") enqueueAutoVoiceText(speakableText);
+    else scheduleVoiceReplyCollapse(15000);
+  };
+
+  useEffect(() => {
+    if (!voiceModeLoaded) return;
+    const pending = pendingVoiceCompletionsRef.current.splice(0);
+    for (const completion of pending) voiceCompletionHandlerRef.current(completion);
+  }, [voiceModeLoaded]);
 
   useEffect(() => {
     const inputActive = voiceRecording || transcribingVoice;
@@ -1312,6 +1340,7 @@ const attachImage = useCallback(async () => {
     let cancelled = false;
     let opened: ChatSession | null = null;
     let unsubscribe: (() => void) | null = null;
+    let unsubscribeVoice: (() => void) | null = null;
     void (async () => {
       try {
         const [secretValue, savedPermission] = await Promise.all([
@@ -1338,6 +1367,9 @@ const attachImage = useCallback(async () => {
         // snapshot-time scroll races layout, since the hydration batch measures
         // after the scroll fires.
         unsubscribe = session.subscribe(setSnapshot);
+        unsubscribeVoice = session.subscribeVoiceCompletions((completion) => {
+          voiceCompletionHandlerRef.current(completion);
+        });
       } catch (error) {
         if (!cancelled) {
           setSnapshot({
@@ -1351,6 +1383,8 @@ const attachImage = useCallback(async () => {
     return () => {
       cancelled = true;
       unsubscribe?.();
+      unsubscribeVoice?.();
+      pendingVoiceCompletionsRef.current = [];
       opened?.releaseView();
       if (sessionRef.current === opened) sessionRef.current = null;
     };
@@ -1566,113 +1600,6 @@ const attachImage = useCallback(async () => {
     };
   }, [running, aborting, voiceRecording, transcribingVoice]);
 
-  useEffect(() => {
-    const completedAssistants = completedAssistantReplies(snapshot.transcript);
-
-    const cancelPendingVoiceSettle = () => {
-      if (voiceSettleTimerRef.current) clearTimeout(voiceSettleTimerRef.current);
-      voiceSettleTimerRef.current = null;
-    };
-
-    // Hydration/catch-up replays historical transcript rows into a fresh screen.
-    // Seed those stable ids before observing live completions so opening or
-    // reconnecting a conversation can never make old replies speak again.
-    if (snapshot.hydrating) {
-      cancelPendingVoiceSettle();
-      for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
-      voiceTimestampWatermarkRef.current = Math.max(
-        voiceTimestampWatermarkRef.current,
-        newestAssistantTimestamp(snapshot.transcript),
-      );
-      return;
-    }
-    if (!voiceHistorySeededRef.current) {
-      cancelPendingVoiceSettle();
-      for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
-      voiceTimestampWatermarkRef.current = Math.max(
-        voiceTimestampWatermarkRef.current,
-        newestAssistantTimestamp(snapshot.transcript),
-      );
-      voiceHistorySeededRef.current = true;
-      return;
-    }
-    if (!voiceModeLoaded) return;
-
-    // Authoritative history can expose an assistant row before that row has
-    // finished growing. The projection intentionally cannot call those rows
-    // "streaming", so `!item.streaming` alone is NOT proof that speech is final.
-    // Never consume an assistant row while the turn is active. Once device/run
-    // state settles, require one quiet window with an unchanged transcript;
-    // every late history refresh cancels and restarts this timer. This trades a
-    // small amount of latency for reading the complete Milo reply exactly once.
-    if (running || aborting) {
-      cancelPendingVoiceSettle();
-      return;
-    }
-
-    const candidates = completedAssistants.filter((item) => {
-      if (voiceHandledAssistantIdsRef.current.has(item.id)) return false;
-      if (
-        typeof item.occurredAt === "number" &&
-        Number.isFinite(item.occurredAt) &&
-        item.occurredAt <= voiceTimestampWatermarkRef.current
-      ) return false;
-      return true;
-    });
-
-    if (candidates.length === 0) {
-      cancelPendingVoiceSettle();
-      // Absorb historical/re-keyed ids so they cannot become candidates later.
-      for (const item of completedAssistants) {
-        if ((item.occurredAt ?? 0) <= voiceTimestampWatermarkRef.current) {
-          voiceHandledAssistantIdsRef.current.add(item.id);
-        }
-      }
-      return;
-    }
-
-    cancelPendingVoiceSettle();
-    voiceSettleTimerRef.current = setTimeout(() => {
-      voiceSettleTimerRef.current = null;
-
-      // A single Milo turn may persist prose in more than one assistant row
-      // around tool calls. Speak all new prose in transcript order as one clip,
-      // rather than marking the first partial row handled and losing the rest.
-      for (const item of candidates) {
-        voiceHandledAssistantIdsRef.current.add(item.id);
-        if (typeof item.occurredAt === "number" && Number.isFinite(item.occurredAt)) {
-          voiceTimestampWatermarkRef.current = Math.max(voiceTimestampWatermarkRef.current, item.occurredAt);
-        }
-      }
-
-      if (voiceMode === "off") return;
-      const speakableText = prepareSpeechText(candidates.map((item) => item.text).join("\n\n"));
-      clearVoiceDismissTimer();
-      if (voiceMode !== "auto") retireVoicePlayer();
-      if (!speakableText) {
-        setVoiceReply(null);
-        return;
-      }
-
-      const replyId = candidates[candidates.length - 1]?.id ?? `voice-${Date.now()}`;
-      setVoiceReply({ id: replyId, text: speakableText });
-      if (voiceMode === "auto") enqueueAutoVoiceText(speakableText);
-      else scheduleVoiceReplyCollapse(15000);
-    }, 850);
-
-    return cancelPendingVoiceSettle;
-  }, [
-    snapshot.hydrating,
-    snapshot.transcript,
-    running,
-    aborting,
-    voiceMode,
-    voiceModeLoaded,
-    enqueueAutoVoiceText,
-    retireVoicePlayer,
-    clearVoiceDismissTimer,
-    scheduleVoiceReplyCollapse,
-  ]);
 
   const refreshAgentSecrets = useCallback(async () => {
     const session = sessionRef.current;
