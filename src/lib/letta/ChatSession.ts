@@ -44,7 +44,6 @@ import {
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
-import { isAssistantContentBlockBoundary } from "./voiceProtocol";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -1661,11 +1660,9 @@ export class ChatSession {
    * voice segmentation. Visible transcript state still comes exclusively from
    * authoritative App Server history.
    *
-   * Consecutive `assistant` deltas are one speech segment. The assistant
-   * content block's own protocol stop event finalizes it immediately; a later
-   * reasoning/tool transition remains a defensive fallback for servers that do
-   * not expose block lifecycle events. The terminal SDK `result` frame also
-   * finalizes a trailing assistant segment.
+   * Each typed SDK `assistant` record is a completed logical prose segment, so
+   * voice publishes it immediately. Reasoning/tool/result transitions remain
+   * defensive fallbacks for compatibility with older transports.
    */
   private observeLiveVoiceProtocol(message: SDKMessage): void {
     if (message.type === "assistant") {
@@ -1689,18 +1686,19 @@ export class ChatSession {
         this.liveVoiceSegment.text += text;
         if (message.seqId !== undefined) this.liveVoiceSegment.lastSeqId = message.seqId;
       }
+
+      // SDK `assistant` records are completed logical assistant messages, not
+      // token deltas. A run may emit several of them around reasoning/tool work,
+      // which is why the SDK accumulates assistantText across the whole turn.
+      // Voice is segment-oriented, so publish this completed prose immediately
+      // instead of waiting for a later reasoning/tool/result record to prove it.
+      this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
       return;
     }
 
-    // Raw stream events must never contribute text (that would double-count the
-    // typed SDK deltas), but their content-block lifecycle is the earliest
-    // protocol-authored proof that the assistant segment itself is complete.
-    if (message.type === "stream_event") {
-      if (isAssistantContentBlockBoundary(message)) {
-        this.flushLiveVoiceSegment();
-      }
-      return;
-    }
+    // Raw stream events are companion/replay telemetry and must never contribute
+    // voice text or completion boundaries; doing so can duplicate typed records.
+    if (message.type === "stream_event") return;
 
     // Any typed move away from assistant prose remains a defensive end-of-segment
     // marker. This includes reasoning, a tool call, and a tool result.
