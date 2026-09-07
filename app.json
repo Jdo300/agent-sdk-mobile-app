@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "RG Agent Link",
-    "slug": "rg-link",
+    "slug": "bloop-agent-chat",
     "version": "0.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
