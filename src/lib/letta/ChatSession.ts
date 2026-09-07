@@ -44,6 +44,7 @@ import {
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
+import { isAssistantContentBlockBoundary } from "./voiceProtocol";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -1660,11 +1661,13 @@ export class ChatSession {
    * voice segmentation. Visible transcript state still comes exclusively from
    * authoritative App Server history.
    *
-   * Consecutive `assistant` deltas are one speech segment. The first typed
-   * transition to reasoning/tool traffic finalizes that segment immediately.
-   * The terminal SDK `result` frame finalizes a trailing assistant segment.
+   * Consecutive `assistant` deltas are one speech segment. The assistant
+   * content block's own protocol stop event finalizes it immediately; a later
+   * reasoning/tool transition remains a defensive fallback for servers that do
+   * not expose block lifecycle events. The terminal SDK `result` frame also
+   * finalizes a trailing assistant segment.
    */
-  private observeLiveVoiceProtocol(message: Extract<SDKMessage, { type: "assistant" | "reasoning" | "tool_call" | "tool_result" | "stream_event" }>): void {
+  private observeLiveVoiceProtocol(message: SDKMessage): void {
     if (message.type === "assistant") {
       const text = message.content;
       if (!text) return;
@@ -1689,14 +1692,25 @@ export class ChatSession {
       return;
     }
 
-    // `stream_event` is the raw companion/replay representation and would double
-    // count typed SDK messages. Typed assistant/reasoning/tool messages above are
-    // the voice-control surface; raw stream events remain telemetry only.
-    if (message.type === "stream_event") return;
+    // Raw stream events must never contribute text (that would double-count the
+    // typed SDK deltas), but their content-block lifecycle is the earliest
+    // protocol-authored proof that the assistant segment itself is complete.
+    if (message.type === "stream_event") {
+      if (isAssistantContentBlockBoundary(message)) {
+        this.flushLiveVoiceSegment();
+      }
+      return;
+    }
 
-    // Any typed move away from assistant prose is a deterministic end-of-segment
+    // Any typed move away from assistant prose remains a defensive end-of-segment
     // marker. This includes reasoning, a tool call, and a tool result.
-    this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
+    if (
+      message.type === "reasoning" ||
+      message.type === "tool_call" ||
+      message.type === "tool_result"
+    ) {
+      this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
+    }
   }
 
   private flushLiveVoiceSegment(runIds: string[] = []): void {
