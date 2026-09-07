@@ -77,6 +77,12 @@
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "owner": "jdo300",
+    "extra": {
+      "eas": {
+        "projectId": "b0f9e8c7-f68f-4041-9811-3edb65f9a0dc"
+      }
     }
   }
 }
