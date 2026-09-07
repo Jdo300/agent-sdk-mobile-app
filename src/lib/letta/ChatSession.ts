@@ -44,6 +44,7 @@ import {
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
+import { liveAssistantSegmentIsPersisted } from "./voicePersistence";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -1163,6 +1164,7 @@ export class ChatSession {
       this.nextBefore = page.nextBefore;
       this.accumulator = rebuildAuthoritativeTranscript(page.messages);
       this.captureHistoryTimestamps(page.messages);
+      this.flushLiveVoiceSegmentIfPersisted(page.messages);
       this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
     } catch {
       // The viewer/control transport remains responsible for connection UI. A
@@ -1660,9 +1662,10 @@ export class ChatSession {
    * voice segmentation. Visible transcript state still comes exclusively from
    * authoritative App Server history.
    *
-   * Each typed SDK `assistant` record is a completed logical prose segment, so
-   * voice publishes it immediately. Reasoning/tool/result transitions remain
-   * defensive fallbacks for compatibility with older transports.
+   * Typed SDK `assistant` records are streaming text chunks and are accumulated
+   * into one speech segment. Authoritative persisted history finalizes that
+   * segment as soon as the complete assistant message appears there; later
+   * reasoning/tool/result transitions remain defensive fallbacks.
    */
   private observeLiveVoiceProtocol(message: SDKMessage): void {
     if (message.type === "assistant") {
@@ -1687,12 +1690,6 @@ export class ChatSession {
         if (message.seqId !== undefined) this.liveVoiceSegment.lastSeqId = message.seqId;
       }
 
-      // SDK `assistant` records are completed logical assistant messages, not
-      // token deltas. A run may emit several of them around reasoning/tool work,
-      // which is why the SDK accumulates assistantText across the whole turn.
-      // Voice is segment-oriented, so publish this completed prose immediately
-      // instead of waiting for a later reasoning/tool/result record to prove it.
-      this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
       return;
     }
 
@@ -1709,6 +1706,14 @@ export class ChatSession {
     ) {
       this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
     }
+  }
+
+
+  private flushLiveVoiceSegmentIfPersisted(messages: readonly unknown[]): void {
+    const segment = this.liveVoiceSegment;
+    if (!segment || !segment.text.trim()) return;
+    if (!liveAssistantSegmentIsPersisted(messages, segment.text, segment.runId)) return;
+    this.flushLiveVoiceSegment(segment.runId ? [segment.runId] : []);
   }
 
   private flushLiveVoiceSegment(runIds: string[] = []): void {
