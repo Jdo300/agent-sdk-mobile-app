@@ -160,6 +160,18 @@ export class ChatSession {
    */
   private voiceCompletionListeners = new Set<VoiceCompletionListener>();
   private publishedVoiceCompletionIds = new Set<string>();
+  /**
+   * Assistant text currently being emitted by the live protocol. A segment is
+   * finalized only by an explicit protocol transition away from `assistant`, or
+   * by the terminal SDK `result` frame. No elapsed-time inference is involved.
+   */
+  private liveVoiceSegment: {
+    runId?: string;
+    firstSeqId?: number;
+    lastSeqId?: number;
+    firstUuid: string;
+    text: string;
+  } | null = null;
   private closed = false;
   /** Number of mounted ChatScreen views currently attached to this session. */
   private viewRefs = 0;
@@ -1253,6 +1265,7 @@ export class ChatSession {
     this.listeners.clear();
     this.voiceCompletionListeners.clear();
     this.publishedVoiceCompletionIds.clear();
+    this.liveVoiceSegment = null;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────
@@ -1604,17 +1617,20 @@ export class ChatSession {
       emitSyncTelemetry({ ...event, conversationId: this.conversationId });
     }
     if (streamDisposition(message) === "authoritative_history") {
-      // Resume streams can replay old runs without seq_id. Consuming them keeps
-      // the SDK queue healthy, but canonical transcript state comes only from
-      // App Server history. Idle replay is discarded without even refreshing;
-      // active work uses one serialized management-history refresh path.
-      if (
+      // Resume streams can replay old runs without seq_id. They still never
+      // mutate canonical transcript state. Voice may observe typed live deltas,
+      // but only while the executing device/locally-submitted turn is known to
+      // be active; idle replay is ignored completely.
+      const liveTurnKnown =
         this.deviceIsProcessing ||
         this.snapshot.run === "running" ||
         this.snapshot.run === "awaiting_approval" ||
-        this.echoOtids.size > 0
-      ) {
+        this.echoOtids.size > 0;
+      if (liveTurnKnown) {
+        this.observeLiveVoiceProtocol(message);
         this.scheduleAuthoritativeHistoryRefresh(0);
+      } else {
+        this.liveVoiceSegment = null;
       }
       return;
     }
@@ -1627,34 +1643,77 @@ export class ChatSession {
     const next = this.reduce(this.snapshot, message);
     this.commit(next);
     if (message.type === "result") {
-      this.publishVoiceCompletion(message);
+      // `result` is the deterministic final boundary for any assistant segment
+      // that was not followed by reasoning/tool traffic. Do not use result.text
+      // itself here: it contains all assistant prose from the turn and would
+      // duplicate segments already emitted at earlier protocol transitions.
+      this.flushLiveVoiceSegment(message.runIds ?? []);
       this.scheduleAuthoritativeHistoryRefresh(0);
     } else if (message.type === "error") {
+      this.liveVoiceSegment = null;
       this.scheduleAuthoritativeHistoryRefresh(0);
     }
   }
 
   /**
-   * `SDKResultMessage.result` is built by the Agent SDK from every
-   * `assistant_message` observed for the active turn and is emitted only after
-   * the protocol's terminal stop/result transition. That is the speech boundary:
-   * no transcript quiet-window or network-latency timer is involved.
+   * Observe transcript-bearing SDK deltas for one purpose only: deterministic
+   * voice segmentation. Visible transcript state still comes exclusively from
+   * authoritative App Server history.
+   *
+   * Consecutive `assistant` deltas are one speech segment. The first typed
+   * transition to reasoning/tool traffic finalizes that segment immediately.
+   * The terminal SDK `result` frame finalizes a trailing assistant segment.
    */
-  private publishVoiceCompletion(message: Extract<SDKMessage, { type: "result" }>): void {
-    if (!message.success || typeof message.result !== "string" || !message.result.trim()) return;
-    const runIds = message.runIds?.filter(Boolean) ?? [];
-    const id = runIds.length > 0
-      ? `voice-result:${this.conversationId}:${runIds.join(",")}`
-      : `voice-result:${this.conversationId}:${this.counter++}`;
-    // A resumed viewer can replay terminal protocol bookkeeping. Never speak the
-    // same completed run twice while this ChatSession is alive.
+  private observeLiveVoiceProtocol(message: Extract<SDKMessage, { type: "assistant" | "reasoning" | "tool_call" | "tool_result" | "stream_event" }>): void {
+    if (message.type === "assistant") {
+      const text = message.content;
+      if (!text) return;
+      const current = this.liveVoiceSegment;
+      // A run-id change is itself an authoritative lineage boundary. Flush the
+      // previous live segment before accepting text from the new run.
+      if (current && current.runId && message.runId && current.runId !== message.runId) {
+        this.flushLiveVoiceSegment(current.runId ? [current.runId] : []);
+      }
+      if (!this.liveVoiceSegment) {
+        this.liveVoiceSegment = {
+          runId: message.runId,
+          firstSeqId: message.seqId,
+          lastSeqId: message.seqId,
+          firstUuid: message.uuid,
+          text,
+        };
+      } else {
+        this.liveVoiceSegment.text += text;
+        if (message.seqId !== undefined) this.liveVoiceSegment.lastSeqId = message.seqId;
+      }
+      return;
+    }
+
+    // `stream_event` is the raw companion/replay representation and would double
+    // count typed SDK messages. Typed assistant/reasoning/tool messages above are
+    // the voice-control surface; raw stream events remain telemetry only.
+    if (message.type === "stream_event") return;
+
+    // Any typed move away from assistant prose is a deterministic end-of-segment
+    // marker. This includes reasoning, a tool call, and a tool result.
+    this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
+  }
+
+  private flushLiveVoiceSegment(runIds: string[] = []): void {
+    const segment = this.liveVoiceSegment;
+    this.liveVoiceSegment = null;
+    if (!segment || !segment.text.trim()) return;
+    const effectiveRunIds = runIds.length > 0 ? runIds : segment.runId ? [segment.runId] : [];
+    const id = segment.runId && segment.firstSeqId !== undefined
+      ? `voice-segment:${this.conversationId}:${segment.runId}:${segment.firstSeqId}:${segment.lastSeqId ?? segment.firstSeqId}`
+      : `voice-segment:${this.conversationId}:${segment.runId ?? "run"}:${segment.firstUuid}`;
     if (this.publishedVoiceCompletionIds.has(id)) return;
     this.publishedVoiceCompletionIds.add(id);
     if (this.publishedVoiceCompletionIds.size > 200) {
       const oldest = this.publishedVoiceCompletionIds.values().next().value;
       if (oldest) this.publishedVoiceCompletionIds.delete(oldest);
     }
-    const completion: VoiceCompletion = { id, text: message.result, runIds };
+    const completion: VoiceCompletion = { id, text: segment.text, runIds: effectiveRunIds };
     for (const listener of this.voiceCompletionListeners) listener(completion);
   }
 
