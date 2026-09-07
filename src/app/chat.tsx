@@ -2084,7 +2084,7 @@ const attachImage = useCallback(async () => {
       <TextScaleProvider scale={isDesktopWeb ? desktopTextScale : 1}>
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
-        keyboardVerticalOffset={Platform.OS === "ios" ? -insets.bottom : 0}
+        keyboardVerticalOffset={0}
         style={styles.flex}
       >
         <View style={styles.flex}>
