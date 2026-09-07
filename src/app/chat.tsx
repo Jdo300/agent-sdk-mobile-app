@@ -14,7 +14,6 @@ import {
   AppState,
   FlatList,
   Keyboard,
-  KeyboardAvoidingView,
   Platform,
   StyleSheet,
   TextInput,
@@ -504,17 +503,36 @@ export default function ChatScreen() {
   const params = useLocalSearchParams<{ conversationId: string; agentId: string; agentName?: string; title?: string; autosend?: string }>();
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
-  const { width: windowWidth } = useWindowDimensions();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const isDesktopWeb = Platform.OS === "web" && windowWidth >= 1000;
   const [desktopDrawerOpen, setDesktopDrawerOpen] = useState(() => storedDesktopBoolean(DESKTOP_SIDEBAR_KEY, false));
   const [desktopTextScale, setDesktopTextScale] = useState(() => storedDesktopScale());
   const [desktopComposerHeight, setDesktopComposerHeight] = useState(128);
+  const [keyboardBottomInset, setKeyboardBottomInset] = useState(0);
   const { activeProfile } = useProfiles();
 
   useEffect(() => {
     if (!isDesktopWeb) return;
     try { globalThis.localStorage?.setItem(DESKTOP_SIDEBAR_KEY, String(desktopDrawerOpen)); } catch { /* storage unavailable */ }
   }, [isDesktopWeb, desktopDrawerOpen]);
+
+  useEffect(() => {
+    if (Platform.OS !== "ios") return;
+
+    const updateKeyboardInset = (event: Parameters<Parameters<typeof Keyboard.addListener>[1]>[0]) => {
+      // Use the keyboard's actual on-screen frame, not a guessed keyboard height.
+      // screenY also handles accessibility keyboards and partially/floating keyboards.
+      setKeyboardBottomInset(Math.max(0, Math.round(windowHeight - event.endCoordinates.screenY)));
+    };
+    const frameSub = Keyboard.addListener("keyboardWillChangeFrame", updateKeyboardInset);
+    const showSub = Keyboard.addListener("keyboardWillShow", updateKeyboardInset);
+    const hideSub = Keyboard.addListener("keyboardWillHide", () => setKeyboardBottomInset(0));
+    return () => {
+      frameSub.remove();
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [windowHeight]);
 
   useEffect(() => {
     if (!isDesktopWeb) return;
@@ -2082,10 +2100,11 @@ const attachImage = useCallback(async () => {
       )}
       <View style={styles.desktopChatFrame}>
       <TextScaleProvider scale={isDesktopWeb ? desktopTextScale : 1}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-        keyboardVerticalOffset={0}
-        style={styles.flex}
+      <View
+        style={[
+          styles.flex,
+          Platform.OS === "ios" && keyboardBottomInset > 0 ? { paddingBottom: keyboardBottomInset } : null,
+        ]}
       >
         <View style={styles.flex}>
           {transcriptList}
@@ -2134,7 +2153,11 @@ const attachImage = useCallback(async () => {
             {
               borderColor: colors.surfaceEdge,
               paddingTop: isDesktopWeb ? 2 : space.md,
-              paddingBottom: isDesktopWeb ? 1 : Math.max(insets.bottom, space.md),
+              paddingBottom: isDesktopWeb
+                ? 1
+                : keyboardBottomInset > 0
+                  ? space.md
+                  : Math.max(insets.bottom, space.md),
               gap: isDesktopWeb ? 1 : space.sm,
             },
           ]}
@@ -2548,7 +2571,7 @@ const attachImage = useCallback(async () => {
             ) : null}
           </View>
         </View>
-      </KeyboardAvoidingView>
+      </View>
       </TextScaleProvider>
       </View>
         </View>
