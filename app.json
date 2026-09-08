@@ -23,7 +23,8 @@
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true
         },
-        "NSLocalNetworkUsageDescription": "Bloop connects directly to the local Milo server for chat and voice services."
+        "NSLocalNetworkUsageDescription": "Bloop connects directly to the local Milo server for chat and voice services.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -67,7 +68,8 @@
       [
         "expo-audio",
         {
-          "microphonePermission": "Allow Local Milo to record voice messages."
+          "microphonePermission": "Allow Local Milo to record voice messages.",
+          "enableBackgroundPlayback": true
         }
       ],
       "expo-asset",

@@ -769,7 +769,7 @@ export default function ChatScreen() {
       voiceInputActiveRef.current = false;
       setVoiceRecording(false);
       setVoiceError(null);
-      await setAudioModeAsync({ allowsRecording: false });
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true, shouldPlayInBackground: true });
     }
   }, [recorder, recorderState.isRecording, stopBrowserVoiceMeter]);
 
@@ -865,7 +865,7 @@ export default function ChatScreen() {
       voiceInputActiveRef.current = false;
       setTranscribingVoice(false);
       setTranscriptionProgress(null);
-      await setAudioModeAsync({ allowsRecording: false });
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true, shouldPlayInBackground: true });
       voiceTrace(traceId, "voice_flow_finally");
       voiceTraceIdRef.current = null;
     }
@@ -901,7 +901,7 @@ export default function ChatScreen() {
       setVoiceError(null);
       // Playback should be reliable regardless of whether the microphone was
       // used first, and should remain audible with the iPhone silent switch on.
-      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true, shouldPlayInBackground: true });
       const token = sessionRef.current?.authToken() ?? (await getSecret(activeProfile.id)) ?? "";
       if (requestId !== voicePlayRequestRef.current) return;
       const officeBrowser = Platform.OS === "web" && activeProfile.id === "profile-local-milo-office";
@@ -1001,7 +1001,7 @@ export default function ChatScreen() {
     // specifically for recording; otherwise drain the assistant TTS queue.
     if (voicePausedForInputRef.current && voicePlayerRef.current) {
       voicePausedForInputRef.current = false;
-      void setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).then(() => {
+      void setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true, shouldPlayInBackground: true }).then(() => {
         if (voiceInputActiveRef.current || !voicePlayerRef.current) return;
         voicePlayerRef.current.play();
         setVoicePlaying(true);
