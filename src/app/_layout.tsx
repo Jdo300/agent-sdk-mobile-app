@@ -5,18 +5,30 @@
  */
 import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import Constants, { ExecutionEnvironment } from "expo-constants";
-import { router, Stack } from "expo-router";
-import { useEffect } from "react";
+import { router, Stack, useGlobalSearchParams, usePathname } from "expo-router";
+import { useEffect, useRef } from "react";
 import { Platform } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
-import { routeForMiloNotification } from "../lib/notificationRouting";
+import { notificationRouteAlreadyActive, routeForMiloNotification } from "../lib/notificationRouting";
 import { ProfilesProvider } from "../lib/profiles/ProfilesContext";
 import { ChatLifecycleCoordinator } from "../lib/letta/ChatLifecycleCoordinator";
 import { ThemeProvider, useTheme } from "../theme/ThemeProvider";
 
 function NotificationRouter() {
+  const pathname = usePathname();
+  const searchParams = useGlobalSearchParams<{ conversationId?: string | string[] }>();
+  const activeRouteRef = useRef<{ pathname: string; conversationId?: string }>({ pathname: "" });
+
+  useEffect(() => {
+    const rawConversationId = searchParams.conversationId;
+    activeRouteRef.current = {
+      pathname,
+      conversationId: Array.isArray(rawConversationId) ? rawConversationId[0] : rawConversationId,
+    };
+  }, [pathname, searchParams.conversationId]);
+
   useEffect(() => {
     if (Platform.OS === "web" || Constants.executionEnvironment === ExecutionEnvironment.StoreClient) return;
     let alive = true;
@@ -36,8 +48,14 @@ function NotificationRouter() {
       const openResponse = (response: import("expo-notifications").NotificationResponse) => {
         if (response.actionIdentifier !== Notifications.DEFAULT_ACTION_IDENTIFIER) return;
         const route = routeForMiloNotification(response.notification.request.content.data);
-        if (!route) return;
-        router.push(route);
+        if (route) {
+          const active = activeRouteRef.current;
+          if (!notificationRouteAlreadyActive(active.pathname, active.conversationId, route)) {
+            router.push(route);
+          }
+        }
+        // A general explicit notification may intentionally have no chat target.
+        // Tapping it still foregrounds the app; there is simply no route to push.
         try { Notifications.clearLastNotificationResponse(); } catch { /* unavailable during teardown */ }
       };
 

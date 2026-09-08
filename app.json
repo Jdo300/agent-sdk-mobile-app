@@ -23,10 +23,11 @@
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true
         },
-        "NSLocalNetworkUsageDescription": "Bloop connects directly to the local Milo server for chat and voice services."
+        "NSLocalNetworkUsageDescription": "Bloop connects directly to the local Milo server for chat and voice services.",
+        "ITSAppUsesNonExemptEncryption": false
       },
       "appleTeamId": "L6DX4VDCTF",
-      "buildNumber": "2"
+      "buildNumber": "3"
     },
     "android": {
       "adaptiveIcon": {
@@ -69,7 +70,8 @@
       [
         "expo-audio",
         {
-          "microphonePermission": "Allow Local Milo to record voice messages."
+          "microphonePermission": "Allow Local Milo to record voice messages.",
+          "enableBackgroundPlayback": true
         }
       ],
       "expo-asset",
