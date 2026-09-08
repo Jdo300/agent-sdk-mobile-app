@@ -44,8 +44,19 @@ import {
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
+import { liveAssistantSegmentIsPersisted } from "./voicePersistence";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
+
+export interface VoiceCompletion {
+  /** Stable for a completed SDK turn whenever Letta supplies run IDs. */
+  id: string;
+  /** Complete assistant prose accumulated by the SDK for that turn. */
+  text: string;
+  runIds: string[];
+}
+
+export type VoiceCompletionListener = (completion: VoiceCompletion) => void;
 
 /**
  * How long a resolved approval waits for evidence the decision reached the
@@ -144,6 +155,24 @@ export class ChatSession {
   private session: LettaCodeSession | null = null;
   private snapshot: ChatSnapshot;
   private listeners = new Set<SnapshotListener>();
+  /**
+   * Ephemeral, protocol-final voice events. These are deliberately not part of
+   * ChatSnapshot: a newly-mounted/reconnected view must never replay old speech.
+   */
+  private voiceCompletionListeners = new Set<VoiceCompletionListener>();
+  private publishedVoiceCompletionIds = new Set<string>();
+  /**
+   * Assistant text currently being emitted by the live protocol. A segment is
+   * finalized only by an explicit protocol transition away from `assistant`, or
+   * by the terminal SDK `result` frame. No elapsed-time inference is involved.
+   */
+  private liveVoiceSegment: {
+    runId?: string;
+    firstSeqId?: number;
+    lastSeqId?: number;
+    firstUuid: string;
+    text: string;
+  } | null = null;
   private closed = false;
   /** Number of mounted ChatScreen views currently attached to this session. */
   private viewRefs = 0;
@@ -386,6 +415,16 @@ export class ChatSession {
     this.listeners.add(listener);
     listener(this.snapshot);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to assistant prose only when the Agent SDK has deterministically
+   * completed the turn (`stop_reason` -> SDK `result`). Unlike transcript
+   * subscriptions, this never replays the current/previous value to a new view.
+   */
+  subscribeVoiceCompletions(listener: VoiceCompletionListener): () => void {
+    this.voiceCompletionListeners.add(listener);
+    return () => this.voiceCompletionListeners.delete(listener);
   }
 
   current(): ChatSnapshot {
@@ -1125,6 +1164,7 @@ export class ChatSession {
       this.nextBefore = page.nextBefore;
       this.accumulator = rebuildAuthoritativeTranscript(page.messages);
       this.captureHistoryTimestamps(page.messages);
+      this.flushLiveVoiceSegmentIfPersisted(page.messages);
       this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
     } catch {
       // The viewer/control transport remains responsible for connection UI. A
@@ -1225,6 +1265,9 @@ export class ChatSession {
     publishActivity(this.conversationId, null);
     this.session?.close();
     this.listeners.clear();
+    this.voiceCompletionListeners.clear();
+    this.publishedVoiceCompletionIds.clear();
+    this.liveVoiceSegment = null;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────
@@ -1576,17 +1619,20 @@ export class ChatSession {
       emitSyncTelemetry({ ...event, conversationId: this.conversationId });
     }
     if (streamDisposition(message) === "authoritative_history") {
-      // Resume streams can replay old runs without seq_id. Consuming them keeps
-      // the SDK queue healthy, but canonical transcript state comes only from
-      // App Server history. Idle replay is discarded without even refreshing;
-      // active work uses one serialized management-history refresh path.
-      if (
+      // Resume streams can replay old runs without seq_id. They still never
+      // mutate canonical transcript state. Voice may observe typed live deltas,
+      // but only while the executing device/locally-submitted turn is known to
+      // be active; idle replay is ignored completely.
+      const liveTurnKnown =
         this.deviceIsProcessing ||
         this.snapshot.run === "running" ||
         this.snapshot.run === "awaiting_approval" ||
-        this.echoOtids.size > 0
-      ) {
+        this.echoOtids.size > 0;
+      if (liveTurnKnown) {
+        this.observeLiveVoiceProtocol(message);
         this.scheduleAuthoritativeHistoryRefresh(0);
+      } else {
+        this.liveVoiceSegment = null;
       }
       return;
     }
@@ -1598,9 +1644,94 @@ export class ChatSession {
     // Control/status messages remain on the SDK stream.
     const next = this.reduce(this.snapshot, message);
     this.commit(next);
-    if (message.type === "result" || message.type === "error") {
+    if (message.type === "result") {
+      // `result` is the deterministic final boundary for any assistant segment
+      // that was not followed by reasoning/tool traffic. Do not use result.text
+      // itself here: it contains all assistant prose from the turn and would
+      // duplicate segments already emitted at earlier protocol transitions.
+      this.flushLiveVoiceSegment(message.runIds ?? []);
+      this.scheduleAuthoritativeHistoryRefresh(0);
+    } else if (message.type === "error") {
+      this.liveVoiceSegment = null;
       this.scheduleAuthoritativeHistoryRefresh(0);
     }
+  }
+
+  /**
+   * Observe transcript-bearing SDK deltas for one purpose only: deterministic
+   * voice segmentation. Visible transcript state still comes exclusively from
+   * authoritative App Server history.
+   *
+   * Typed SDK `assistant` records are streaming text chunks and are accumulated
+   * into one speech segment. Authoritative persisted history finalizes that
+   * segment as soon as the complete assistant message appears there; later
+   * reasoning/tool/result transitions remain defensive fallbacks.
+   */
+  private observeLiveVoiceProtocol(message: SDKMessage): void {
+    if (message.type === "assistant") {
+      const text = message.content;
+      if (!text) return;
+      const current = this.liveVoiceSegment;
+      // A run-id change is itself an authoritative lineage boundary. Flush the
+      // previous live segment before accepting text from the new run.
+      if (current && current.runId && message.runId && current.runId !== message.runId) {
+        this.flushLiveVoiceSegment(current.runId ? [current.runId] : []);
+      }
+      if (!this.liveVoiceSegment) {
+        this.liveVoiceSegment = {
+          runId: message.runId,
+          firstSeqId: message.seqId,
+          lastSeqId: message.seqId,
+          firstUuid: message.uuid,
+          text,
+        };
+      } else {
+        this.liveVoiceSegment.text += text;
+        if (message.seqId !== undefined) this.liveVoiceSegment.lastSeqId = message.seqId;
+      }
+
+      return;
+    }
+
+    // Raw stream events are companion/replay telemetry and must never contribute
+    // voice text or completion boundaries; doing so can duplicate typed records.
+    if (message.type === "stream_event") return;
+
+    // Any typed move away from assistant prose remains a defensive end-of-segment
+    // marker. This includes reasoning, a tool call, and a tool result.
+    if (
+      message.type === "reasoning" ||
+      message.type === "tool_call" ||
+      message.type === "tool_result"
+    ) {
+      this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
+    }
+  }
+
+
+  private flushLiveVoiceSegmentIfPersisted(messages: readonly unknown[]): void {
+    const segment = this.liveVoiceSegment;
+    if (!segment || !segment.text.trim()) return;
+    if (!liveAssistantSegmentIsPersisted(messages, segment.text, segment.runId)) return;
+    this.flushLiveVoiceSegment(segment.runId ? [segment.runId] : []);
+  }
+
+  private flushLiveVoiceSegment(runIds: string[] = []): void {
+    const segment = this.liveVoiceSegment;
+    this.liveVoiceSegment = null;
+    if (!segment || !segment.text.trim()) return;
+    const effectiveRunIds = runIds.length > 0 ? runIds : segment.runId ? [segment.runId] : [];
+    const id = segment.runId && segment.firstSeqId !== undefined
+      ? `voice-segment:${this.conversationId}:${segment.runId}:${segment.firstSeqId}:${segment.lastSeqId ?? segment.firstSeqId}`
+      : `voice-segment:${this.conversationId}:${segment.runId ?? "run"}:${segment.firstUuid}`;
+    if (this.publishedVoiceCompletionIds.has(id)) return;
+    this.publishedVoiceCompletionIds.add(id);
+    if (this.publishedVoiceCompletionIds.size > 200) {
+      const oldest = this.publishedVoiceCompletionIds.values().next().value;
+      if (oldest) this.publishedVoiceCompletionIds.delete(oldest);
+    }
+    const completion: VoiceCompletion = { id, text: segment.text, runIds: effectiveRunIds };
+    for (const listener of this.voiceCompletionListeners) listener(completion);
   }
 
 

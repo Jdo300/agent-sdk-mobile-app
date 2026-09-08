@@ -14,7 +14,6 @@ import {
   AppState,
   FlatList,
   Keyboard,
-  KeyboardAvoidingView,
   Platform,
   StyleSheet,
   TextInput,
@@ -88,7 +87,6 @@ import {
 } from "../lib/letta/model";
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
 import { pickImages, pickAudio, type Attachment, type AudioAttachment } from "../lib/letta/attachments";
-import { completedAssistantReplies, newestAssistantTimestamp, voiceReplyToAutoSpeak } from "../lib/voiceEligibility";
 import { getSecret } from "../lib/profiles/profiles";
 import {
   getVoiceMode,
@@ -505,17 +503,36 @@ export default function ChatScreen() {
   const params = useLocalSearchParams<{ conversationId: string; agentId: string; agentName?: string; title?: string; autosend?: string }>();
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
-  const { width: windowWidth } = useWindowDimensions();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const isDesktopWeb = Platform.OS === "web" && windowWidth >= 1000;
   const [desktopDrawerOpen, setDesktopDrawerOpen] = useState(() => storedDesktopBoolean(DESKTOP_SIDEBAR_KEY, false));
   const [desktopTextScale, setDesktopTextScale] = useState(() => storedDesktopScale());
   const [desktopComposerHeight, setDesktopComposerHeight] = useState(128);
+  const [keyboardBottomInset, setKeyboardBottomInset] = useState(0);
   const { activeProfile } = useProfiles();
 
   useEffect(() => {
     if (!isDesktopWeb) return;
     try { globalThis.localStorage?.setItem(DESKTOP_SIDEBAR_KEY, String(desktopDrawerOpen)); } catch { /* storage unavailable */ }
   }, [isDesktopWeb, desktopDrawerOpen]);
+
+  useEffect(() => {
+    if (Platform.OS !== "ios") return;
+
+    const updateKeyboardInset = (event: Parameters<Parameters<typeof Keyboard.addListener>[1]>[0]) => {
+      // Use the keyboard's actual on-screen frame, not a guessed keyboard height.
+      // screenY also handles accessibility keyboards and partially/floating keyboards.
+      setKeyboardBottomInset(Math.max(0, Math.round(windowHeight - event.endCoordinates.screenY)));
+    };
+    const frameSub = Keyboard.addListener("keyboardWillChangeFrame", updateKeyboardInset);
+    const showSub = Keyboard.addListener("keyboardWillShow", updateKeyboardInset);
+    const hideSub = Keyboard.addListener("keyboardWillHide", () => setKeyboardBottomInset(0));
+    return () => {
+      frameSub.remove();
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [windowHeight]);
 
   useEffect(() => {
     if (!isDesktopWeb) return;
@@ -566,9 +583,10 @@ export default function ChatScreen() {
   const voiceInputActiveRef = useRef(false);
   const voicePausedForInputRef = useRef(false);
   const playVoiceTextRef = useRef<((text: string) => Promise<void>) | null>(null);
-  const voiceHandledAssistantIdsRef = useRef(new Set<string>());
-  const voiceHistorySeededRef = useRef(false);
-  const voiceTimestampWatermarkRef = useRef(0);
+  const voiceModeRef = useRef<VoiceMode>(voiceMode);
+  const voiceModeLoadedRef = useRef(voiceModeLoaded);
+  const pendingVoiceCompletionsRef = useRef<Array<{ id: string; text: string }>>([]);
+  const voiceCompletionHandlerRef = useRef<(completion: { id: string; text: string }) => void>(() => {});
   const voiceTrackWidthRef = useRef(0);
   const voiceDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
@@ -934,16 +952,45 @@ export default function ChatScreen() {
 
   const enqueueAutoVoiceText = useCallback((text: string) => {
     if (!text.trim()) return;
-    // The transcript projection already tells us when an assistant block has
-    // stopped being the live/streaming edge (cursor disappears because a tool,
-    // reasoning block, or another row took over).  Queue those completed blocks
-    // in order instead of interrupting whatever TTS is currently playing.
+    // Only protocol-final assistant text reaches this queue. Playback ordering is
+    // driven by the native player's completion callback, never by network quiet
+    // periods or guessed message-boundary delays.
     if (voiceInputActiveRef.current || voicePlayerRef.current || voicePlaying || voiceAutoQueueRef.current.length > 0) {
       voiceAutoQueueRef.current.push(text);
       return;
     }
     void playVoiceText(text);
   }, [playVoiceText, voicePlaying]);
+
+  // Keep the completion listener stable across ChatSession lifetime changes. The
+  // Agent SDK emits this only after a terminal stop/result transition, so this
+  // path has no transcript-settle or network-latency timer.
+  voiceModeRef.current = voiceMode;
+  voiceModeLoadedRef.current = voiceModeLoaded;
+  voiceCompletionHandlerRef.current = (completion) => {
+    if (!voiceModeLoadedRef.current) {
+      pendingVoiceCompletionsRef.current.push(completion);
+      return;
+    }
+    const mode = voiceModeRef.current;
+    if (mode === "off") return;
+    const speakableText = prepareSpeechText(completion.text);
+    clearVoiceDismissTimer();
+    if (mode !== "auto") retireVoicePlayer();
+    if (!speakableText) {
+      setVoiceReply(null);
+      return;
+    }
+    setVoiceReply({ id: completion.id, text: speakableText });
+    if (mode === "auto") enqueueAutoVoiceText(speakableText);
+    else scheduleVoiceReplyCollapse(15000);
+  };
+
+  useEffect(() => {
+    if (!voiceModeLoaded) return;
+    const pending = pendingVoiceCompletionsRef.current.splice(0);
+    for (const completion of pending) voiceCompletionHandlerRef.current(completion);
+  }, [voiceModeLoaded]);
 
   useEffect(() => {
     const inputActive = voiceRecording || transcribingVoice;
@@ -1311,6 +1358,7 @@ const attachImage = useCallback(async () => {
     let cancelled = false;
     let opened: ChatSession | null = null;
     let unsubscribe: (() => void) | null = null;
+    let unsubscribeVoice: (() => void) | null = null;
     void (async () => {
       try {
         const [secretValue, savedPermission] = await Promise.all([
@@ -1337,6 +1385,9 @@ const attachImage = useCallback(async () => {
         // snapshot-time scroll races layout, since the hydration batch measures
         // after the scroll fires.
         unsubscribe = session.subscribe(setSnapshot);
+        unsubscribeVoice = session.subscribeVoiceCompletions((completion) => {
+          voiceCompletionHandlerRef.current(completion);
+        });
       } catch (error) {
         if (!cancelled) {
           setSnapshot({
@@ -1350,6 +1401,8 @@ const attachImage = useCallback(async () => {
     return () => {
       cancelled = true;
       unsubscribe?.();
+      unsubscribeVoice?.();
+      pendingVoiceCompletionsRef.current = [];
       opened?.releaseView();
       if (sessionRef.current === opened) sessionRef.current = null;
     };
@@ -1565,86 +1618,6 @@ const attachImage = useCallback(async () => {
     };
   }, [running, aborting, voiceRecording, transcribingVoice]);
 
-  useEffect(() => {
-    const completedAssistants = completedAssistantReplies(snapshot.transcript);
-
-    // Hydration/catch-up replays historical transcript rows into a fresh screen.
-    // Seed those stable ids before observing live completions so opening or
-    // reconnecting a conversation can never make old replies speak again.
-    if (snapshot.hydrating) {
-      for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
-      voiceTimestampWatermarkRef.current = Math.max(
-        voiceTimestampWatermarkRef.current,
-        newestAssistantTimestamp(snapshot.transcript),
-      );
-      return;
-    }
-    if (!voiceHistorySeededRef.current) {
-      for (const item of completedAssistants) voiceHandledAssistantIdsRef.current.add(item.id);
-      voiceTimestampWatermarkRef.current = Math.max(
-        voiceTimestampWatermarkRef.current,
-        newestAssistantTimestamp(snapshot.transcript),
-      );
-      voiceHistorySeededRef.current = true;
-      return;
-    }
-    if (!voiceModeLoaded) return;
-
-    // Voice follows completed assistant prose, not the run lifecycle. Milo can
-    // emit a useful assistant message and then continue into more tool calls.
-    // Identity alone is not enough here: reconciliation can re-key an older row.
-    // Only the newest visible completed assistant, newer than our entry/catch-up
-    // watermark, is allowed to trigger automatic speech.
-    const reply = voiceReplyToAutoSpeak(
-      snapshot.transcript,
-      voiceHandledAssistantIdsRef.current,
-      voiceTimestampWatermarkRef.current,
-    );
-    if (!reply) {
-      // Still absorb any historical/re-keyed ids so they cannot become candidates
-      // on a later render after transcript shape changes.
-      for (const item of completedAssistants) {
-        if ((item.occurredAt ?? 0) <= voiceTimestampWatermarkRef.current) {
-          voiceHandledAssistantIdsRef.current.add(item.id);
-        }
-      }
-
-      return;
-    }
-    voiceHandledAssistantIdsRef.current.add(reply.id);
-    if (typeof reply.occurredAt === "number" && Number.isFinite(reply.occurredAt)) {
-      voiceTimestampWatermarkRef.current = Math.max(voiceTimestampWatermarkRef.current, reply.occurredAt);
-    }
-
-    if (voiceMode === "off") return;
-    const speakableText = prepareSpeechText(reply.text);
-    clearVoiceDismissTimer();
-    // Auto voice is serialized: a newly completed assistant block must never
-    // cut off a block that is already speaking. Tap/replay mode can still
-    // replace the current clip because that is an explicit user action.
-    if (voiceMode !== "auto") retireVoicePlayer();
-    if (!speakableText) {
-      setVoiceReply(null);
-      return;
-    }
-
-    setVoiceReply({ id: reply.id, text: speakableText });
-    if (voiceMode === "auto") {
-      enqueueAutoVoiceText(speakableText);
-    } else {
-      scheduleVoiceReplyCollapse(15000);
-    }
-  }, [
-    snapshot.hydrating,
-    snapshot.transcript,
-    voiceMode,
-    voiceModeLoaded,
-    playVoiceText,
-    enqueueAutoVoiceText,
-    retireVoicePlayer,
-    clearVoiceDismissTimer,
-    scheduleVoiceReplyCollapse,
-  ]);
 
   const refreshAgentSecrets = useCallback(async () => {
     const session = sessionRef.current;
@@ -2127,7 +2100,12 @@ const attachImage = useCallback(async () => {
       )}
       <View style={styles.desktopChatFrame}>
       <TextScaleProvider scale={isDesktopWeb ? desktopTextScale : 1}>
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.flex}>
+      <View
+        style={[
+          styles.flex,
+          Platform.OS === "ios" && keyboardBottomInset > 0 ? { paddingBottom: keyboardBottomInset } : null,
+        ]}
+      >
         <View style={styles.flex}>
           {transcriptList}
           {/* Anchored to the list's own bottom edge, so it clears the composer
@@ -2175,7 +2153,11 @@ const attachImage = useCallback(async () => {
             {
               borderColor: colors.surfaceEdge,
               paddingTop: isDesktopWeb ? 2 : space.md,
-              paddingBottom: isDesktopWeb ? 1 : Math.max(insets.bottom, space.md),
+              paddingBottom: isDesktopWeb
+                ? 1
+                : keyboardBottomInset > 0
+                  ? space.md
+                  : Math.max(insets.bottom, space.md),
               gap: isDesktopWeb ? 1 : space.sm,
             },
           ]}
@@ -2589,7 +2571,7 @@ const attachImage = useCallback(async () => {
             ) : null}
           </View>
         </View>
-      </KeyboardAvoidingView>
+      </View>
       </TextScaleProvider>
       </View>
         </View>
