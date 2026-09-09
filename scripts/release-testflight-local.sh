@@ -11,9 +11,30 @@ ARCHIVE_DIR="$HOME/Library/Developer/Xcode/Archives/RG-Agent-Link"
 ARCHIVE_PATH="$ARCHIVE_DIR/RG-Agent-Link-$TIMESTAMP.xcarchive"
 EXPORT_DIR="$REPO_ROOT/.release/testflight-$TIMESTAMP"
 EXPORT_PLIST="$EXPORT_DIR/ExportOptions.plist"
+ASC_CONFIG="${ASC_CONFIG:-$HOME/.config/rg-agent-link/appstore-connect.env}"
 
 cd "$REPO_ROOT"
 mkdir -p "$ARCHIVE_DIR" "$EXPORT_DIR"
+
+if [[ ! -f "$ASC_CONFIG" ]]; then
+  echo "ERROR: missing Apple App Store Connect API configuration: $ASC_CONFIG" >&2
+  echo "Create a local Apple API key once, then set ASC_KEY_ID, ASC_ISSUER_ID, and ASC_KEY_PATH in that file." >&2
+  exit 3
+fi
+# shellcheck disable=SC1090
+source "$ASC_CONFIG"
+: "${ASC_KEY_ID:?ASC_KEY_ID is required in $ASC_CONFIG}"
+: "${ASC_ISSUER_ID:?ASC_ISSUER_ID is required in $ASC_CONFIG}"
+: "${ASC_KEY_PATH:?ASC_KEY_PATH is required in $ASC_CONFIG}"
+if [[ ! -f "$ASC_KEY_PATH" ]]; then
+  echo "ERROR: App Store Connect private key not found: $ASC_KEY_PATH" >&2
+  exit 3
+fi
+AUTH_ARGS=(
+  -authenticationKeyPath "$ASC_KEY_PATH"
+  -authenticationKeyID "$ASC_KEY_ID"
+  -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+)
 
 if [[ "$(git branch --show-current)" != "ios-native-build" ]]; then
   echo "ERROR: release must run from ios-native-build" >&2
@@ -86,6 +107,7 @@ echo "[4/5] Archive locally with Xcode"
   -destination 'generic/platform=iOS' \
   -archivePath "$ARCHIVE_PATH" \
   -allowProvisioningUpdates \
+  "${AUTH_ARGS[@]}" \
   DEVELOPMENT_TEAM="$TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
   archive
@@ -103,7 +125,8 @@ echo "[5/5] Upload archive directly to Apple App Store Connect"
   -archivePath "$ARCHIVE_PATH" \
   -exportPath "$EXPORT_DIR" \
   -exportOptionsPlist "$EXPORT_PLIST" \
-  -allowProvisioningUpdates
+  -allowProvisioningUpdates \
+  "${AUTH_ARGS[@]}"
 
 echo
 echo "SUCCESS: Apple accepted RG Agent Link build $APP_BUILD for App Store Connect/TestFlight upload."
