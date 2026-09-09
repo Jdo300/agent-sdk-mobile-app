@@ -26,6 +26,7 @@ source "$ASC_CONFIG"
 : "${ASC_KEY_ID:?ASC_KEY_ID is required in $ASC_CONFIG}"
 : "${ASC_ISSUER_ID:?ASC_ISSUER_ID is required in $ASC_CONFIG}"
 : "${ASC_KEY_PATH:?ASC_KEY_PATH is required in $ASC_CONFIG}"
+ASC_PROFILE_NAME="${ASC_PROFILE_NAME:-RG Agent Link App Store Local 2026-09-09}"
 if [[ ! -f "$ASC_KEY_PATH" ]]; then
   echo "ERROR: App Store Connect private key not found: $ASC_KEY_PATH" >&2
   exit 3
@@ -98,13 +99,20 @@ cat > "$EXPORT_PLIST" <<PLIST
   <key>destination</key>
   <string>upload</string>
   <key>signingStyle</key>
-  <string>automatic</string>
+  <string>manual</string>
+  <key>signingCertificate</key>
+  <string>Apple Distribution</string>
   <key>teamID</key>
   <string>$TEAM_ID</string>
   <key>manageAppVersionAndBuildNumber</key>
   <false/>
   <key>uploadSymbols</key>
   <true/>
+  <key>provisioningProfiles</key>
+  <dict>
+    <key>$BUNDLE_ID</key>
+    <string>$ASC_PROFILE_NAME</string>
+  </dict>
 </dict>
 </plist>
 PLIST
