@@ -54,6 +54,16 @@ if [[ "$APP_BUNDLE" != "$BUNDLE_ID" ]]; then
   exit 2
 fi
 
+# RG Agent Link intentionally uses a local Apple Distribution signing identity.
+# This keeps distribution signing on the iMac rather than depending on Apple's
+# cloud-managed signing certificate service. Fail before the expensive archive
+# if the one-time local certificate setup has not been completed.
+if ! security find-identity -v -p codesigning "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null | grep -q 'Apple Distribution:'; then
+  echo "ERROR: no local Apple Distribution signing identity is installed in the iMac login keychain." >&2
+  echo "One-time setup: Xcode > Settings > Accounts > Resonance Group > Manage Certificates > + > Apple Distribution." >&2
+  exit 4
+fi
+
 echo "== RG Agent Link local TestFlight release =="
 echo "App: $APP_NAME"
 echo "Bundle: $APP_BUNDLE"
