@@ -21,7 +21,7 @@ import { createTranscriptAccumulator } from "@letta-ai/letta-agent-sdk/client";
 
 import { toImageContent, type Attachment } from "./attachments";
 import type { Profile } from "../profiles/profiles";
-import { getConversationModel, getConversationStaticDiagnostics, isAuthError, listConversationMessages, sdkClient, type ConversationDiagnostics } from "./api";
+import { executeRemoteConversationCommand, getConversationModel, getConversationStaticDiagnostics, isAuthError, listConversationMessages, sdkClient, type ConversationDiagnostics } from "./api";
 import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode, type ToolStatus, type TranscriptItem } from "./model";
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
@@ -822,17 +822,12 @@ export class ChatSession {
   /** Live context diagnostics from the exact App Server conversation runtime. */
   async getConversationDiagnostics(): Promise<ConversationDiagnostics> {
     const staticInfo = await getConversationStaticDiagnostics(this.conn, this.conversationId);
-    const response = await this.ensureSession().sendCommand(
-      {
-        type: "execute_command",
-        command_id: "context",
-        runtime: { agent_id: staticInfo.agentId, conversation_id: this.conversationId },
-      },
-      {
-        timeoutMs: 15000,
-        predicate: (message) =>
-          message.type === "slash_command_end" && message.command_id === "context",
-      },
+    const response = await executeRemoteConversationCommand(
+      this.conn,
+      this.conversationId,
+      staticInfo.agentId,
+      "context",
+      15_000,
     );
     if (response.success !== true) {
       throw new Error(typeof response.output === "string" ? response.output : "Couldn't read context status.");
@@ -902,8 +897,7 @@ export class ChatSession {
       },
       {
         timeoutMs: 120000,
-        predicate: (message) =>
-          message.type === "slash_command_end" && message.command_id === "compact",
+        responseType: "execute_command_response",
       },
     );
     if (response.success !== true) {
