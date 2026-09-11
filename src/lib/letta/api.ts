@@ -21,6 +21,7 @@ import type {
 import { CLOUD_DEFAULT_URL, type Profile } from "../profiles/profiles";
 import { OAuthTokenError } from "../auth/oauthTokens";
 import { createBrowserBridgeWebSocketConstructor, isBrowserRuntime } from "./browserWebSocket";
+import { parseConversationCommandResult, type ConversationCommandResult } from "./conversationCommand";
 
 // Re-exported so UI code imports from the app's data module, but the
 // definition is the SDK's — no drift (previously narrowed to low|medium|high,
@@ -452,6 +453,89 @@ function modelSettingsFor(model: string, effort?: ReasoningEffort): ModelSetting
   return undefined;
 }
 
+
+export async function executeRemoteConversationCommand(
+  conn: Connection,
+  conversationId: string,
+  agentId: string,
+  commandId: string,
+  timeoutMs = 15_000,
+): Promise<ConversationCommandResult> {
+  if (conn.profile.type !== "remote") {
+    throw new Error(`/${commandId} runtime diagnostics are only available for remote App Server conversations.`);
+  }
+  const WebSocketCtor = isReactNative()
+    ? createReactNativeWebSocketConstructor(globalThis.WebSocket as never)
+    : isBrowserRuntime()
+      ? createBrowserBridgeWebSocketConstructor(globalThis.WebSocket)
+      : undefined;
+  const client = createAppServerClient({
+    url: conn.profile.url,
+    ...(conn.secret ? { authToken: conn.secret } : {}),
+    ...(WebSocketCtor ? { WebSocket: WebSocketCtor as never } : {}),
+    requestTimeoutMs: Math.min(timeoutMs, 10_000),
+  });
+  try {
+    await client.connect();
+    const runtimeStartId = client.nextRequestId("runtime_start");
+    await client.requestRaw(
+      {
+        type: "runtime_start",
+        request_id: runtimeStartId,
+        agent_id: agentId,
+        conversation_id: conversationId,
+        recover_approvals: false,
+        force_device_status: false,
+        wait_for_replay: true,
+        client_info: { name: "RG Agent Link diagnostics" },
+      } as never,
+      {
+        timeoutMs: Math.min(timeoutMs, 10_000),
+        predicate: (message): message is never =>
+          Boolean(
+            message &&
+              typeof message === "object" &&
+              "type" in message &&
+              message.type === "runtime_start_response",
+          ),
+      },
+    );
+
+    const requestId = client.nextRequestId("execute_command");
+    return await new Promise<ConversationCommandResult>((resolve, reject) => {
+      let settled = false;
+      let unsubscribe = () => {};
+      const finish = (result: ConversationCommandResult | Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        if (result instanceof Error) reject(result);
+        else resolve(result);
+      };
+      const timer = setTimeout(
+        () => finish(new Error(`Timed out waiting for /${commandId} result.`)),
+        timeoutMs,
+      );
+      unsubscribe = client.onMessage((message) => {
+        const result = parseConversationCommandResult(message, requestId, commandId);
+        if (result) finish(result);
+      });
+      try {
+        client.sendRaw({
+          type: "execute_command",
+          request_id: requestId,
+          command_id: commandId,
+          runtime: { agent_id: agentId, conversation_id: conversationId },
+        } as never);
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  } finally {
+    client.close();
+  }
+}
 
 // ── Conversation diagnostics ─────────────────────────────────────────────────
 
