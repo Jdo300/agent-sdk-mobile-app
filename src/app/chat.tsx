@@ -575,6 +575,7 @@ export default function ChatScreen() {
   const [browserVoiceLevel, setBrowserVoiceLevel] = useState(0);
   const browserMeterRef = useRef<{ stream?: MediaStream; context?: AudioContext; frame?: number } | null>(null);
   const finishingVoiceRef = useRef(false);
+  const startingVoiceRef = useRef(false);
   const voiceTraceIdRef = useRef<string | null>(null);
   const voicePlayerRef = useRef<AudioPlayer | null>(null);
   const voicePlayerSubRef = useRef<{ remove(): void } | null>(null);
@@ -729,36 +730,63 @@ export default function ChatScreen() {
   useEffect(() => () => stopBrowserVoiceMeter(), [stopBrowserVoiceMeter]);
 
   const startVoiceRecording = useCallback(async () => {
-    if (!activeProfile || voiceRecording || transcribingVoice) return;
+    // React state does not flip synchronously. A fast double click/tap could enter
+    // this function twice and let one prepare/record race invalidate the other's
+    // web MediaRecorder. Keep a synchronous guard around the whole start path.
+    if (!activeProfile || voiceRecording || transcribingVoice || startingVoiceRef.current) return;
+    startingVoiceRef.current = true;
     const traceId = newVoiceTraceId();
     voiceTraceIdRef.current = traceId;
     voiceTrace(traceId, "record_start_requested", { conversationId: params.conversationId });
     setVoiceError(null);
-    const permission = await requestRecordingPermissionsAsync();
-    voiceTrace(traceId, "record_permission", { granted: permission.granted });
-    if (!permission.granted) {
-      setVoiceError("Microphone permission is required for voice messages.");
-      return;
+    try {
+      const permission = await requestRecordingPermissionsAsync();
+      voiceTrace(traceId, "record_permission", { granted: permission.granted });
+      if (!permission.granted) {
+        setVoiceError("Microphone permission is required for voice messages.");
+        return;
+      }
+      // Voice input owns the audio session while the recorder/transcription box is
+      // active. Pause any Milo speech immediately so the microphone cannot record
+      // the app's own TTS, and hold subsequent assistant clips in the auto queue.
+      voiceInputActiveRef.current = true;
+      const activeVoicePlayer = voicePlayerRef.current;
+      if (activeVoicePlayer?.playing) {
+        activeVoicePlayer.pause();
+        voicePausedForInputRef.current = true;
+        setVoicePlaying(false);
+      }
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      voiceTrace(traceId, "recorder_prepare_begin");
+      await recorder.prepareToRecordAsync();
+      voiceTrace(traceId, "recorder_prepare_done");
+      try {
+        recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
+      } catch (error) {
+        // expo-audio's web recorder can occasionally lose its MediaRecorder
+        // between preparation and record() (most commonly after rapid/repeated
+        // starts). Recreate it once rather than letting the exception crash the
+        // browser app. Native platforms do not use MediaRecorder, so do not mask
+        // unrelated native recording failures with a retry.
+        const detail = error instanceof Error ? error.message : String(error);
+        if (Platform.OS !== "web" || !/MediaRecorder|prepareToRecordAsync/i.test(detail)) throw error;
+        voiceTrace(traceId, "recorder_prepare_retry", { detail });
+        await recorder.prepareToRecordAsync();
+        recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
+      }
+      voiceTrace(traceId, "recorder_record_called");
+      setVoiceRecording(true);
+      if (Platform.OS === "web") void startBrowserVoiceMeter();
+      haptic.tap();
+    } catch (error) {
+      voiceInputActiveRef.current = false;
+      const detail = error instanceof Error ? error.message : "Could not start audio recording.";
+      voiceTrace(traceId, "record_start_failed", { detail });
+      setVoiceError(detail);
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true, shouldPlayInBackground: true }).catch(() => undefined);
+    } finally {
+      startingVoiceRef.current = false;
     }
-    // Voice input owns the audio session while the recorder/transcription box is
-    // active. Pause any Milo speech immediately so the microphone cannot record
-    // the app's own TTS, and hold subsequent assistant clips in the auto queue.
-    voiceInputActiveRef.current = true;
-    const activeVoicePlayer = voicePlayerRef.current;
-    if (activeVoicePlayer?.playing) {
-      activeVoicePlayer.pause();
-      voicePausedForInputRef.current = true;
-      setVoicePlaying(false);
-    }
-    await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-    voiceTrace(traceId, "recorder_prepare_begin");
-    await recorder.prepareToRecordAsync();
-    voiceTrace(traceId, "recorder_prepare_done");
-    recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
-    voiceTrace(traceId, "recorder_record_called");
-    setVoiceRecording(true);
-    if (Platform.OS === "web") void startBrowserVoiceMeter();
-    haptic.tap();
   }, [activeProfile, voiceRecording, transcribingVoice, recorder, startBrowserVoiceMeter]);
 
   const cancelVoiceRecording = useCallback(async () => {
@@ -1949,8 +1977,10 @@ const attachImage = useCallback(async () => {
                       followLiveRef.current = false;
                       if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
                       wheelIdleTimerRef.current = setTimeout(() => {
+                        // Ending a wheel gesture must never opt the reader back
+                        // into live-follow. The scroll event itself re-enables
+                        // follow only after the wheel actually reaches offset 0.
                         userScrollingRef.current = false;
-                        if (lastScrollOffsetRef.current <= 2) followLiveRef.current = true;
                       }, 140);
                     },
                   } as any) : {})}
@@ -1970,13 +2000,20 @@ const attachImage = useCallback(async () => {
                     // programmatic pins. This makes manual scroll position authoritative
                     // while content continues streaming.
                     if (Date.now() < programmaticScrollUntilRef.current) return;
-                    if (offset > 6) {
+                    // Desktop wheel deltas can be only a fraction of a pixel. A
+                    // 6px deadband made short attempts to leave the live edge
+                    // look "stuck" because the next content growth pinned back
+                    // to zero. On web, any meaningful positive offset is reader
+                    // intent; native keeps the larger jitter tolerance.
+                    const leaveLiveThreshold = isDesktopWeb ? 0.5 : 6;
+                    const returnLiveThreshold = isDesktopWeb ? 0.25 : 2;
+                    if (offset > leaveLiveThreshold) {
                       followLiveRef.current = false;
                       return;
                     }
                     // Only an active reader gesture can opt back into live-follow;
                     // layout/content changes reaching zero must not silently do it.
-                    if (userScrollingRef.current && offset <= 2) {
+                    if (userScrollingRef.current && offset <= returnLiveThreshold) {
                       followLiveRef.current = true;
                     }
                   }}
