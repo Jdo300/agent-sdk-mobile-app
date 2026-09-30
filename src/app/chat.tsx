@@ -86,7 +86,7 @@ import {
   type ToolItem,
 } from "../lib/letta/model";
 import { groupToolRuns, type TranscriptRowItem } from "../lib/letta/grouping";
-import { pickImages, pickAudio, type Attachment, type AudioAttachment } from "../lib/letta/attachments";
+import { pickImages, pickAudio, takePhoto, type Attachment, type AudioAttachment } from "../lib/letta/attachments";
 import { getSecret } from "../lib/profiles/profiles";
 import {
   getVoiceMode,
@@ -1106,6 +1106,16 @@ const attachImage = useCallback(async () => {
     haptic.tap();
     const picked = await pickImages();
     if (picked.length > 0) setAttachments((current) => [...current, ...picked].slice(0, 4));
+  }, []);
+
+  const capturePhoto = useCallback(async () => {
+    haptic.tap();
+    try {
+      const captured = await takePhoto();
+      if (captured.length > 0) setAttachments((current) => [...current, ...captured].slice(0, 4));
+    } catch (error) {
+      Alert.alert("Camera access", error instanceof Error ? error.message : "Could not open the camera.");
+    }
   }, []);
 
   const attachAudio = useCallback(async () => {
@@ -2635,6 +2645,18 @@ const attachImage = useCallback(async () => {
           <View style={styles.attachMenuText}>
             <Text role="bodyEm">Photo</Text>
             <Text role="sub" ink={3}>From your library</Text>
+          </View>
+        </Touchable>
+        <Touchable
+          accessibilityRole="button"
+          accessibilityLabel="Take a photo"
+          onPress={() => void capturePhoto()}
+          style={styles.attachMenuRow}
+        >
+          <View style={styles.attachMenuIcon}><PhotoIcon color={colors.ink2} size={21} /></View>
+          <View style={styles.attachMenuText}>
+            <Text role="bodyEm">Camera</Text>
+            <Text role="sub" ink={3}>Take a new photo</Text>
           </View>
         </Touchable>
         <Touchable

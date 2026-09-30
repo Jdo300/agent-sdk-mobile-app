@@ -48,6 +48,19 @@ export async function pickImages(): Promise<Attachment[]> {
   return prepared.filter((a): a is Attachment => a !== null);
 }
 
+/** Capture a new photo and run it through the same resize/JPEG pipeline. */
+export async function takePhoto(): Promise<Attachment[]> {
+  const permission = await ImagePicker.requestCameraPermissionsAsync();
+  if (!permission.granted) throw new Error("Camera permission is required to take a photo.");
+  const result = await ImagePicker.launchCameraAsync({
+    mediaTypes: ["images"],
+    quality: 1,
+  });
+  if (result.canceled || result.assets.length === 0) return [];
+  const attachment = await prepare(result.assets[0]!, 0);
+  return attachment ? [attachment] : [];
+}
+
 async function prepare(
   asset: ImagePicker.ImagePickerAsset,
   index: number,
