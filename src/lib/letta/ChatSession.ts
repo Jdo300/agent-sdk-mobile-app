@@ -25,7 +25,7 @@ import { executeRemoteConversationCommand, getConversationModel, getConversation
 import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode, type ToolStatus, type TranscriptItem } from "./model";
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
-import { newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
+import { liveReasoningKeyAtEdge, newestTextKey, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import { rebuildAuthoritativeTranscript } from "./authoritativeTranscript";
 import { shouldReconnectSilentSend } from "./authoritativeCatchUp";
 import {
@@ -1742,10 +1742,16 @@ export class ChatSession {
     // message can be complete while the run continues into tool work. Marking it
     // live until a later row arrived delayed TTS and forced heuristic timers.
     const liveKey: string | null = null;
-    this.recordTimings(rows, liveKey);
+    const reasoningActive =
+      this.deviceIsProcessing ||
+      snapshot.run === "running" ||
+      snapshot.run === "awaiting_approval";
+    const liveReasoningKey = liveReasoningKeyAtEdge(rows, reasoningActive);
+    this.recordTimings(rows, liveReasoningKey);
 
     const state: ProjectionState = {
       liveKey,
+      liveReasoningKey,
       interruptedKey: this.interruptedKey,
       toolStatusOverride: this.toolStatusOverride,
       thinkStartedAt: this.thinkStartedAt,
@@ -1865,12 +1871,12 @@ export class ChatSession {
    * rather than derived from the rows themselves. Live timestamps are captured
    * on first appearance; history later replaces them with server time.
    */
-  private recordTimings(rows: readonly TranscriptRow[], liveKey: string | null): void {
+  private recordTimings(rows: readonly TranscriptRow[], liveReasoningKey: string | null): void {
     for (const row of rows) {
       if (!this.rowOccurredAt.has(row.key)) this.rowOccurredAt.set(row.key, Date.now());
       if (row.kind === "reasoning") {
         if (!this.thinkStartedAt.has(row.key)) this.thinkStartedAt.set(row.key, Date.now());
-        if (row.key !== liveKey && !this.thinkSeconds.has(row.key)) {
+        if (row.key !== liveReasoningKey && !this.thinkSeconds.has(row.key)) {
           const startedAt = this.thinkStartedAt.get(row.key)!;
           this.thinkSeconds.set(row.key, Math.max(1, Math.round((Date.now() - startedAt) / 1000)));
         }

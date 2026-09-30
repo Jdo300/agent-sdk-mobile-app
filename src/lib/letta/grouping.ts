@@ -6,7 +6,7 @@
  * into one summary row (as paseo, remodex and litter all do); the live call
  * stays standalone so a running turn keeps showing what it is doing.
  */
-import type { ToolItem, TranscriptItem } from "./model";
+import type { ReasoningItem, ToolItem, TranscriptItem } from "./model";
 
 /** Summary row standing in for a run of collapsed tool calls. */
 export interface ToolGroupItem {
@@ -28,6 +28,45 @@ function isSettledTool(item: TranscriptItem): item is ToolItem {
     item.kind === "tool" &&
     (item.status === "success" || item.status === "denied" || item.status === "error")
   );
+}
+
+function joinReasoningText(left: string, right: string): string {
+  if (!left) return right;
+  if (!right) return left;
+  return `${left}${left.endsWith("\n") || right.startsWith("\n") ? "" : "\n"}${right}`;
+}
+
+/**
+ * App Server history may persist one continuous reasoning phase as several
+ * adjacent reasoning messages. Keep canonical rows untouched, but present
+ * adjacent slices from the same run as one expandable thought in the UI.
+ */
+export function coalesceReasoningRuns(transcript: readonly TranscriptItem[]): TranscriptItem[] {
+  const rows: TranscriptItem[] = [];
+  for (const item of transcript) {
+    const previous = rows[rows.length - 1];
+    if (
+      item.kind === "reasoning" &&
+      previous?.kind === "reasoning" &&
+      item.runId &&
+      previous.runId === item.runId
+    ) {
+      const left = previous as ReasoningItem;
+      const right = item as ReasoningItem;
+      const starts = [left.startedAt, right.startedAt].filter((v): v is number => v !== undefined);
+      rows[rows.length - 1] = {
+        ...left,
+        text: joinReasoningText(left.text, right.text),
+        seconds: left.seconds + right.seconds,
+        ...(starts.length > 0 ? { startedAt: Math.min(...starts) } : {}),
+        ...((left.streaming || right.streaming) ? { streaming: true } : { streaming: undefined }),
+        ...(left.occurredAt !== undefined ? { occurredAt: left.occurredAt } : right.occurredAt !== undefined ? { occurredAt: right.occurredAt } : {}),
+      };
+      continue;
+    }
+    rows.push(item);
+  }
+  return rows;
 }
 
 export function groupToolRuns(
@@ -57,7 +96,7 @@ export function groupToolRuns(
     run = [];
   };
 
-  for (const item of transcript) {
+  for (const item of coalesceReasoningRuns(transcript)) {
     if (isSettledTool(item)) {
       run.push(item);
       continue;

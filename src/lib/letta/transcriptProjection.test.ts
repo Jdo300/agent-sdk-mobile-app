@@ -7,11 +7,12 @@
 import { describe, expect, it } from "bun:test";
 
 import type { TranscriptRow } from "@letta-ai/letta-agent-sdk/client";
-import { liveTextKeyAtEdge, newestTextKey, projectRow, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
+import { liveReasoningKeyAtEdge, liveTextKeyAtEdge, newestTextKey, projectRow, projectRows, userRowOtids, type ProjectionState } from "./transcriptProjection";
 import type { ToolItem, ToolStatus } from "./model";
 
 const base: ProjectionState = {
   liveKey: null,
+  liveReasoningKey: null,
   interruptedKey: null,
   toolStatusOverride: new Map<string, ToolStatus>(),
   thinkStartedAt: new Map(),
@@ -76,8 +77,19 @@ describe("transcript projection", () => {
     const rows = [text("reasoning", "r1", "thinking…")];
     const settled = projectRows(rows, { ...base, thinkSeconds: new Map([["r1", 3]]) });
     expect(settled[0]).toMatchObject({ seconds: 3 });
-    const live = projectRows(rows, { ...base, liveKey: "r1" });
+    const live = projectRows(rows, { ...base, liveReasoningKey: "r1" });
     expect(live[0]).toMatchObject({ seconds: 0, streaming: true });
+  });
+
+
+  it("marks only trailing reasoning live while processing", () => {
+    const rows = [
+      { ...text("reasoning", "r1", "first"), runId: "run-1" } as TranscriptRow,
+      { ...text("reasoning", "r2", "second"), runId: "run-1" } as TranscriptRow,
+    ];
+    expect(liveReasoningKeyAtEdge(rows, true)).toBe("r2");
+    expect(liveReasoningKeyAtEdge(rows, false)).toBeNull();
+    expect(liveReasoningKeyAtEdge([...rows, text("assistant", "a1", "done")], true)).toBeNull();
   });
 
   it("strips system-reminder wrappers from user rows", () => {

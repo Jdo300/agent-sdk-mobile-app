@@ -13,8 +13,10 @@ import type { ToolStatus, TranscriptItem } from "./model";
 import { cleanUserText, formatToolInput, summarizeToolInput } from "./toolText";
 
 export interface ProjectionState {
-  /** Row currently being written by an in-flight turn, if any. */
+  /** Assistant row currently being written, if any. Kept separate from reasoning. */
   liveKey: string | null;
+  /** Trailing reasoning row while the device is actively processing. */
+  liveReasoningKey: string | null;
   /** Row a turn abandoned — rendered "Stopped". */
   interruptedKey: string | null;
   /** awaiting_approval / denied, which no wire status expresses. */
@@ -28,6 +30,7 @@ export interface ProjectionState {
 
 export function projectRow(row: TranscriptRow, state: ProjectionState): TranscriptItem {
   const live = row.key === state.liveKey;
+  const liveReasoning = row.key === state.liveReasoningKey;
 
   if (row.kind === "tool_call") {
     const override = state.toolStatusOverride.get(row.toolCallId);
@@ -55,10 +58,11 @@ export function projectRow(row: TranscriptRow, state: ProjectionState): Transcri
     return {
       kind: "reasoning",
       id: row.key,
+      ...(row.runId ? { runId: row.runId } : {}),
       text: row.text,
       seconds: state.thinkSeconds.get(row.key) ?? 0,
       ...(startedAt !== undefined ? { startedAt } : {}),
-      ...(live ? { streaming: true } : {}),
+      ...(liveReasoning ? { streaming: true } : {}),
       ...(state.rowOccurredAt.has(row.key) ? { occurredAt: state.rowOccurredAt.get(row.key)! } : {}),
     };
   }
@@ -119,4 +123,19 @@ export function newestTextKey(rows: readonly TranscriptRow[]): string | null {
 export function liveTextKeyAtEdge(rows: readonly TranscriptRow[]): string | null {
   const row = rows[rows.length - 1];
   return row && (row.kind === "assistant" || row.kind === "reasoning") ? row.key : null;
+}
+
+/**
+ * The assistant live key intentionally stays disabled for persisted history so
+ * TTS never mistakes already-complete prose for an in-flight message. Reasoning
+ * needs a different rule: while the device is processing, the trailing
+ * reasoning row is live so its elapsed timer continues to tick.
+ */
+export function liveReasoningKeyAtEdge(
+  rows: readonly TranscriptRow[],
+  active: boolean,
+): string | null {
+  if (!active) return null;
+  const row = rows[rows.length - 1];
+  return row?.kind === "reasoning" ? row.key : null;
 }

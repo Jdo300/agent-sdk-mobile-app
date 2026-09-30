@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { groupToolRuns, type ToolGroupItem } from "./grouping";
+import { coalesceReasoningRuns, groupToolRuns, type ToolGroupItem } from "./grouping";
 import type { ToolItem, TranscriptItem } from "./model";
 
 function tool(id: string, status: ToolItem["status"] = "success", name = "shell"): ToolItem {
@@ -10,6 +10,32 @@ const prose: TranscriptItem = { kind: "assistant", id: "a1", text: "done" };
 const none = new Set<string>();
 
 describe("groupToolRuns", () => {
+
+  it("coalesces adjacent reasoning slices from the same run", () => {
+    const rows = coalesceReasoningRuns([
+      { kind: "reasoning", id: "r1", runId: "run-1", text: "first", seconds: 1, startedAt: 1000 },
+      { kind: "reasoning", id: "r2", runId: "run-1", text: "second", seconds: 0, startedAt: 2000, streaming: true },
+      prose,
+    ]);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      kind: "reasoning",
+      id: "r1",
+      runId: "run-1",
+      text: "first\nsecond",
+      startedAt: 1000,
+      streaming: true,
+    });
+  });
+
+  it("does not merge reasoning across different runs", () => {
+    const rows = coalesceReasoningRuns([
+      { kind: "reasoning", id: "r1", runId: "run-1", text: "first", seconds: 1 },
+      { kind: "reasoning", id: "r2", runId: "run-2", text: "second", seconds: 1 },
+    ]);
+    expect(rows).toHaveLength(2);
+  });
+
   it("leaves short runs as individual cards", () => {
     const rows = groupToolRuns([tool("t1"), tool("t2"), prose], none);
     expect(rows.map((r) => r.kind)).toEqual(["tool", "tool", "assistant"]);

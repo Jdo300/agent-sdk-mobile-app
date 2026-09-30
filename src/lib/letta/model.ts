@@ -56,6 +56,8 @@ export interface AssistantItem {
 export interface ReasoningItem {
   kind: "reasoning";
   id: string;
+  /** Run identity lets the view coalesce adjacent persisted reasoning slices. */
+  runId?: string;
   /** Full reasoning text, revealed on expand. */
   text: string;
   /** Seconds spent thinking — the settled total once streaming ends. */
