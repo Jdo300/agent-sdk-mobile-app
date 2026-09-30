@@ -104,7 +104,7 @@ export const UserBubble = memo(function UserBubble({
               ))}
             </View>
           ) : null}
-          {item.text ? <Text style={styles.userText}>{item.text}</Text> : null}
+          {item.text ? <Text selectable style={styles.userText}>{item.text}</Text> : null}
         </View>
         <Timestamp value={item.occurredAt} align="right" />
         {item.pending ? (

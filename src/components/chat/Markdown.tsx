@@ -7,7 +7,7 @@
  * through the token system; links open externally via Linking.
  */
 import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Linking, Platform, ScrollView, StyleSheet, View, type TextStyle } from "react-native";
+import { Linking, Platform, ScrollView, StyleSheet, Text as RNText, View, type TextStyle } from "react-native";
 import { router } from "expo-router";
 import MarkdownDisplay, { MarkdownIt, type ASTNode, type RenderRules } from "react-native-markdown-display";
 import * as Clipboard from "expo-clipboard";
@@ -279,6 +279,19 @@ function TableRow({
 }
 
 const rules: RenderRules = {
+  // Native selectable text lets users copy a path, URL, or single sentence
+  // without copying the entire assistant message. Formatted children remain
+  // nested so Markdown emphasis/link styling is preserved.
+  text: (node, _children, _parentNodes, markdownStyle, inheritedStyles = {}) => (
+    <RNText key={node.key} selectable style={[inheritedStyles, markdownStyle.text]}>
+      {node.content}
+    </RNText>
+  ),
+  textgroup: (node, children, _parentNodes, markdownStyle) => (
+    <RNText key={node.key} selectable style={markdownStyle.textgroup}>
+      {children}
+    </RNText>
+  ),
   fence: (node) => <CodeFence key={node.key} code={node.content} language={fenceLanguage(node)} />,
   code_block: (node) => <CodeFence key={node.key} code={node.content} language={null} />,
   image: (node, _children, _parentNodes, markdownStyle, allowedImageHandlers, defaultImageHandler) => {
