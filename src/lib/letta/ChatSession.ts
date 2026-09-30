@@ -640,12 +640,41 @@ export class ChatSession {
     this.dropLocalOutgoing(itemId);
   }
 
-  /** Re-send a failed bubble: drop it (and its error row) and send fresh. */
+  private async persistedUserOtidExists(otid: string): Promise<boolean> {
+    if (persistedUserOtids(this.loadedHistoryMessages).includes(otid)) return true;
+    let before: string | undefined;
+    for (let count = 0; count < INITIAL_HISTORY_MAX_PAGES; count++) {
+      const page = await this.fetchHistoryPage(before);
+      if (persistedUserOtids(page.messages).includes(otid)) return true;
+      if (!page.hasMore || !page.nextBefore) return false;
+      before = page.nextBefore;
+    }
+    return false;
+  }
+
+  /** Re-send a failed bubble: verify ambiguous delivery first, then send fresh only when absent. */
   async retrySend(itemId: string): Promise<void> {
     const items = this.snapshot.transcript;
     const index = items.findIndex((t) => t.id === itemId);
     const item = items[index];
     if (!item || item.kind !== "user" || (!item.failed && !item.deliveryUnknown)) return;
+    if (item.deliveryUnknown) {
+      try {
+        if (await this.persistedUserOtidExists(itemId)) {
+          await removeDurableOutbox(this.conn.profile.id, this.conversationId, itemId).catch(() => {});
+          this.dropLocalOutgoing(itemId);
+          this.scheduleAuthoritativeHistoryRefresh(0);
+          return;
+        }
+      } catch {
+        this.commit(this.appendError(
+          this.snapshot,
+          "Couldn't verify whether that message was already delivered. Retry was not sent.",
+          true,
+        ));
+        return;
+      }
+    }
     // The error row committed alongside the failure sits right after it. Remove
     // it from local source state as well so project() cannot resurrect it.
     const next = items[index + 1];
