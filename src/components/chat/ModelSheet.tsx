@@ -49,7 +49,7 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
   const efforts = activeModel?.supportedEfforts ?? EFFORTS;
 
   return (
-    <Sheet ref={ref} title="Model">
+    <Sheet ref={ref} title="Model" scroll>
       <SheetTextInput
         value={search}
         onChangeText={setSearch}
@@ -87,7 +87,7 @@ export const ModelSheet = forwardRef<BottomSheetModal, Props>(function ModelShee
         </Text>
       ) : null}
       <View style={styles.listBlock}>
-        {filtered.slice(0, 8).map((m) => {
+        {filtered.map((m) => {
           const selected = currentModel === m.handle;
           return (
             <Touchable
