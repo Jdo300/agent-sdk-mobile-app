@@ -6,6 +6,7 @@ import { router, useLocalSearchParams } from "expo-router";
 import { useEffect, useState } from "react";
 import {
   Alert,
+  Image,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -14,7 +15,6 @@ import {
   View,
 } from "react-native";
 
-import { Bloop } from "../components/ui/Bloop";
 import { Header, Screen } from "../components/ui/Screen";
 import { Text } from "../components/ui/Text";
 import { Touchable } from "../components/ui/Touchable";
@@ -33,7 +33,7 @@ import {
 } from "../lib/profiles/profiles";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
-import { brandMark, radius, space } from "../theme/tokens";
+import { radius, space } from "../theme/tokens";
 
 function Field({
   label,
@@ -289,7 +289,7 @@ export default function ProfileEditorScreen() {
           {type === "cloud" ? (
             <>
               <View style={styles.cloudIntro}>
-                <Bloop id="cloud-auth" size={52} color={brandMark.bloop} />
+                <Image source={require("../../assets/images/splash-icon.png")} style={styles.brandLogo} resizeMode="contain" />
                 <View style={styles.cloudIntroText}>
                   <Text role="title">Connect to Letta Cloud</Text>
                   <Text role="body" ink={2}>
@@ -483,6 +483,7 @@ const styles = StyleSheet.create({
     gap: space.lg,
     paddingBottom: space.xxl,
   },
+  brandLogo: { width: 52, height: 52 },
   cloudIntro: { flexDirection: "row", alignItems: "center", gap: space.lg, paddingVertical: space.sm },
   cloudIntroText: { flex: 1, gap: space.xs },
   authChoices: { gap: space.sm },
