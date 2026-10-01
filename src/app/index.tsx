@@ -6,24 +6,26 @@
  * test-connection flow arrive in milestone 3.
  */
 import { router } from "expo-router";
-import { ScrollView, StyleSheet, View } from "react-native";
+import { Image, ScrollView, StyleSheet, View } from "react-native";
 
 import { Screen } from "../components/ui/Screen";
 import { StatusDot } from "../components/ui/StatusDot";
 import { Text } from "../components/ui/Text";
 import { Touchable } from "../components/ui/Touchable";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
-import { Bloop } from "../components/ui/Bloop";
 import { useTheme } from "../theme/ThemeProvider";
-import { brandMark, radius, space } from "../theme/tokens";
+import { radius, space } from "../theme/tokens";
 
-/**
- * The app's own mark: the same bloop the agents wear, so the icon, the avatars
- * and this screen are one idea. Placeholder art on purpose — fork this and
- * swap it for your own (docs/press/README.md).
- */
-function Logomark({ size = 44 }: { size?: number; color?: string }) {
-  return <Bloop id="bloop-app-mark" size={size} color={brandMark.bloop} />;
+/** Resonance Group mark used for RG Agent Link branding. */
+function Logomark({ size = 52 }: { size?: number }) {
+  return (
+    <Image
+      accessibilityIgnoresInvertColors
+      resizeMode="contain"
+      source={require("../../assets/images/rg-logo.png")}
+      style={{ width: size * 1.17, height: size }}
+    />
+  );
 }
 
 function ModeCard({
@@ -70,7 +72,7 @@ export default function ConnectScreen() {
     <Screen>
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.hero}>
-          <Logomark color={colors.ink} />
+          <Logomark />
           <Text role="display" style={styles.heroTitle}>
             Chat with your agents,{"\n"}anywhere.
           </Text>
