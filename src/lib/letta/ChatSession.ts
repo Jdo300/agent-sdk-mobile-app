@@ -44,7 +44,6 @@ import {
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
-import { liveAssistantSegmentIsPersisted } from "./voicePersistence";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -1271,7 +1270,6 @@ export class ChatSession {
       this.nextBefore = page.nextBefore;
       this.accumulator = rebuildAuthoritativeTranscript(page.messages);
       this.captureHistoryTimestamps(page.messages);
-      this.flushLiveVoiceSegmentIfPersisted(page.messages);
       this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
     } catch {
       // The viewer/control transport remains responsible for connection UI. A
@@ -1769,10 +1767,9 @@ export class ChatSession {
     const next = this.reduce(this.snapshot, message);
     this.commit(next);
     if (message.type === "result") {
-      // `result` is the deterministic final boundary for any assistant segment
-      // that was not followed by reasoning/tool traffic. Do not use result.text
-      // itself here: it contains all assistant prose from the turn and would
-      // duplicate segments already emitted at earlier protocol transitions.
+      // result is the only speech-completion boundary. Assistant prose may
+      // be interrupted by reasoning/tool traffic, but auto-TTS must wait until
+      // the whole turn is finalized and then publish it exactly once.
       this.flushLiveVoiceSegment(message.runIds ?? []);
       this.scheduleAuthoritativeHistoryRefresh(0);
     } else if (message.type === "error") {
@@ -1795,12 +1792,8 @@ export class ChatSession {
     if (message.type === "assistant") {
       const text = message.content;
       if (!text) return;
-      const current = this.liveVoiceSegment;
-      // A run-id change is itself an authoritative lineage boundary. Flush the
-      // previous live segment before accepting text from the new run.
-      if (current && current.runId && message.runId && current.runId !== message.runId) {
-        this.flushLiveVoiceSegment(current.runId ? [current.runId] : []);
-      }
+      // Run IDs can change around tool activity within one user turn. That is
+      // not a speech-completion boundary: keep accumulating until SDK result.
       if (!this.liveVoiceSegment) {
         this.liveVoiceSegment = {
           runId: message.runId,
@@ -1821,24 +1814,11 @@ export class ChatSession {
     // voice text or completion boundaries; doing so can duplicate typed records.
     if (message.type === "stream_event") return;
 
-    // Any typed move away from assistant prose remains a defensive end-of-segment
-    // marker. This includes reasoning, a tool call, and a tool result.
-    if (
-      message.type === "reasoning" ||
-      message.type === "tool_call" ||
-      message.type === "tool_result"
-    ) {
-      this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
-    }
+    // Reasoning and tool transitions may occur between pieces of assistant
+    // prose in the same turn. They are deliberately ignored here so TTS cannot
+    // start from a partial message. Only the terminal SDK result flushes.
   }
 
-
-  private flushLiveVoiceSegmentIfPersisted(messages: readonly unknown[]): void {
-    const segment = this.liveVoiceSegment;
-    if (!segment || !segment.text.trim()) return;
-    if (!liveAssistantSegmentIsPersisted(messages, segment.text, segment.runId)) return;
-    this.flushLiveVoiceSegment(segment.runId ? [segment.runId] : []);
-  }
 
   private flushLiveVoiceSegment(runIds: string[] = []): void {
     const segment = this.liveVoiceSegment;
