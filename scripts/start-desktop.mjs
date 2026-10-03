@@ -139,5 +139,11 @@ function shutdown(signal = "SIGTERM") {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 expo.on("exit", (code) => {
-  bridge.close(() => process.exit(code ?? 0));
+  if (shuttingDown) return;
+  shuttingDown = true;
+  bridgeProcess.kill("SIGTERM");
+  proxy.close();
+  localVoiceProxy.close();
+  web.close();
+  process.exit(code ?? 0);
 });
