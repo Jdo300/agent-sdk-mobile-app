@@ -1715,11 +1715,16 @@ const attachImage = useCallback(async () => {
     dismissChatKeyboard();
     haptic.send();
     const images = attachments;
-    setAttachments([]);
-    clearDraft();
-    // Sending always re-enters follow mode — your own message must be visible.
+    // Clear composer state only after ChatSession has durably journaled the exact
+    // text + base64 image payload. This closes the process-death gap between an
+    // optimistic UI clear and the SQLite write without waiting on the network.
     pinToLatest();
-    await session.send(text, images);
+    await session.send(text, images, {
+      onJournaled: () => {
+        setAttachments([]);
+        clearDraft();
+      },
+    });
   }, [running, draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const sendWhileRunning = useCallback(async () => {
@@ -1730,10 +1735,13 @@ const attachImage = useCallback(async () => {
     dismissChatKeyboard();
     haptic.queue();
     const images = attachments;
-    setAttachments([]);
-    clearDraft();
     pinToLatest();
-    await session.send(text, images);
+    await session.send(text, images, {
+      onJournaled: () => {
+        setAttachments([]);
+        clearDraft();
+      },
+    });
   }, [draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const canSend = draft.trim().length > 0 || attachments.length > 0;

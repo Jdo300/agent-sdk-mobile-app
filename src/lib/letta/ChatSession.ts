@@ -493,7 +493,11 @@ export class ChatSession {
     }
   }
 
-  async send(text: string, attachments: Attachment[] = []): Promise<boolean> {
+  async send(
+    text: string,
+    attachments: Attachment[] = [],
+    options?: { onJournaled?: () => void },
+  ): Promise<boolean> {
     const otid = `echo-${this.conversationId}-${Date.now()}-${this.counter++}`;
     return this.submitDurableTurn({
       profileId: this.conn.profile.id,
@@ -505,11 +509,14 @@ export class ChatSession {
       error: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-    });
+    }, options);
   }
 
   /** Persist first, then submit the exact same OTID on every retry. */
-  private async submitDurableTurn(item: DurableOutboxItem): Promise<boolean> {
+  private async submitDurableTurn(
+    item: DurableOutboxItem,
+    options?: { onJournaled?: () => void },
+  ): Promise<boolean> {
     this.advanceReconciliationGeneration();
     if (this.snapshot.loadingOlder) this.commit(patch(this.snapshot, { loadingOlder: false }));
     try {
@@ -519,6 +526,7 @@ export class ChatSession {
       this.commit(this.appendError(this.snapshot, detail));
       return false;
     }
+    try { options?.onJournaled?.(); } catch { /* UI acknowledgement is best-effort. */ }
 
     const { otid, text, attachments } = item;
     this.echoOtids.add(otid);
@@ -1457,11 +1465,22 @@ export class ChatSession {
    * Overlay only genuinely local delivery state after authoritative history is
    * built. v2 never treats SQLite transcript cache as visible history.
    */
+  private durableAttachmentDisplayUris(attachments: readonly Attachment[]): string[] {
+    return attachments.map((attachment) =>
+      attachment.data
+        ? `data:${attachment.mediaType};base64,${attachment.data}`
+        : attachment.uri,
+    );
+  }
+
   private applyStartupOutbox(authoritativeMessages: readonly unknown[], generation: number): void {
     if (this.startupOutbox.length === 0) return;
     const persisted = new Set(persistedUserOtids(authoritativeMessages));
     const anchor = this.accumulator.rows().length;
     for (const item of this.startupOutbox) {
+      if (item.attachments.length > 0) {
+        this.sentImageUris.set(item.otid, this.durableAttachmentDisplayUris(item.attachments));
+      }
       if (persisted.has(item.otid)) {
         void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
         continue;
@@ -1487,7 +1506,7 @@ export class ChatSession {
           id: item.otid,
           text: item.text,
           occurredAt: item.createdAt,
-          ...(item.attachments.length > 0 ? { images: item.attachments.map((attachment) => attachment.uri) } : {}),
+          ...(item.attachments.length > 0 ? { images: this.durableAttachmentDisplayUris(item.attachments) } : {}),
           ...(item.state === "failed"
             ? { failed: true }
             : item.state === "sending" || item.state === "awaiting_echo"
