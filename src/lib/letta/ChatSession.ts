@@ -82,6 +82,7 @@ const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
 const AUTHORITATIVE_LIVE_REFRESH_MS = 500;
 const SEND_STREAM_ACTIVITY_TIMEOUT_MS = 5000;
+const SEND_HANDOFF_TIMEOUT_MS = 15_000;
 const TRANSPORT_HEALTH_INTERVAL_MS = 30_000;
 const TRANSPORT_HEALTH_TIMEOUT_MS = 10_000;
 
@@ -559,11 +560,15 @@ export class ChatSession {
         return false;
       }
       const activityBeforeSend = this.streamActivitySerial;
-      await this.ensureSession().send(
-        attachments.length > 0
-          ? [...toImageContent(attachments), ...(text ? [{ type: "text" as const, text }] : [])]
-          : text,
-        { otid },
+      await withTimeout(
+        this.ensureSession().send(
+          attachments.length > 0
+            ? [...toImageContent(attachments), ...(text ? [{ type: "text" as const, text }] : [])]
+            : text,
+          { otid },
+        ),
+        SEND_HANDOFF_TIMEOUT_MS,
+        "Send handoff timed out.",
       );
       this.armSendActivityWatch(activityBeforeSend);
       // Handoff succeeded, but persistence can lag the transport acknowledgement.
