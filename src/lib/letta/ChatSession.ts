@@ -1573,6 +1573,11 @@ export class ChatSession {
           run: transportFailure ? preserveRunAcrossTransportLoss(this.snapshot.run) : this.snapshot.run,
         }),
       );
+      // A cold-open history read can fail before the live SDK session exists.
+      // Treat that exactly like any other transient transport loss: the retry
+      // path creates a fresh session, verifies device state, then schedules an
+      // authoritative history refresh so first load recovers without a reload.
+      if (transportFailure && !isAuthError(e)) this.scheduleReconnectRetry();
       return false;
     }
   }
