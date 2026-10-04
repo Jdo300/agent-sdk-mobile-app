@@ -46,6 +46,7 @@ import { QueueSheet } from "../components/chat/QueueSheet";
 import {
   AssistantBlock,
   ErrorRow,
+  NotificationCard,
   ReasoningRow,
   ThinkingRow,
   ToolCard,
@@ -260,6 +261,8 @@ const TranscriptRow = memo(function TranscriptRow({
       return <ReasoningRow item={item} />;
     case "tool":
       return <ToolCard item={item} onPress={onToolPress ? () => onToolPress(item.id) : undefined} />;
+    case "notification":
+      return <NotificationCard item={item} />;
     case "error":
       return <ErrorRow item={item} onRetry={onErrorRetry} />;
   }

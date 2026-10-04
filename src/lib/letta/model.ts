@@ -104,7 +104,23 @@ export interface ErrorItem {
   occurredAt?: number;
 }
 
-export type TranscriptItem = UserItem | AssistantItem | ReasoningItem | ToolItem | ErrorItem;
+export interface NotificationItem {
+  kind: "notification";
+  id: string;
+  title: string;
+  summary: string;
+  raw: string;
+  status?: string;
+  occurredAt?: number;
+}
+
+export type TranscriptItem =
+  | UserItem
+  | AssistantItem
+  | ReasoningItem
+  | ToolItem
+  | NotificationItem
+  | ErrorItem;
 
 /** Wire `can_use_tool` control request (protocol_v2 CanUseToolControlRequestBody). */
 export interface ApprovalRequest {

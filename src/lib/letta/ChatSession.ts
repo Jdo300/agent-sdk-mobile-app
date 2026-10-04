@@ -44,6 +44,7 @@ import {
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
+import { mergeNotificationsChronologically, projectTaskNotifications } from "./systemNotifications";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -1928,7 +1929,10 @@ export class ChatSession {
     for (const { anchor, item } of this.localRows) {
       if (anchor > placed) transcript.push(item);
     }
-    return patch(snapshot, { transcript });
+    const notifications = projectTaskNotifications(this.loadedHistoryMessages);
+    return patch(snapshot, {
+      transcript: mergeNotificationsChronologically(transcript, notifications),
+    });
   }
 
   /** Preserve persisted server timestamps when history is merged. */
