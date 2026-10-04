@@ -45,6 +45,7 @@ import {
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
 import { mergeNotificationsChronologically, projectTaskNotifications } from "./systemNotifications";
+import { assessRuntimeHealth } from "./runtimeHealth";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -886,6 +887,14 @@ export class ChatSession {
   /** Live context diagnostics from the exact App Server conversation runtime. */
   async getConversationDiagnostics(): Promise<ConversationDiagnostics> {
     const staticInfo = await getConversationStaticDiagnostics(this.conn, this.conversationId);
+    const runtimeState = await this.ensureSession().bootstrapState({ limit: 1 });
+    const runtimeTools = runtimeState.tools ?? null;
+    const health = assessRuntimeHealth({
+      configuredModel: staticInfo.model,
+      runtimeModel: runtimeState.model ?? null,
+      configuredTools: staticInfo.configuredTools,
+      runtimeTools,
+    });
     const response = await executeRemoteConversationCommand(
       this.conn,
       this.conversationId,
@@ -925,6 +934,10 @@ export class ChatSession {
       : history.at(-1)?.tokens ?? null;
     return {
       model: staticInfo.model,
+      runtimeModel: runtimeState.model ?? null,
+      configuredTools: staticInfo.configuredTools,
+      runtimeTools,
+      runtimeWarnings: health.warnings,
       contextTokens,
       contextWindow: staticInfo.contextWindow,
       promptTokens: contextTokens,
