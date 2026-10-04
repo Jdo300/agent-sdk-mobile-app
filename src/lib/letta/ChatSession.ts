@@ -37,7 +37,9 @@ import {
 } from "./protocolHardening";
 import {
   loadDurableOutbox,
+  loadDurableSentImages,
   putDurableOutbox,
+  putDurableSentImages,
   removeDurableOutbox,
   updateDurableOutboxState,
   type DurableOutboxItem,
@@ -530,6 +532,17 @@ export class ChatSession {
     try { options?.onJournaled?.(); } catch { /* UI acknowledgement is best-effort. */ }
 
     const { otid, text, attachments } = item;
+    if (attachments.length > 0) {
+      // Delivery state and transcript presentation have different lifetimes:
+      // the outbox is deleted on server acknowledgement, while sent image bytes
+      // must survive so persisted history can still render them after relaunch.
+      void putDurableSentImages(
+        this.conn.profile.id,
+        this.conversationId,
+        otid,
+        attachments,
+      ).catch(() => {});
+    }
     this.echoOtids.add(otid);
     if (!this.localRows.some((row) => row.item.kind === "user" && row.item.id === otid)) {
       this.commit(
@@ -1462,7 +1475,16 @@ export class ChatSession {
   private async loadDeliveryJournal(generation: number): Promise<boolean> {
     if (this.deliveryJournalLoaded) return this.reconciliationIsCurrent(generation, "delivery_journal_existing");
     try {
-      this.startupOutbox = await loadDurableOutbox(this.conn.profile.id, this.conversationId);
+      const [outbox, sentImages] = await Promise.all([
+        loadDurableOutbox(this.conn.profile.id, this.conversationId),
+        loadDurableSentImages(this.conn.profile.id, this.conversationId),
+      ]);
+      this.startupOutbox = outbox;
+      for (const cached of sentImages) {
+        if (cached.attachments.length > 0) {
+          this.sentImageUris.set(cached.otid, this.durableAttachmentDisplayUris(cached.attachments));
+        }
+      }
       if (!this.reconciliationIsCurrent(generation, "delivery_journal_load")) return false;
       this.deliveryJournalLoaded = true;
       return true;

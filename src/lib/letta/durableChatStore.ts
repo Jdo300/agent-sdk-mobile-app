@@ -29,6 +29,23 @@ interface OutboxRow {
   updated_at: number;
 }
 
+
+interface SentImageRow {
+  profile_id: string;
+  conversation_id: string;
+  otid: string;
+  attachments_json: string;
+  updated_at: number;
+}
+
+export interface DurableSentImages {
+  profileId: string;
+  conversationId: string;
+  otid: string;
+  attachments: Attachment[];
+  updatedAt: number;
+}
+
 let databasePromise: Promise<SQLiteDatabase> | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
 
@@ -62,6 +79,14 @@ async function openDatabase(): Promise<SQLiteDatabase> {
       state TEXT NOT NULL,
       error TEXT,
       created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, conversation_id, otid)
+    );
+    CREATE TABLE IF NOT EXISTS sent_image_cache (
+      profile_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      otid TEXT NOT NULL,
+      attachments_json TEXT NOT NULL,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (profile_id, conversation_id, otid)
     );
@@ -148,6 +173,54 @@ export async function putDurableOutbox(item: DurableOutboxItem): Promise<void> {
       item.error,
       item.createdAt,
       item.updatedAt,
+    );
+  });
+}
+
+export async function loadDurableSentImages(
+  profileId: string,
+  conversationId: string,
+): Promise<DurableSentImages[]> {
+  const db = await database();
+  const rows = await db.getAllAsync<SentImageRow>(
+    "SELECT profile_id, conversation_id, otid, attachments_json, updated_at FROM sent_image_cache WHERE profile_id = ? AND conversation_id = ? ORDER BY updated_at ASC",
+    profileId,
+    conversationId,
+  );
+  return rows.map((row) => ({
+    profileId: row.profile_id,
+    conversationId: row.conversation_id,
+    otid: row.otid,
+    attachments: parseAttachments(row.attachments_json),
+    updatedAt: row.updated_at,
+  }));
+}
+
+/**
+ * Persist sent-image presentation data separately from delivery state.
+ * Server history remains authoritative; this cache only restores image bytes
+ * because current App Server history does not round-trip multimodal content.
+ */
+export async function putDurableSentImages(
+  profileId: string,
+  conversationId: string,
+  otid: string,
+  attachments: readonly Attachment[],
+): Promise<void> {
+  if (attachments.length === 0) return;
+  return serializeWrite(async () => {
+    const db = await database();
+    await db.runAsync(
+      `INSERT INTO sent_image_cache(profile_id, conversation_id, otid, attachments_json, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(profile_id, conversation_id, otid) DO UPDATE SET
+         attachments_json = excluded.attachments_json,
+         updated_at = excluded.updated_at`,
+      profileId,
+      conversationId,
+      otid,
+      JSON.stringify(attachments),
+      Date.now(),
     );
   });
 }
