@@ -961,7 +961,7 @@ export default function ChatScreen() {
             // clip queued until recording/transcription has fully closed.
             if (!voiceInputActiveRef.current) {
               voiceAutoQueueRef.current.shift();
-              setTimeout(() => { void playVoiceTextRef.current?.(next); }, 60);
+              void playVoiceTextRef.current?.(next);
             }
           } else {
             scheduleVoiceReplyCollapse(0);
