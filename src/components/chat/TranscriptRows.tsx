@@ -4,7 +4,7 @@
  * disclosed and quieter than the prose.
  */
 import { memo, useEffect, useState } from "react";
-import { Alert, StyleSheet, View, useWindowDimensions } from "react-native";
+import { Alert, Platform, StyleSheet, View, useWindowDimensions } from "react-native";
 import { router } from "expo-router";
 import { Image } from "expo-image";
 import Animated, {
@@ -20,7 +20,7 @@ import { motion, radius, space, type as typeScale } from "../../theme/tokens";
 import { Text } from "../ui/Text";
 import { Touchable } from "../ui/Touchable";
 import { Markdown, markdownToPlainText, useCopyFeedback } from "./Markdown";
-import type { AssistantItem, ErrorItem, ReasoningItem, ToolItem, UserItem } from "../../lib/letta/model";
+import type { AssistantItem, ErrorItem, NotificationItem, ReasoningItem, ToolItem, UserItem } from "../../lib/letta/model";
 import type { ToolGroupItem } from "../../lib/letta/grouping";
 import { setViewerPayload } from "../../lib/viewerPayload";
 
@@ -504,6 +504,54 @@ export const ToolCard = memo(function ToolCard({ item, onPress }: { item: ToolIt
   );
 });
 
+// ── Task notification ────────────────────────────────────────────────────────
+
+export const NotificationCard = memo(function NotificationCard({ item }: { item: NotificationItem }) {
+  const { colors } = useTheme();
+  const [expanded, setExpanded] = useState(false);
+  const failed = item.status === "failed" || item.status === "error";
+  const statusLabel = item.status
+    ? item.status.replace(/_/g, " ").replace(/^./, (value) => value.toUpperCase())
+    : null;
+
+  return (
+    <Touchable
+      accessibilityRole="button"
+      accessibilityLabel={`Task notification: ${item.title}. ${expanded ? "Collapse details" : "Expand details"}`}
+      onPress={() => setExpanded((value) => !value)}
+      scaleOnPress={false}
+      style={[
+        styles.notificationCard,
+        {
+          backgroundColor: colors.surface,
+          borderColor: colors.surfaceEdge,
+          borderLeftColor: failed ? colors.danger : colors.accent,
+        },
+      ]}
+    >
+      <View style={styles.notificationHead}>
+        <Text role="sub" tone={failed ? "danger" : "accent"}>◆</Text>
+        <Text role="sub" ink={2} style={styles.notificationTitle} numberOfLines={1}>
+          {item.title}
+        </Text>
+        {statusLabel ? <Text role="micro" tone={failed ? "danger" : "accent"}>{statusLabel}</Text> : null}
+        <Text role="sub" ink={3}>{expanded ? "▾" : "›"}</Text>
+      </View>
+      <Text role="sub" ink={1} numberOfLines={expanded ? undefined : 2}>
+        {item.summary}
+      </Text>
+      <Timestamp value={item.occurredAt} />
+      {expanded ? (
+        <View style={[styles.notificationRaw, { borderColor: colors.surfaceEdge }]}>
+          <Text selectable role="micro" ink={2} style={styles.notificationRawText}>
+            {item.raw}
+          </Text>
+        </View>
+      ) : null}
+    </Touchable>
+  );
+});
+
 // ── Error ───────────────────────────────────────────────────────────────────
 
 export const ErrorRow = memo(function ErrorRow({ item, onRetry }: { item: ErrorItem; onRetry?: () => void }) {
@@ -569,6 +617,24 @@ const styles = StyleSheet.create({
   toolHead: { flexDirection: "row", alignItems: "center", gap: space.xs },
   shimmerClip: { position: "absolute", top: 0, bottom: 0, left: 0, right: 0, overflow: "hidden" },
   shimmer: { position: "absolute", top: 0, bottom: 0, width: 90, transform: [{ skewX: "-18deg" }] },
+  notificationCard: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderLeftWidth: 3,
+    borderRadius: radius.row,
+    paddingHorizontal: space.md,
+    paddingVertical: space.sm,
+    gap: 5,
+  },
+  notificationHead: { flexDirection: "row", alignItems: "center", gap: space.xs },
+  notificationTitle: { flex: 1 },
+  notificationRaw: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingTop: space.sm,
+    marginTop: space.xs,
+  },
+  notificationRawText: {
+    fontFamily: Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" }),
+  },
   errorRow: { flexDirection: "row", alignItems: "center", gap: space.md },
   errorBody: { flex: 1, gap: 2 },
   retry: { minHeight: 32 },
