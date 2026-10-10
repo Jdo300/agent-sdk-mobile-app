@@ -442,16 +442,24 @@ export async function pollAcceptedTranscription(
   }
 }
 
-export function officeBrowserSpeechSource(text: string) {
+export function officeBrowserSpeechSource(text: string, voice: string = KOKORO_VOICE, speed?: number) {
   const clipped = text.slice(0, 12000);
-  const query = new URLSearchParams({ text: clipped, voice: KOKORO_VOICE });
+  const query = new URLSearchParams({ text: clipped, voice });
+  if (typeof speed === "number") query.set("speed", String(speed));
   return { uri: `/__bloop/local-milo/voice/speech?${query.toString()}` };
 }
 
-export function speechSource(text: string, token: string, serverUrl: string) {
+export function speechSource(
+  text: string,
+  token: string,
+  serverUrl: string,
+  voice: string = KOKORO_VOICE,
+  speed?: number,
+) {
   const voiceBaseUrl = voiceHttpBaseUrl(serverUrl);
   const clipped = text.slice(0, 12000);
-  const query = new URLSearchParams({ text: clipped, voice: KOKORO_VOICE });
+  const query = new URLSearchParams({ text: clipped, voice });
+  if (typeof speed === "number") query.set("speed", String(speed));
   return {
     uri: `${voiceBaseUrl}/voice/speech?${query.toString()}`,
     headers: { Authorization: `Bearer ${token}` },

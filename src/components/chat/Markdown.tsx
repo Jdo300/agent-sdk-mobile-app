@@ -23,6 +23,7 @@ import { setViewerPayload } from "../../lib/viewerPayload";
 import { getSecret } from "../../lib/profiles/profiles";
 import { useProfiles } from "../../lib/profiles/ProfilesContext";
 import { voiceHttpBaseUrl } from "../../lib/voiceTransport";
+import { splitVoiceBlocks, splitVoiceBlocksStreaming } from "../../lib/voiceBlocks";
 
 // ── Fence-aware block splitting (paseo packages/app/src/utils) ──────────────
 
@@ -97,7 +98,8 @@ function openLink(url: string): boolean {
 
 /** Convert chat markdown to readable clipboard text without changing its words. */
 export function markdownToPlainText(markdown: string): string {
-  return markdown
+  // Voice blocks are spoken-script payload, never clipboard prose.
+  return splitVoiceBlocks(markdown).display
     .replace(/```[^\n]*\n([\s\S]*?)```/g, "$1")
     .replace(/~~~[^\n]*\n([\s\S]*?)~~~/g, "$1")
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
@@ -411,7 +413,10 @@ const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
  * appends blocks or grows the last one, so earlier indices never re-bind.
  */
 export function Markdown({ text }: { text: string }) {
-  const blocks = useMemo(() => splitMarkdownBlocks(text), [text]);
+  // <voice>...</voice> blocks are TTS script, not display prose. Strip them
+  // (and a partial opening tag mid-stream) before rendering.
+  const displayText = useMemo(() => splitVoiceBlocksStreaming(text).display, [text]);
+  const blocks = useMemo(() => splitMarkdownBlocks(displayText), [displayText]);
   return (
     <View style={styles.blocks}>
       {blocks.map((block, index) => (

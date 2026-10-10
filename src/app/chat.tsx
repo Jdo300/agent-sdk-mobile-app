@@ -40,6 +40,7 @@ import Svg, { Path } from "react-native-svg";
 import { ApprovalCard } from "../components/chat/ApprovalCard";
 import { ConnectionBanner } from "../components/chat/Banner";
 import { ModelSheet } from "../components/chat/ModelSheet";
+import { VoiceSheet } from "../components/chat/VoiceSheet";
 import { SecretSheet } from "../components/chat/SecretSheet";
 import { QueueCapsule } from "../components/chat/QueueCapsule";
 import { QueueSheet } from "../components/chat/QueueSheet";
@@ -103,6 +104,15 @@ import {
 } from "../lib/voice";
 import { registerConversationPush } from "../lib/pushNotifications";
 import { newVoiceTraceId, replayPersistedVoiceTrace, voiceTrace } from "../lib/voiceDiagnostics";
+import { splitVoiceBlocks } from "../lib/voiceBlocks";
+import {
+  activeVoiceFor,
+  defaultVoiceSettings,
+  loadVoiceSettings,
+  saveActiveVoiceProfile,
+  saveVoiceSpeed,
+  type VoiceSettings,
+} from "../lib/voiceProfiles";
 import { useProfiles } from "../lib/profiles/ProfilesContext";
 import { useTheme } from "../theme/ThemeProvider";
 import { motion, radius, space } from "../theme/tokens";
@@ -563,6 +573,9 @@ export default function ChatScreen() {
   const [transcribingAudio, setTranscribingAudio] = useState(false);
   const [voiceMode, setVoiceModeState] = useState<VoiceMode>("tap");
   const [voiceModeLoaded, setVoiceModeLoaded] = useState(false);
+  const [voiceSettings, setVoiceSettings] = useState<VoiceSettings>(defaultVoiceSettings());
+  const voiceSettingsRef = useRef<VoiceSettings>(voiceSettings);
+  voiceSettingsRef.current = voiceSettings;
   const [voiceAutoSend, setVoiceAutoSend] = useState(false);
   const [voiceAutoSendLoaded, setVoiceAutoSendLoaded] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState(false);
@@ -618,6 +631,7 @@ export default function ChatScreen() {
       setVoiceModeState(mode);
       setVoiceModeLoaded(true);
     });
+    void loadVoiceSettings().then(setVoiceSettings).catch(() => { /* defaults stand */ });
     void AsyncStorage.getItem(VOICE_AUTO_SEND_KEY).then((value) => {
       setVoiceAutoSend(value === "true");
       setVoiceAutoSendLoaded(true);
@@ -934,7 +948,10 @@ export default function ChatScreen() {
       if (requestId !== voicePlayRequestRef.current) return;
       const officeBrowser = Platform.OS === "web" && activeProfile.id === "profile-local-milo-office";
       if (!token && !officeBrowser) throw new Error("The Local Milo capability token is unavailable.");
-      const source = officeBrowser ? officeBrowserSpeechSource(text) : speechSource(text, token, activeProfile.url);
+      const { voice, speed } = activeVoiceFor(voiceSettingsRef.current);
+      const source = officeBrowser
+        ? officeBrowserSpeechSource(text, voice, speed)
+        : speechSource(text, token, activeProfile.url, voice, speed);
       const player = createAudioPlayer(source, { updateInterval: 150 });
       if (requestId !== voicePlayRequestRef.current) {
         player.remove();
@@ -1002,7 +1019,9 @@ export default function ChatScreen() {
     }
     const mode = voiceModeRef.current;
     if (mode === "off") return;
-    const speakableText = prepareSpeechText(completion.text);
+    // Issue #33: an explicit <voice>...</voice> block is the spoken script;
+    // without one, the whole message is spoken (legacy behavior).
+    const speakableText = prepareSpeechText(splitVoiceBlocks(completion.text).speech ?? completion.text);
     clearVoiceDismissTimer();
     if (mode !== "auto") retireVoicePlayer();
     if (!speakableText) {
@@ -1248,6 +1267,7 @@ const attachImage = useCallback(async () => {
 
   // Conversation-scoped model + reasoning controls.
   const modelSheetRef = useRef<BottomSheetModal>(null);
+  const voiceSheetRef = useRef<BottomSheetModal>(null);
   const queueSheetRef = useRef<BottomSheetModal>(null);
   const controlsSheetRef = useRef<BottomSheetModal>(null);
   const secretSheetRef = useRef<BottomSheetModal>(null);
@@ -1829,7 +1849,7 @@ const attachImage = useCallback(async () => {
   }, []);
 
   const onAssistantReplay = useCallback((id: string, markdown: string) => {
-    const text = prepareSpeechText(markdown);
+    const text = prepareSpeechText(splitVoiceBlocks(markdown).speech ?? markdown);
     if (!text) return;
     clearVoiceDismissTimer();
     retireVoicePlayer();
@@ -2100,6 +2120,7 @@ const attachImage = useCallback(async () => {
             accessibilityRole="button"
             accessibilityLabel={`Voice output: ${voiceMode}. Click to change`}
             onPress={cycleVoiceMode}
+            onLongPress={() => voiceSheetRef.current?.present()}
             style={styles.desktopVoiceLink}
           >
             <View style={styles.voiceModeContent}>
@@ -2125,6 +2146,7 @@ const attachImage = useCallback(async () => {
               accessibilityRole="button"
               accessibilityLabel={`Voice output: ${voiceMode}. Tap to change`}
               onPress={cycleVoiceMode}
+              onLongPress={() => voiceSheetRef.current?.present()}
               style={[styles.voiceModePill, { backgroundColor: colors.surface, borderColor: colors.surfaceEdge }]}
             >
               <View style={styles.voiceModeContent}>
@@ -2883,6 +2905,18 @@ const attachImage = useCallback(async () => {
         onSelect={(handle, nextEffort) => void selectModel(handle, nextEffort)}
         onSelectEffort={(nextEffort) => void selectEffort(nextEffort)}
         error={modelError}
+      />
+      <VoiceSheet
+        ref={voiceSheetRef}
+        settings={voiceSettings}
+        onSelectProfile={(id) => {
+          setVoiceSettings((s) => ({ ...s, activeId: id }));
+          void saveActiveVoiceProfile(id);
+        }}
+        onSpeedChange={(id, speed) => {
+          setVoiceSettings((s) => ({ ...s, speeds: { ...s.speeds, [id]: speed } }));
+          void saveVoiceSpeed(id, speed);
+        }}
       />
     </Screen>
   );
