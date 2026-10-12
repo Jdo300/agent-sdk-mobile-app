@@ -47,6 +47,7 @@ import { QueueSheet } from "../components/chat/QueueSheet";
 import {
   AssistantBlock,
   ErrorRow,
+  NotificationCard,
   ReasoningRow,
   ThinkingRow,
   ToolCard,
@@ -270,6 +271,8 @@ const TranscriptRow = memo(function TranscriptRow({
       return <ReasoningRow item={item} />;
     case "tool":
       return <ToolCard item={item} onPress={onToolPress ? () => onToolPress(item.id) : undefined} />;
+    case "notification":
+      return <NotificationCard item={item} />;
     case "error":
       return <ErrorRow item={item} onRetry={onErrorRetry} />;
   }
@@ -978,7 +981,7 @@ export default function ChatScreen() {
             // clip queued until recording/transcription has fully closed.
             if (!voiceInputActiveRef.current) {
               voiceAutoQueueRef.current.shift();
-              setTimeout(() => { void playVoiceTextRef.current?.(next); }, 60);
+              void playVoiceTextRef.current?.(next);
             }
           } else {
             scheduleVoiceReplyCollapse(0);
@@ -1725,11 +1728,16 @@ const attachImage = useCallback(async () => {
     dismissChatKeyboard();
     haptic.send();
     const images = attachments;
-    setAttachments([]);
-    clearDraft();
-    // Sending always re-enters follow mode — your own message must be visible.
+    // Clear composer state only after ChatSession has durably journaled the exact
+    // text + base64 image payload. This closes the process-death gap between an
+    // optimistic UI clear and the SQLite write without waiting on the network.
     pinToLatest();
-    await session.send(text, images);
+    await session.send(text, images, {
+      onJournaled: () => {
+        setAttachments([]);
+        clearDraft();
+      },
+    });
   }, [running, draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const sendWhileRunning = useCallback(async () => {
@@ -1740,10 +1748,13 @@ const attachImage = useCallback(async () => {
     dismissChatKeyboard();
     haptic.queue();
     const images = attachments;
-    setAttachments([]);
-    clearDraft();
     pinToLatest();
-    await session.send(text, images);
+    await session.send(text, images, {
+      onJournaled: () => {
+        setAttachments([]);
+        clearDraft();
+      },
+    });
   }, [draft, attachments, pinToLatest, clearDraft, interceptSecretCommand]);
 
   const canSend = draft.trim().length > 0 || attachments.length > 0;
@@ -2767,10 +2778,27 @@ const attachImage = useCallback(async () => {
                 </Text>
               </View>
 
+              {conversationDiagnostics.runtimeWarnings.length > 0 ? (
+                <View style={[styles.diagnosticsWarning, { borderColor: colors.danger }]}>
+                  <Text role="bodyEm" tone="danger">Runtime configuration warning</Text>
+                  {conversationDiagnostics.runtimeWarnings.map((warning) => (
+                    <Text key={warning} role="sub" tone="danger">• {warning}</Text>
+                  ))}
+                  <Text role="sub" ink={3}>
+                    Configured tools: {conversationDiagnostics.configuredTools.length} · Runtime tools: {conversationDiagnostics.runtimeTools?.length ?? "unknown"}
+                  </Text>
+                </View>
+              ) : null}
+
               <View style={styles.diagnosticsGrid}>
                 <View style={styles.diagnosticCell}>
                   <Text role="sub" ink={3}>Model</Text>
                   <Text role="bodyEm" numberOfLines={2}>{conversationDiagnostics.model?.split("/").pop() ?? "—"}</Text>
+                  {conversationDiagnostics.runtimeModel && conversationDiagnostics.runtimeModel !== conversationDiagnostics.model ? (
+                    <Text role="micro" tone="danger" numberOfLines={2}>
+                      Runtime: {conversationDiagnostics.runtimeModel}
+                    </Text>
+                  ) : null}
                 </View>
                 <View style={styles.diagnosticCell}>
                   <Text role="sub" ink={3}>Context change</Text>
@@ -3100,6 +3128,13 @@ const styles = StyleSheet.create({
   contextFill: { height: 7, borderRadius: 4 },
   diagnosticsGrid: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
   diagnosticCell: { width: "47%", minWidth: 120, gap: 2, paddingVertical: space.xs },
+  diagnosticsWarning: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radius.row,
+    paddingHorizontal: space.md,
+    paddingVertical: space.sm,
+    gap: space.xs,
+  },
   diagnosticsSection: { borderTopWidth: StyleSheet.hairlineWidth, paddingTop: space.md, gap: 4 },
   diagnosticsRename: { minHeight: 44, borderWidth: StyleSheet.hairlineWidth, borderRadius: radius.row, alignItems: "center", justifyContent: "center", paddingHorizontal: space.md, marginTop: space.xs },
   diagnosticsActions: { flexDirection: "row", gap: space.sm, paddingTop: space.xs },
