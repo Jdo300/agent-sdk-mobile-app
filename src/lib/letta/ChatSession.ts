@@ -1269,9 +1269,15 @@ export class ChatSession {
       this.accumulator = rebuildAuthoritativeTranscript(page.messages);
       this.captureHistoryTimestamps(page.messages);
       this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
-    } catch {
-      // The viewer/control transport remains responsible for connection UI. A
-      // missed history refresh must not create a transcript error row.
+    } catch (error) {
+      // A failed authoritative refresh used to be invisible. Keep the existing
+      // retry/recovery semantics but expose a content-free diagnostic.
+      emitSyncTelemetry({
+        kind: "history_refresh_failed",
+        conversationId: this.conversationId,
+        generation,
+        reason: error instanceof Error ? error.name : "unknown_error",
+      });
     } finally {
       this.historyRefreshInFlight = false;
       if (this.closed) return;

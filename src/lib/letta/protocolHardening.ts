@@ -7,7 +7,8 @@ export type SyncTelemetryKind =
   | "sync_stale_discard"
   | "sync_converged"
   | "sync_retry"
-  | "history_snapshot";
+  | "history_snapshot"
+  | "history_refresh_failed";
 
 export interface SyncTelemetryEvent {
   kind: SyncTelemetryKind;
