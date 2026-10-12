@@ -86,8 +86,6 @@ const RECONNECT_RETRY_MAX_MS = 5000;
 const AUTHORITATIVE_LIVE_REFRESH_MS = 500;
 const SEND_STREAM_ACTIVITY_TIMEOUT_MS = 5000;
 const SEND_HANDOFF_TIMEOUT_MS = 15_000;
-const TRANSPORT_HEALTH_INTERVAL_MS = 30_000;
-const TRANSPORT_HEALTH_TIMEOUT_MS = 10_000;
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -270,8 +268,6 @@ export class ChatSession {
   private streamActivitySerial = 0;
   private sendActivityTimer: ReturnType<typeof setTimeout> | null = null;
   /** Periodic management RPC used to detect a half-open transport. */
-  private transportHealthTimer: ReturnType<typeof setTimeout> | null = null;
-  private transportHealthProbeInFlight = false;
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
@@ -382,7 +378,6 @@ export class ChatSession {
     const streamGeneration = ++this.streamGeneration;
     void this.consume(this.session, streamGeneration);
     this.watchDeviceStatus(this.session);
-    this.scheduleTransportHealthProbe(this.session);
     return this.session;
   }
 
@@ -1021,54 +1016,6 @@ export class ChatSession {
     });
   }
 
-  private scheduleTransportHealthProbe(session: LettaCodeSession): void {
-    if (
-      this.closed ||
-      this.session !== session ||
-      this.transportHealthTimer ||
-      this.transportHealthProbeInFlight
-    ) return;
-    this.transportHealthTimer = setTimeout(() => {
-      this.transportHealthTimer = null;
-      void this.runTransportHealthProbe(session);
-    }, TRANSPORT_HEALTH_INTERVAL_MS);
-  }
-
-  private clearTransportHealthProbe(): void {
-    if (this.transportHealthTimer) {
-      clearTimeout(this.transportHealthTimer);
-      this.transportHealthTimer = null;
-    }
-  }
-
-  private async runTransportHealthProbe(session: LettaCodeSession): Promise<void> {
-    if (this.closed || this.session !== session || this.transportHealthProbeInFlight) return;
-    this.transportHealthProbeInFlight = true;
-    try {
-      await withTimeout(
-        session.getDeviceStatus(),
-        TRANSPORT_HEALTH_TIMEOUT_MS,
-        "Transport health probe timed out.",
-      );
-      if (this.closed || this.session !== session) return;
-    } catch {
-      if (this.closed || this.session !== session) return;
-      this.sessionDead = true;
-      this.commit(
-        patch(this.scrubTransportErrors(this.snapshot), {
-          connection: "reconnecting",
-          run: preserveRunAcrossTransportLoss(this.snapshot.run),
-        }),
-      );
-      void this.reconnect({ forceNewTransport: true });
-      return;
-    } finally {
-      this.transportHealthProbeInFlight = false;
-      const current = this.session;
-      if (!this.closed && current && !this.sessionDead) this.scheduleTransportHealthProbe(current);
-    }
-  }
-
   /**
    * The device owns the truth about whether a turn is running and which
    * approvals it is blocked on, so its status reconciles our in-memory guess.
@@ -1194,7 +1141,6 @@ export class ChatSession {
 
     // A dead or explicitly-reset SDK transport is discarded before probing runtime state.
     if (this.sessionDead || options?.forceNewTransport) {
-      this.clearTransportHealthProbe();
       const stale = this.session;
       this.session = null;
       this.streamGeneration += 1;
@@ -1354,7 +1300,6 @@ export class ChatSession {
     this.reconciliationGeneration += 1;
     this.streamGeneration += 1;
     this.clearReconnectRetry();
-    this.clearTransportHealthProbe();
     if (this.sendActivityTimer) {
       clearTimeout(this.sendActivityTimer);
       this.sendActivityTimer = null;
