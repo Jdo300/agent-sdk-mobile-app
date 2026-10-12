@@ -541,6 +541,10 @@ export async function executeRemoteConversationCommand(
 
 export interface ConversationDiagnostics {
   model: string | null;
+  runtimeModel: string | null;
+  configuredTools: string[];
+  runtimeTools: string[] | null;
+  runtimeWarnings: string[];
   contextTokens: number | null;
   contextWindow: number | null;
   promptTokens: number | null;
@@ -566,6 +570,7 @@ export interface ConversationDiagnostics {
 export interface ConversationStaticDiagnostics {
   agentId: string;
   model: string | null;
+  configuredTools: string[];
   contextWindow: number | null;
   coreMemoryEstimatedTokens: number;
   coreMemoryCharacters: number;
@@ -600,9 +605,14 @@ export async function getConversationStaticDiagnostics(
     .map((block) => block.value ?? "")
     .join("\n");
   const coreMemoryCharacters = blockText.length;
+  const configuredTools = (agent.tools ?? [])
+    .map((tool) => tool?.name)
+    .filter((name): name is string => typeof name === "string" && name.length > 0)
+    .sort((a, b) => a.localeCompare(b));
   return {
     agentId: conversation.agent_id,
     model,
+    configuredTools,
     contextWindow: finiteNumber(conversation.context_window_limit) ?? catalogContextWindow,
     coreMemoryEstimatedTokens: Math.round(coreMemoryCharacters / 4),
     coreMemoryCharacters,

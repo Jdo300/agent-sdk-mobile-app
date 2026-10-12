@@ -37,14 +37,17 @@ import {
 } from "./protocolHardening";
 import {
   loadDurableOutbox,
+  loadDurableSentImages,
   putDurableOutbox,
+  putDurableSentImages,
   removeDurableOutbox,
   updateDurableOutboxState,
   type DurableOutboxItem,
 } from "./durableChatStore";
 import { deliveryRecoveryAction, persistedUserOtids } from "./deliveryJournalCore";
 import { streamDisposition } from "./streamDisposition";
-import { liveAssistantSegmentIsPersisted } from "./voicePersistence";
+import { mergeNotificationsChronologically, projectTaskNotifications } from "./systemNotifications";
+import { assessRuntimeHealth } from "./runtimeHealth";
 
 export type SnapshotListener = (snapshot: ChatSnapshot) => void;
 
@@ -82,6 +85,25 @@ const RECONNECT_RETRY_BASE_MS = 1000;
 const RECONNECT_RETRY_MAX_MS = 5000;
 const AUTHORITATIVE_LIVE_REFRESH_MS = 500;
 const SEND_STREAM_ACTIVITY_TIMEOUT_MS = 5000;
+const SEND_HANDOFF_TIMEOUT_MS = 15_000;
+const TRANSPORT_HEALTH_INTERVAL_MS = 30_000;
+const TRANSPORT_HEALTH_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 /** A transport loss does not imply the server-side run stopped. */
 function preserveRunAcrossTransportLoss(run: ChatSnapshot["run"]): ChatSnapshot["run"] {
@@ -247,6 +269,9 @@ export class ChatSession {
   /** Incremented for every message observed on the live viewer stream. */
   private streamActivitySerial = 0;
   private sendActivityTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Periodic management RPC used to detect a half-open transport. */
+  private transportHealthTimer: ReturnType<typeof setTimeout> | null = null;
+  private transportHealthProbeInFlight = false;
   private counter = 0;
   /** Attachments behind pending local echoes, so retry re-sends the images too. */
   private pendingAttachments = new Map<string, Attachment[]>();
@@ -357,6 +382,7 @@ export class ChatSession {
     const streamGeneration = ++this.streamGeneration;
     void this.consume(this.session, streamGeneration);
     this.watchDeviceStatus(this.session);
+    this.scheduleTransportHealthProbe(this.session);
     return this.session;
   }
 
@@ -470,7 +496,11 @@ export class ChatSession {
     }
   }
 
-  async send(text: string, attachments: Attachment[] = []): Promise<boolean> {
+  async send(
+    text: string,
+    attachments: Attachment[] = [],
+    options?: { onJournaled?: () => void },
+  ): Promise<boolean> {
     const otid = `echo-${this.conversationId}-${Date.now()}-${this.counter++}`;
     return this.submitDurableTurn({
       profileId: this.conn.profile.id,
@@ -482,11 +512,14 @@ export class ChatSession {
       error: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-    });
+    }, options);
   }
 
   /** Persist first, then submit the exact same OTID on every retry. */
-  private async submitDurableTurn(item: DurableOutboxItem): Promise<boolean> {
+  private async submitDurableTurn(
+    item: DurableOutboxItem,
+    options?: { onJournaled?: () => void },
+  ): Promise<boolean> {
     this.advanceReconciliationGeneration();
     if (this.snapshot.loadingOlder) this.commit(patch(this.snapshot, { loadingOlder: false }));
     try {
@@ -496,8 +529,20 @@ export class ChatSession {
       this.commit(this.appendError(this.snapshot, detail));
       return false;
     }
+    try { options?.onJournaled?.(); } catch { /* UI acknowledgement is best-effort. */ }
 
     const { otid, text, attachments } = item;
+    if (attachments.length > 0) {
+      // Delivery state and transcript presentation have different lifetimes:
+      // the outbox is deleted on server acknowledgement, while sent image bytes
+      // must survive so persisted history can still render them after relaunch.
+      void putDurableSentImages(
+        this.conn.profile.id,
+        this.conversationId,
+        otid,
+        attachments,
+      ).catch(() => {});
+    }
     this.echoOtids.add(otid);
     if (!this.localRows.some((row) => row.item.kind === "user" && row.item.id === otid)) {
       this.commit(
@@ -537,11 +582,15 @@ export class ChatSession {
         return false;
       }
       const activityBeforeSend = this.streamActivitySerial;
-      await this.ensureSession().send(
-        attachments.length > 0
-          ? [...toImageContent(attachments), ...(text ? [{ type: "text" as const, text }] : [])]
-          : text,
-        { otid },
+      await withTimeout(
+        this.ensureSession().send(
+          attachments.length > 0
+            ? [...toImageContent(attachments), ...(text ? [{ type: "text" as const, text }] : [])]
+            : text,
+          { otid },
+        ),
+        SEND_HANDOFF_TIMEOUT_MS,
+        "Send handoff timed out.",
       );
       this.armSendActivityWatch(activityBeforeSend);
       // Handoff succeeded, but persistence can lag the transport acknowledgement.
@@ -822,6 +871,14 @@ export class ChatSession {
   /** Live context diagnostics from the exact App Server conversation runtime. */
   async getConversationDiagnostics(): Promise<ConversationDiagnostics> {
     const staticInfo = await getConversationStaticDiagnostics(this.conn, this.conversationId);
+    const runtimeState = await this.ensureSession().bootstrapState({ limit: 1 });
+    const runtimeTools = runtimeState.tools ?? null;
+    const health = assessRuntimeHealth({
+      configuredModel: staticInfo.model,
+      runtimeModel: runtimeState.model ?? null,
+      configuredTools: staticInfo.configuredTools,
+      runtimeTools,
+    });
     const response = await executeRemoteConversationCommand(
       this.conn,
       this.conversationId,
@@ -861,6 +918,10 @@ export class ChatSession {
       : history.at(-1)?.tokens ?? null;
     return {
       model: staticInfo.model,
+      runtimeModel: runtimeState.model ?? null,
+      configuredTools: staticInfo.configuredTools,
+      runtimeTools,
+      runtimeWarnings: health.warnings,
       contextTokens,
       contextWindow: staticInfo.contextWindow,
       promptTokens: contextTokens,
@@ -958,6 +1019,54 @@ export class ChatSession {
     }).catch(() => {
       // Best-effort: some transports may not replay status until a turn runs.
     });
+  }
+
+  private scheduleTransportHealthProbe(session: LettaCodeSession): void {
+    if (
+      this.closed ||
+      this.session !== session ||
+      this.transportHealthTimer ||
+      this.transportHealthProbeInFlight
+    ) return;
+    this.transportHealthTimer = setTimeout(() => {
+      this.transportHealthTimer = null;
+      void this.runTransportHealthProbe(session);
+    }, TRANSPORT_HEALTH_INTERVAL_MS);
+  }
+
+  private clearTransportHealthProbe(): void {
+    if (this.transportHealthTimer) {
+      clearTimeout(this.transportHealthTimer);
+      this.transportHealthTimer = null;
+    }
+  }
+
+  private async runTransportHealthProbe(session: LettaCodeSession): Promise<void> {
+    if (this.closed || this.session !== session || this.transportHealthProbeInFlight) return;
+    this.transportHealthProbeInFlight = true;
+    try {
+      await withTimeout(
+        session.getDeviceStatus(),
+        TRANSPORT_HEALTH_TIMEOUT_MS,
+        "Transport health probe timed out.",
+      );
+      if (this.closed || this.session !== session) return;
+    } catch {
+      if (this.closed || this.session !== session) return;
+      this.sessionDead = true;
+      this.commit(
+        patch(this.scrubTransportErrors(this.snapshot), {
+          connection: "reconnecting",
+          run: preserveRunAcrossTransportLoss(this.snapshot.run),
+        }),
+      );
+      void this.reconnect({ forceNewTransport: true });
+      return;
+    } finally {
+      this.transportHealthProbeInFlight = false;
+      const current = this.session;
+      if (!this.closed && current && !this.sessionDead) this.scheduleTransportHealthProbe(current);
+    }
   }
 
   /**
@@ -1085,7 +1194,8 @@ export class ChatSession {
 
     // A dead or explicitly-reset SDK transport is discarded before probing runtime state.
     if (this.sessionDead || options?.forceNewTransport) {
-        const stale = this.session;
+      this.clearTransportHealthProbe();
+      const stale = this.session;
       this.session = null;
       this.streamGeneration += 1;
       this.sessionDead = false;
@@ -1158,7 +1268,6 @@ export class ChatSession {
       this.nextBefore = page.nextBefore;
       this.accumulator = rebuildAuthoritativeTranscript(page.messages);
       this.captureHistoryTimestamps(page.messages);
-      this.flushLiveVoiceSegmentIfPersisted(page.messages);
       this.commit(this.project(patch(this.snapshot, { hasMore: page.hasMore })));
     } catch {
       // The viewer/control transport remains responsible for connection UI. A
@@ -1239,6 +1348,7 @@ export class ChatSession {
     this.reconciliationGeneration += 1;
     this.streamGeneration += 1;
     this.clearReconnectRetry();
+    this.clearTransportHealthProbe();
     if (this.sendActivityTimer) {
       clearTimeout(this.sendActivityTimer);
       this.sendActivityTimer = null;
@@ -1336,7 +1446,16 @@ export class ChatSession {
   private async loadDeliveryJournal(generation: number): Promise<boolean> {
     if (this.deliveryJournalLoaded) return this.reconciliationIsCurrent(generation, "delivery_journal_existing");
     try {
-      this.startupOutbox = await loadDurableOutbox(this.conn.profile.id, this.conversationId);
+      const [outbox, sentImages] = await Promise.all([
+        loadDurableOutbox(this.conn.profile.id, this.conversationId),
+        loadDurableSentImages(this.conn.profile.id, this.conversationId),
+      ]);
+      this.startupOutbox = outbox;
+      for (const cached of sentImages) {
+        if (cached.attachments.length > 0) {
+          this.sentImageUris.set(cached.otid, this.durableAttachmentDisplayUris(cached.attachments));
+        }
+      }
       if (!this.reconciliationIsCurrent(generation, "delivery_journal_load")) return false;
       this.deliveryJournalLoaded = true;
       return true;
@@ -1351,11 +1470,22 @@ export class ChatSession {
    * Overlay only genuinely local delivery state after authoritative history is
    * built. v2 never treats SQLite transcript cache as visible history.
    */
+  private durableAttachmentDisplayUris(attachments: readonly Attachment[]): string[] {
+    return attachments.map((attachment) =>
+      attachment.data
+        ? `data:${attachment.mediaType};base64,${attachment.data}`
+        : attachment.uri,
+    );
+  }
+
   private applyStartupOutbox(authoritativeMessages: readonly unknown[], generation: number): void {
     if (this.startupOutbox.length === 0) return;
     const persisted = new Set(persistedUserOtids(authoritativeMessages));
     const anchor = this.accumulator.rows().length;
     for (const item of this.startupOutbox) {
+      if (item.attachments.length > 0) {
+        this.sentImageUris.set(item.otid, this.durableAttachmentDisplayUris(item.attachments));
+      }
       if (persisted.has(item.otid)) {
         void removeDurableOutbox(this.conn.profile.id, this.conversationId, item.otid).catch(() => {});
         continue;
@@ -1381,7 +1511,7 @@ export class ChatSession {
           id: item.otid,
           text: item.text,
           occurredAt: item.createdAt,
-          ...(item.attachments.length > 0 ? { images: item.attachments.map((attachment) => attachment.uri) } : {}),
+          ...(item.attachments.length > 0 ? { images: this.durableAttachmentDisplayUris(item.attachments) } : {}),
           ...(item.state === "failed"
             ? { failed: true }
             : item.state === "sending" || item.state === "awaiting_echo"
@@ -1467,6 +1597,11 @@ export class ChatSession {
           run: transportFailure ? preserveRunAcrossTransportLoss(this.snapshot.run) : this.snapshot.run,
         }),
       );
+      // A cold-open history read can fail before the live SDK session exists.
+      // Treat that exactly like any other transient transport loss: the retry
+      // path creates a fresh session, verifies device state, then schedules an
+      // authoritative history refresh so first load recovers without a reload.
+      if (transportFailure && !isAuthError(e)) this.scheduleReconnectRetry();
       return false;
     }
   }
@@ -1639,10 +1774,9 @@ export class ChatSession {
     const next = this.reduce(this.snapshot, message);
     this.commit(next);
     if (message.type === "result") {
-      // `result` is the deterministic final boundary for any assistant segment
-      // that was not followed by reasoning/tool traffic. Do not use result.text
-      // itself here: it contains all assistant prose from the turn and would
-      // duplicate segments already emitted at earlier protocol transitions.
+      // result is the only speech-completion boundary. Assistant prose may
+      // be interrupted by reasoning/tool traffic, but auto-TTS must wait until
+      // the whole turn is finalized and then publish it exactly once.
       this.flushLiveVoiceSegment(message.runIds ?? []);
       this.scheduleAuthoritativeHistoryRefresh(0);
     } else if (message.type === "error") {
@@ -1665,12 +1799,8 @@ export class ChatSession {
     if (message.type === "assistant") {
       const text = message.content;
       if (!text) return;
-      const current = this.liveVoiceSegment;
-      // A run-id change is itself an authoritative lineage boundary. Flush the
-      // previous live segment before accepting text from the new run.
-      if (current && current.runId && message.runId && current.runId !== message.runId) {
-        this.flushLiveVoiceSegment(current.runId ? [current.runId] : []);
-      }
+      // Run IDs can change around tool activity within one user turn. That is
+      // not a speech-completion boundary: keep accumulating until SDK result.
       if (!this.liveVoiceSegment) {
         this.liveVoiceSegment = {
           runId: message.runId,
@@ -1691,24 +1821,11 @@ export class ChatSession {
     // voice text or completion boundaries; doing so can duplicate typed records.
     if (message.type === "stream_event") return;
 
-    // Any typed move away from assistant prose remains a defensive end-of-segment
-    // marker. This includes reasoning, a tool call, and a tool result.
-    if (
-      message.type === "reasoning" ||
-      message.type === "tool_call" ||
-      message.type === "tool_result"
-    ) {
-      this.flushLiveVoiceSegment(message.runId ? [message.runId] : []);
-    }
+    // Reasoning and tool transitions may occur between pieces of assistant
+    // prose in the same turn. They are deliberately ignored here so TTS cannot
+    // start from a partial message. Only the terminal SDK result flushes.
   }
 
-
-  private flushLiveVoiceSegmentIfPersisted(messages: readonly unknown[]): void {
-    const segment = this.liveVoiceSegment;
-    if (!segment || !segment.text.trim()) return;
-    if (!liveAssistantSegmentIsPersisted(messages, segment.text, segment.runId)) return;
-    this.flushLiveVoiceSegment(segment.runId ? [segment.runId] : []);
-  }
 
   private flushLiveVoiceSegment(runIds: string[] = []): void {
     const segment = this.liveVoiceSegment;
@@ -1812,7 +1929,10 @@ export class ChatSession {
     for (const { anchor, item } of this.localRows) {
       if (anchor > placed) transcript.push(item);
     }
-    return patch(snapshot, { transcript });
+    const notifications = projectTaskNotifications(this.loadedHistoryMessages);
+    return patch(snapshot, {
+      transcript: mergeNotificationsChronologically(transcript, notifications),
+    });
   }
 
   /** Preserve persisted server timestamps when history is merged. */
