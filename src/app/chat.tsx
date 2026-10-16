@@ -764,7 +764,12 @@ export default function ChatScreen() {
       await recorder.prepareToRecordAsync();
       voiceTrace(traceId, "recorder_prepare_done");
       try {
-        recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
+        // Do NOT pass forDuration here: expo-audio implements it as a raw
+        // setTimeout(stop) that is never cleared on manual stop. If the user
+        // finishes or cancels before the limit, the orphaned timer later calls
+        // stop() on a null MediaRecorder and throws uncaught (red box on web).
+        // The ten-minute ceiling is enforced by the polled-state effect below.
+        recorder.record();
       } catch (error) {
         // expo-audio's web recorder can occasionally lose its MediaRecorder
         // between preparation and record() (most commonly after rapid/repeated
@@ -775,7 +780,7 @@ export default function ChatScreen() {
         if (Platform.OS !== "web" || !/MediaRecorder|prepareToRecordAsync/i.test(detail)) throw error;
         voiceTrace(traceId, "recorder_prepare_retry", { detail });
         await recorder.prepareToRecordAsync();
-        recorder.record({ forDuration: VOICE_RECORDING_LIMIT_SECONDS });
+        recorder.record();
       }
       voiceTrace(traceId, "recorder_record_called");
       setVoiceRecording(true);
@@ -902,11 +907,12 @@ export default function ChatScreen() {
     }
   }, [activeProfile, recorder, recorderState.isRecording, recorderState.durationMillis, voiceAutoSend, isDesktopWeb, desktopTextScale, stopBrowserVoiceMeter]);
 
-  // `forDuration` enforces the ten-minute ceiling in native audio code. Once
-  // that automatic stop is reflected back into recorder state, finalize it just
-  // like the user tapped the check button so the recording is not stranded.
+  // The ten-minute ceiling is enforced here off polled recorder state (100 ms
+  // cadence) rather than expo-audio's `forDuration`, whose orphaned setTimeout
+  // threw uncaught after a manual stop. Once the limit is crossed while still
+  // recording, finalize just like the user tapped the check button.
   useEffect(() => {
-    if (!voiceRecording || recorderState.isRecording || recorderState.durationMillis < (VOICE_RECORDING_LIMIT_SECONDS * 1000 - 1000)) return;
+    if (!voiceRecording || !recorderState.isRecording || recorderState.durationMillis < (VOICE_RECORDING_LIMIT_SECONDS * 1000 - 1000)) return;
     void finishVoiceRecording();
   }, [voiceRecording, recorderState.isRecording, recorderState.durationMillis, finishVoiceRecording]);
 
