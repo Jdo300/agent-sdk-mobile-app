@@ -22,6 +22,7 @@ import { createTranscriptAccumulator } from "@letta-ai/letta-agent-sdk/client";
 import { toImageContent, type Attachment } from "./attachments";
 import type { Profile } from "../profiles/profiles";
 import { executeRemoteConversationCommand, getConversationModel, getConversationStaticDiagnostics, isAuthError, listConversationMessages, sdkClient, type ConversationDiagnostics } from "./api";
+import type { ConversationCommandResult } from "./conversationCommand";
 import { emptyChat, type ApprovalRequest, type ChatSnapshot, type PermissionMode, type ToolStatus, type TranscriptItem } from "./model";
 import { patch } from "./mockSession";
 import { contentToText, formatToolInput } from "./toolText";
@@ -879,15 +880,25 @@ export class ChatSession {
       configuredTools: staticInfo.configuredTools,
       runtimeTools,
     });
-    const response = await executeRemoteConversationCommand(
-      this.conn,
-      this.conversationId,
-      staticInfo.agentId,
-      "context",
-      15_000,
-    );
-    if (response.success !== true) {
-      throw new Error(typeof response.output === "string" ? response.output : "Couldn't read context status.");
+    // The "context" command is optional live diagnostics. Older App Server
+    // builds (and any build without the /context listener mod) answer with
+    // "Unknown command: context". That is not a hard failure — fall through and
+    // render the static model/memory diagnostics with graceful fallbacks rather
+    // than erroring the whole sheet (or a just-completed compaction).
+    let response: ConversationCommandResult | null = null;
+    try {
+      response = await executeRemoteConversationCommand(
+        this.conn,
+        this.conversationId,
+        staticInfo.agentId,
+        "context",
+        15_000,
+      );
+    } catch {
+      response = null;
+    }
+    if (response && response.success !== true) {
+      response = null;
     }
     let live: {
       context_tokens?: unknown;
@@ -895,7 +906,7 @@ export class ChatSession {
       pending_compaction?: unknown;
     } = {};
     try {
-      if (typeof response.output === "string") live = JSON.parse(response.output) as typeof live;
+      if (response && typeof response.output === "string") live = JSON.parse(response.output) as typeof live;
     } catch {
       // An older App Server may return human-readable /context output. Static
       // model/memory diagnostics still render rather than failing the sheet.
